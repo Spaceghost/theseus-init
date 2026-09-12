@@ -1,6 +1,7 @@
 package graphfixtures
 
 import (
+  "list"
   "strings"
   "spaceghost.dev/theseus/schema"
 )
@@ -93,7 +94,6 @@ targets: [
   schema.#Target & {name: "broken", members: ["broken"]},
 ]
 
-compiled: strings.Join(
-  [for item in services {item.compiled}] + [for target in targets {target.compiled}],
-  "\n",
-)
+serviceRecords: [for item in services {item.compiled}]
+targetRecords: [for target in targets {target.compiled}]
+compiled: strings.Join(list.Concat([serviceRecords, targetRecords]), "\n")
