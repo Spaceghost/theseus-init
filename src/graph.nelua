@@ -1,0 +1,302 @@
+-- Theseus native target planner.
+-- CUE owns graph declarations; this Nelua code validates and plans them before
+-- any process effect. TSC3 service records and TGT1 target records are bounded.
+
+require 'arg'
+require 'io'
+require 'os'
+require 'string'
+
+local MAX_SERVICES: integer = 32
+local MAX_TARGETS: integer = 16
+
+local GraphService = @record{
+  name: string,
+  requires: string,
+  wants: string,
+  after: string,
+  before: string,
+}
+
+local Target = @record{
+  name: string,
+  members: string,
+}
+
+local Graph = @record{
+  services: [32]GraphService,
+  service_count: integer,
+  targets: [16]Target,
+  target_count: integer,
+}
+
+local function next_field(line: string, cursor: isize): (string, isize)
+  local first, last = string.find(line, '\t', cursor, true)
+  if first == 0 then return string.sub(line, cursor), 0 end
+  return string.sub(line, cursor, first - 1), last + 1
+end
+
+local function next_list_item(list: string, cursor: isize): (string, isize)
+  if #list == 0 or cursor == 0 then return '', 0 end
+  local first, last = string.find(list, ',', cursor, true)
+  if first == 0 then return string.sub(list, cursor), 0 end
+  return string.sub(list, cursor, first - 1), last + 1
+end
+
+local function list_contains(list: string, wanted: string): boolean
+  if #list == 0 then return false end
+  local cursor: isize = 1
+  while cursor ~= 0 do
+    local item: string
+    item, cursor = next_list_item(list, cursor)
+    if item == wanted then return true end
+  end
+  return false
+end
+
+local function parse_service(line: string): (boolean, GraphService)
+  local service: GraphService
+  local cursor: isize = 1
+  local field: string
+  field, cursor = next_field(line, cursor)
+  if field ~= 'TSC3' or cursor == 0 then return false, service end
+
+  service.name, cursor = next_field(line, cursor)
+  if #service.name == 0 or cursor == 0 then return false, service end
+
+  -- argv, restart, max-restarts and readiness are runtime fields validated by
+  -- the CUE schema. The graph planner only needs their field boundaries.
+  for _: integer = 1, 4 do
+    field, cursor = next_field(line, cursor)
+    if cursor == 0 then return false, service end
+  end
+
+  service.requires, cursor = next_field(line, cursor)
+  if cursor == 0 then return false, service end
+  service.wants, cursor = next_field(line, cursor)
+  if cursor == 0 then return false, service end
+  service.after, cursor = next_field(line, cursor)
+  if cursor == 0 then return false, service end
+  service.before, cursor = next_field(line, cursor)
+  if cursor ~= 0 then return false, service end
+  return true, service
+end
+
+local function parse_target(line: string): (boolean, Target)
+  local target: Target
+  local cursor: isize = 1
+  local magic: string
+  magic, cursor = next_field(line, cursor)
+  if magic ~= 'TGT1' or cursor == 0 then return false, target end
+  target.name, cursor = next_field(line, cursor)
+  if #target.name == 0 or cursor == 0 then return false, target end
+  target.members, cursor = next_field(line, cursor)
+  if #target.members == 0 or cursor ~= 0 then return false, target end
+  return true, target
+end
+
+local function find_service(graph: *Graph, name: string): integer
+  for i: integer = 0, graph.service_count - 1 do
+    if graph.services[i].name == name then return i end
+  end
+  return -1
+end
+
+local function find_target(graph: *Graph, name: string): integer
+  for i: integer = 0, graph.target_count - 1 do
+    if graph.targets[i].name == name then return i end
+  end
+  return -1
+end
+
+local function load_graph(path: string, graph: *Graph): boolean
+  local file = io.open(path, 'r')
+  if not file:isopen() then
+    io.stderr:write('theseus-graph: cannot open graph records: ', path, '\n')
+    return false
+  end
+  for line in file:lines() do
+    if #line == 0 then goto continue end
+    if string.sub(line, 1, 5) == 'TSC3\t' then
+      if graph.service_count >= MAX_SERVICES then
+        io.stderr:write('theseus-graph: service bound exceeded\n')
+        file:close()
+        return false
+      end
+      local ok: boolean
+      local service: GraphService
+      ok, service = parse_service(line)
+      if not ok or find_service(graph, service.name) >= 0 then
+        io.stderr:write('theseus-graph: malformed or duplicate service record\n')
+        file:close()
+        return false
+      end
+      graph.services[graph.service_count] = service
+      graph.service_count = graph.service_count + 1
+    elseif string.sub(line, 1, 5) == 'TGT1\t' then
+      if graph.target_count >= MAX_TARGETS then
+        io.stderr:write('theseus-graph: target bound exceeded\n')
+        file:close()
+        return false
+      end
+      local ok: boolean
+      local target: Target
+      ok, target = parse_target(line)
+      if not ok or find_target(graph, target.name) >= 0 then
+        io.stderr:write('theseus-graph: malformed or duplicate target record\n')
+        file:close()
+        return false
+      end
+      graph.targets[graph.target_count] = target
+      graph.target_count = graph.target_count + 1
+    else
+      io.stderr:write('theseus-graph: unknown record type\n')
+      file:close()
+      return false
+    end
+    ::continue::
+  end
+  file:close()
+  return graph.service_count > 0 and graph.target_count > 0
+end
+
+local function select_refs(graph: *Graph, list: string, selected: *[32]boolean,
+                           hard: boolean): (boolean, boolean)
+  if #list == 0 then return true, false end
+  local changed = false
+  local cursor: isize = 1
+  while cursor ~= 0 do
+    local name: string
+    name, cursor = next_list_item(list, cursor)
+    local index = find_service(graph, name)
+    if index < 0 then
+      if hard then
+        io.stderr:write('theseus-graph: missing hard dependency: ', name, '\n')
+        return false, changed
+      end
+    elseif not selected[index] then
+      selected[index] = true
+      changed = true
+    end
+  end
+  return true, changed
+end
+
+local function select_target(graph: *Graph, target: *Target,
+                             selected: *[32]boolean): boolean
+  local cursor: isize = 1
+  while cursor ~= 0 do
+    local name: string
+    name, cursor = next_list_item(target.members, cursor)
+    local index = find_service(graph, name)
+    if index < 0 then
+      io.stderr:write('theseus-graph: target member is missing: ', name, '\n')
+      return false
+    end
+    selected[index] = true
+  end
+
+  local changed = true
+  local rounds: integer = 0
+  while changed do
+    changed = false
+    rounds = rounds + 1
+    if rounds > MAX_SERVICES then
+      io.stderr:write('theseus-graph: dependency closure did not converge\n')
+      return false
+    end
+    for i: integer = 0, graph.service_count - 1 do
+      if selected[i] then
+        local ok: boolean
+        local added: boolean
+        ok, added = select_refs(graph, graph.services[i].requires, selected, true)
+        if not ok then return false end
+        if added then changed = true end
+        ok, added = select_refs(graph, graph.services[i].wants, selected, false)
+        if not ok then return false end
+        if added then changed = true end
+      end
+    end
+  end
+  return true
+end
+
+-- `a` must precede `b` when b hard/soft-depends on a, b explicitly runs after
+-- a, or a explicitly runs before b. Ordering-only edges never select services.
+local function precedes(graph: *Graph, a: integer, b: integer): boolean
+  if a == b then return false end
+  local aname = graph.services[a].name
+  local bname = graph.services[b].name
+  return list_contains(graph.services[b].requires, aname) or
+         list_contains(graph.services[b].wants, aname) or
+         list_contains(graph.services[b].after, aname) or
+         list_contains(graph.services[a].before, bname)
+end
+
+local function plan(graph: *Graph, target_name: string): integer
+  local target_index = find_target(graph, target_name)
+  if target_index < 0 then
+    io.stderr:write('theseus-graph: unknown target: ', target_name, '\n')
+    return 3
+  end
+
+  local selected: [32]boolean
+  if not select_target(graph, &graph.targets[target_index], &selected) then return 66 end
+
+  local indegree: [32]integer
+  local emitted: [32]boolean
+  local selected_count: integer = 0
+  for b: integer = 0, graph.service_count - 1 do
+    if selected[b] then
+      selected_count = selected_count + 1
+      for a: integer = 0, graph.service_count - 1 do
+        if selected[a] and precedes(graph, a, b) then indegree[b] = indegree[b] + 1 end
+      end
+    end
+  end
+
+  print('PLAN1', target_name, selected_count)
+  for position: integer = 1, selected_count do
+    local candidate: integer = -1
+    -- CUE list order is preserved in TSC3. Choosing the first ready service is
+    -- deterministic while keeping the runtime planner allocation-free here.
+    for i: integer = 0, graph.service_count - 1 do
+      if selected[i] and not emitted[i] and indegree[i] == 0 then
+        candidate = i
+        break
+      end
+    end
+    if candidate < 0 then
+      io.stderr:write('theseus-graph: dependency/order cycle in target: ', target_name, '\n')
+      return 67
+    end
+    emitted[candidate] = true
+    print('plan', position, graph.services[candidate].name)
+    for b: integer = 0, graph.service_count - 1 do
+      if selected[b] and not emitted[b] and precedes(graph, candidate, b) then
+        indegree[b] = indegree[b] - 1
+      end
+    end
+  end
+  return 0
+end
+
+local function selftest()
+  assert(list_contains('a,b,c', 'a'))
+  assert(list_contains('a,b,c', 'b'))
+  assert(list_contains('a,b,c', 'c'))
+  assert(not list_contains('a,b,c', 'd'))
+  assert(not list_contains('', 'a'))
+  print('Theseus graph self-test passed')
+end
+
+if #arg == 1 and arg[1] == '--selftest' then selftest(); os.exit(0) end
+if #arg ~= 1 then
+  io.stderr:write('usage: theseus-graph TARGET\n')
+  os.exit(64)
+end
+local path = os.getenv('THESEUS_GRAPH')
+if #path == 0 then path = './build/graph.tsc' end
+local graph: Graph
+if not load_graph(path, &graph) then os.exit(65) end
+os.exit(plan(&graph, arg[1]))
