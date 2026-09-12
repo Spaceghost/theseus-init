@@ -34,8 +34,9 @@ jobs:
           rm -rf /tmp/nelua-lang
           git init /tmp/nelua-lang
           git -C /tmp/nelua-lang remote add origin https://github.com/edubart/nelua-lang.git
-          git -C /tmp/nelua-lang fetch --depth 1 origin 9ccf28d
+          git -C /tmp/nelua-lang fetch --depth 1 origin 9ccf28de898a5e1615f1b04f5f28b3447aea0fb8
           git -C /tmp/nelua-lang checkout --detach FETCH_HEAD
+          test "$(git -C /tmp/nelua-lang rev-parse HEAD)" = 9ccf28de898a5e1615f1b04f5f28b3447aea0fb8
           make -C /tmp/nelua-lang -j2
           /tmp/nelua-lang/nelua -h >/dev/null
 
