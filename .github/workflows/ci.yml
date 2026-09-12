@@ -42,7 +42,7 @@ jobs:
           make -C /tmp/nelua-lang -j2
           /tmp/nelua-lang/nelua -h >/dev/null
 
-      - name: Compile Theseus
+      - name: Compile Theseus one-shot supervisor
         run: |
           set -eux
           /tmp/nelua-lang/nelua --compile-binary --release -o build/theseus src/theseus.nelua
@@ -109,3 +109,50 @@ jobs:
           grep -E '^transition[[:space:]]+sleep-stop[[:space:]]+READY[[:space:]]+RUNNING$' build/sleep-stop.txt
           grep -E '^signal[[:space:]]+sleep-stop[[:space:]]+pidfd[[:space:]]+[0-9]+[[:space:]]+signal[[:space:]]+15$' build/sleep-stop.txt
           grep -E '^result[[:space:]]+sleep-stop[[:space:]]+STOPPED[[:space:]]+attempts[[:space:]]+1[[:space:]]+restarts[[:space:]]+0[[:space:]]+exit[[:space:]]+-1[[:space:]]+signal[[:space:]]+15$' build/sleep-stop.txt
+
+      - name: Compile long-lived supervisor and live clients
+        run: |
+          set -eux
+          mkdir -p build/live
+          /tmp/nelua-lang/nelua --compile-binary --release -o build/live/theseusd src/theseusd.nelua
+          /tmp/nelua-lang/nelua --compile-binary --release -o build/live/theseus src/live_client.nelua
+          ln -sf theseus build/live/the
+          test -x build/live/theseusd
+          test -x build/live/theseus
+
+      - name: Query live state and shut down without orphans
+        run: |
+          set -eux
+          export THESEUS_RECORDS="$PWD/build/services.tsc"
+          export THESEUS_SOCKET="$RUNNER_TEMP/theseus-$GITHUB_RUN_ID.sock"
+          test ! -e "$THESEUS_SOCKET"
+          build/live/theseusd sleep-stop >build/live/daemon.log 2>&1 &
+          daemon_pid=$!
+          cleanup() {
+            kill "$daemon_pid" 2>/dev/null || true
+            wait "$daemon_pid" 2>/dev/null || true
+            rm -f "$THESEUS_SOCKET"
+          }
+          trap cleanup EXIT
+          i=0
+          while ! test -S "$THESEUS_SOCKET"; do
+            i=$((i + 1))
+            test "$i" -lt 100
+            sleep 0.02
+          done
+          test "$(stat -c '%a' "$THESEUS_SOCKET")" = 600
+          build/live/the status of sleep-stop | tee build/live/status.txt
+          grep -F 'RUNNING' build/live/status.txt
+          child_pid=$(awk '$1 == "pid" {print $2}' build/live/status.txt)
+          test -n "$child_pid"
+          kill -0 "$child_pid"
+          test "$(build/live/the state of sleep-stop)" = RUNNING
+          build/live/theseus daemon-stop
+          wait "$daemon_pid"
+          test ! -e "$THESEUS_SOCKET"
+          if kill -0 "$child_pid" 2>/dev/null; then
+            echo "owned child remained after daemon shutdown: $child_pid" >&2
+            exit 1
+          fi
+          grep -E '^daemon-stopped[[:space:]]+sleep-stop$' build/live/daemon.log
+          trap - EXIT
