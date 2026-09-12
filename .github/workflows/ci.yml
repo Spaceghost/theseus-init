@@ -114,7 +114,7 @@ jobs:
         run: |
           set -eux
           mkdir -p build/live
-          /tmp/nelua-lang/nelua --compile-binary --release -o build/live/theseusd src/theseusd.nelua
+          /tmp/nelua-lang/nelua --compile-binary --release -o build/live/theseusd src/supervisor.nelua
           /tmp/nelua-lang/nelua --compile-binary --release -o build/live/theseus src/live_client.nelua
           ln -sf theseus build/live/the
           test -x build/live/theseusd
@@ -129,6 +129,9 @@ jobs:
           build/live/theseusd sleep-stop >build/live/daemon.log 2>&1 &
           daemon_pid=$!
           cleanup() {
+            if test -S "$THESEUS_SOCKET"; then
+              build/live/theseus daemon-stop >/dev/null 2>&1 || true
+            fi
             kill "$daemon_pid" 2>/dev/null || true
             wait "$daemon_pid" 2>/dev/null || true
             rm -f "$THESEUS_SOCKET"
@@ -141,7 +144,10 @@ jobs:
             sleep 0.02
           done
           test "$(stat -c '%a' "$THESEUS_SOCKET")" = 600
-          build/live/the status of sleep-stop | tee build/live/status.txt
+          if ! build/live/the status of sleep-stop | tee build/live/status.txt; then
+            cat build/live/daemon.log >&2
+            exit 1
+          fi
           grep -F 'RUNNING' build/live/status.txt
           child_pid=$(awk '$1 == "pid" {print $2}' build/live/status.txt)
           test -n "$child_pid"
