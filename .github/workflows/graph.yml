@@ -1,0 +1,82 @@
+name: graph
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  native-target-plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUE
+        uses: cue-lang/setup-cue@v1.0.0
+        with:
+          version: v0.17.1
+
+      - name: Validate and compile TSC3 graph
+        run: |
+          set -eux
+          cue vet ./...
+          mkdir -p build
+          cue export ./tests/graph.cue -e compiled --out text > build/graph.tsc
+          test "$(grep -c '^TSC3' build/graph.tsc)" -eq 8
+          test "$(grep -c '^TGT1' build/graph.tsc)" -eq 3
+
+      - name: Build pinned Nelua compiler
+        run: |
+          set -eux
+          rm -rf /tmp/nelua-lang
+          git init /tmp/nelua-lang
+          git -C /tmp/nelua-lang remote add origin https://github.com/edubart/nelua-lang.git
+          git -C /tmp/nelua-lang fetch --depth 1 origin 9ccf28de898a5e1615f1b04f5f28b3447aea0fb8
+          git -C /tmp/nelua-lang checkout --detach FETCH_HEAD
+          test "$(git -C /tmp/nelua-lang rev-parse HEAD)" = 9ccf28de898a5e1615f1b04f5f28b3447aea0fb8
+          make -C /tmp/nelua-lang -j2
+
+      - name: Compile graph planner
+        run: |
+          set -eux
+          /tmp/nelua-lang/nelua --compile-binary --release -o build/theseus-graph src/graph.nelua
+          build/theseus-graph --selftest
+
+      - name: Plan default target deterministically
+        run: |
+          set -eux
+          export THESEUS_GRAPH="$PWD/build/graph.tsc"
+          build/theseus-graph default | tee build/default.plan
+          awk '$1 == "plan" {print $3}' build/default.plan > build/default.order
+          printf 'localmount\nnetworking\noptional\napp\n' > build/expected.order
+          cmp build/expected.order build/default.order
+          ! grep -E '(^|[[:space:]])clock$' build/default.plan
+
+      - name: Reject hard dependency cycle before execution
+        run: |
+          set -eux
+          export THESEUS_GRAPH="$PWD/build/graph.tsc"
+          if build/theseus-graph cycle >build/cycle.out 2>build/cycle.err; then
+            echo 'cyclic target unexpectedly planned' >&2
+            exit 1
+          else
+            rc=$?
+          fi
+          test "$rc" -eq 67
+          grep -F 'dependency/order cycle' build/cycle.err
+
+      - name: Reject missing hard dependency
+        run: |
+          set -eux
+          export THESEUS_GRAPH="$PWD/build/graph.tsc"
+          if build/theseus-graph broken >build/broken.out 2>build/broken.err; then
+            echo 'broken target unexpectedly planned' >&2
+            exit 1
+          else
+            rc=$?
+          fi
+          test "$rc" -eq 66
+          grep -F 'missing hard dependency: missing-hard-dependency' build/broken.err
