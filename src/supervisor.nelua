@@ -267,8 +267,8 @@ local function read_line(fd: cint): (boolean, string)
     local end_at = used + got
     for i: integer = used, end_at - 1 do
       if buffer[i] == 10 then
-        buffer[i + 1] = 0
-        return true, (@cstring)(&buffer[0])
+        local length: usize = (@usize)(i + 1)
+        return true, string.copy((@string){data=&buffer[0], size=length})
       end
     end
     used = end_at
