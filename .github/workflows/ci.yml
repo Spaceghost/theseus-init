@@ -19,14 +19,16 @@ jobs:
         with:
           version: v0.17.1
 
-      - name: Validate CUE service model
+      - name: Validate and compile CUE service model
         run: |
           set -eux
           cue version
           cue vet ./...
           mkdir -p build
           cue export ./services/postgresql.cue -e compiled --out text > build/services.tsc
-          test "$(cut -f1 build/services.tsc)" = TSC1
+          cue export ./tests/services.cue -e compiled --out text >> build/services.tsc
+          test "$(cut -f1 build/services.tsc | sort -u)" = TSC2
+          test "$(wc -l < build/services.tsc)" -eq 4
 
       - name: Build pinned Nelua compiler
         run: |
@@ -52,9 +54,60 @@ jobs:
           build/theseus --selftest
           ln -sf theseus build/the
           export THESEUS_RECORDS="$PWD/build/services.tsc"
-          build/theseus status postgresql | grep -F 'PLANNED'
+          build/theseus status postgresql | tee build/status.txt
+          grep -F 'PLANNED' build/status.txt
+          grep -F 'unix-socket' build/status.txt
           build/the status of postgresql | grep -F 'PLANNED'
           test "$(build/the state of postgresql)" = PLANNED
           test "$(build/the restart-policy of postgresql)" = on-failure
           build/the services | grep -F 'postgresql'
           build/the failed services | grep -F '(none)'
+
+      - name: Refuse unsupported readiness before effects
+        run: |
+          set -eux
+          export THESEUS_RECORDS="$PWD/build/services.tsc"
+          if build/theseus run postgresql >build/postgresql-run.txt 2>&1; then
+            echo 'postgresql unexpectedly spawned' >&2
+            exit 1
+          else
+            rc=$?
+          fi
+          test "$rc" -eq 69
+          grep -F 'refusing to spawn it' build/postgresql-run.txt
+          ! grep -F 'spawn postgresql' build/postgresql-run.txt
+
+      - name: Supervise successful child with pidfd identity
+        run: |
+          set -eux
+          export THESEUS_RECORDS="$PWD/build/services.tsc"
+          build/theseus run true-once | tee build/true-once.txt
+          grep -F 'spawn true-once pid ' build/true-once.txt
+          grep -F ' pidfd ' build/true-once.txt
+          grep -F 'result true-once STOPPED attempts 1 restarts 0 exit 0 signal 0' build/true-once.txt
+
+      - name: Apply bounded on-failure restart policy
+        run: |
+          set -eux
+          export THESEUS_RECORDS="$PWD/build/services.tsc"
+          if build/theseus run false-restart >build/false-restart.txt 2>&1; then
+            echo 'false-restart unexpectedly succeeded' >&2
+            exit 1
+          else
+            rc=$?
+          fi
+          test "$rc" -eq 1
+          test "$(grep -c '^spawn false-restart ' build/false-restart.txt)" -eq 3
+          test "$(grep -c '^restart false-restart ' build/false-restart.txt)" -eq 2
+          grep -F 'result false-restart FAILED attempts 3 restarts 2 exit 1 signal 0' build/false-restart.txt
+
+      - name: Stop a live child through its pidfd
+        run: |
+          set -eux
+          export THESEUS_RECORDS="$PWD/build/services.tsc"
+          build/theseus run sleep-stop --stop-after-ms 25 | tee build/sleep-stop.txt
+          grep -F 'transition sleep-stop STARTING READY' build/sleep-stop.txt
+          grep -F 'transition sleep-stop READY RUNNING' build/sleep-stop.txt
+          grep -F 'signal sleep-stop pidfd ' build/sleep-stop.txt
+          grep -F ' signal 15' build/sleep-stop.txt
+          grep -F 'result sleep-stop STOPPED attempts 1 restarts 0 exit -1 signal 15' build/sleep-stop.txt
