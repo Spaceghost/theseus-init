@@ -75,7 +75,7 @@ jobs:
           fi
           test "$rc" -eq 69
           grep -F 'refusing to spawn it' build/postgresql-run.txt
-          ! grep -F 'spawn' build/postgresql-run.txt
+          ! grep -E '^spawn[[:space:]]+postgresql[[:space:]]' build/postgresql-run.txt
 
       - name: Supervise successful child with pidfd identity
         run: |
