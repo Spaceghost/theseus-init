@@ -1,0 +1,348 @@
+-- Theseus v0 bootstrap core.
+-- Maintained implementation is Nelua. CUE emits TSC1 records consumed here.
+
+require 'arg'
+require 'io'
+require 'os'
+require 'string'
+
+local ServiceState = @enum{
+  Absent = 0,
+  Planned,
+  Starting,
+  Ready,
+  Running,
+  Degraded,
+  Stopping,
+  Stopped,
+  Failed,
+  Backoff,
+}
+
+local RestartPolicy = @enum{
+  Never = 0,
+  OnFailure,
+  Always,
+}
+
+local QueryKind = @enum{
+  Invalid = 0,
+  SystemStatus,
+  ServiceStatus,
+  ServiceState,
+  ServiceRestartPolicy,
+  Services,
+  FailedServices,
+  RunningServices,
+}
+
+local Service = @record{
+  name: string,
+  argv_serialized: string,
+  state: ServiceState,
+  restart: RestartPolicy,
+  max_restarts: integer,
+}
+
+local Query = @record{
+  kind: QueryKind,
+  subject: string,
+}
+
+local function state_name(state: ServiceState): string
+  if state == ServiceState.Absent then return 'ABSENT' end
+  if state == ServiceState.Planned then return 'PLANNED' end
+  if state == ServiceState.Starting then return 'STARTING' end
+  if state == ServiceState.Ready then return 'READY' end
+  if state == ServiceState.Running then return 'RUNNING' end
+  if state == ServiceState.Degraded then return 'DEGRADED' end
+  if state == ServiceState.Stopping then return 'STOPPING' end
+  if state == ServiceState.Stopped then return 'STOPPED' end
+  if state == ServiceState.Failed then return 'FAILED' end
+  if state == ServiceState.Backoff then return 'BACKOFF' end
+  return 'UNKNOWN'
+end
+
+local function restart_name(policy: RestartPolicy): string
+  if policy == RestartPolicy.Never then return 'never' end
+  if policy == RestartPolicy.OnFailure then return 'on-failure' end
+  if policy == RestartPolicy.Always then return 'always' end
+  return 'invalid'
+end
+
+local function parse_restart(value: string): (boolean, RestartPolicy)
+  if value == 'never' then return true, RestartPolicy.Never end
+  if value == 'on-failure' then return true, RestartPolicy.OnFailure end
+  if value == 'always' then return true, RestartPolicy.Always end
+  return false, RestartPolicy.Never
+end
+
+local function can_transition(from: ServiceState, to: ServiceState): boolean
+  if from == ServiceState.Absent then return to == ServiceState.Planned end
+  if from == ServiceState.Planned then
+    return to == ServiceState.Starting or to == ServiceState.Stopped
+  end
+  if from == ServiceState.Starting then
+    return to == ServiceState.Ready or to == ServiceState.Running or
+           to == ServiceState.Failed or to == ServiceState.Stopping
+  end
+  if from == ServiceState.Ready then
+    return to == ServiceState.Running or to == ServiceState.Degraded or
+           to == ServiceState.Stopping or to == ServiceState.Failed
+  end
+  if from == ServiceState.Running then
+    return to == ServiceState.Degraded or to == ServiceState.Stopping or
+           to == ServiceState.Failed
+  end
+  if from == ServiceState.Degraded then
+    return to == ServiceState.Running or to == ServiceState.Stopping or
+           to == ServiceState.Failed
+  end
+  if from == ServiceState.Stopping then
+    return to == ServiceState.Stopped or to == ServiceState.Failed
+  end
+  if from == ServiceState.Stopped then
+    return to == ServiceState.Starting or to == ServiceState.Planned
+  end
+  if from == ServiceState.Failed then
+    return to == ServiceState.Backoff or to == ServiceState.Starting or
+           to == ServiceState.Stopped
+  end
+  if from == ServiceState.Backoff then
+    return to == ServiceState.Starting or to == ServiceState.Stopped
+  end
+  return false
+end
+
+-- Return one 1-indexed tab-delimited field and the next cursor. A next cursor
+-- of zero means this was the final field.
+local function next_field(line: string, cursor: isize): (string, isize)
+  local first, last = string.find(line, '\t', cursor, true)
+  if first == 0 then
+    return string.sub(line, cursor), 0
+  end
+  return string.sub(line, cursor, first - 1), last + 1
+end
+
+local function parse_service_record(line: string): (boolean, Service)
+  local service: Service
+  local cursor: isize = 1
+  local magic: string
+  magic, cursor = next_field(line, cursor)
+  if magic ~= 'TSC1' or cursor == 0 then return false, service end
+
+  service.name, cursor = next_field(line, cursor)
+  if #service.name == 0 or cursor == 0 then return false, service end
+
+  service.argv_serialized, cursor = next_field(line, cursor)
+  if #service.argv_serialized == 0 or cursor == 0 then return false, service end
+
+  local restart: string
+  restart, cursor = next_field(line, cursor)
+  if cursor == 0 then return false, service end
+  local restart_ok: boolean
+  restart_ok, service.restart = parse_restart(restart)
+  if not restart_ok then return false, service end
+
+  local maximum: string
+  maximum, cursor = next_field(line, cursor)
+  if cursor ~= 0 then return false, service end
+  service.max_restarts = tointeger(maximum)
+  if service.max_restarts < 0 or service.max_restarts > 1000000 then
+    return false, service
+  end
+
+  service.state = ServiceState.Planned
+  return true, service
+end
+
+local function records_path(): string
+  local configured = os.getenv('THESEUS_RECORDS')
+  if #configured > 0 then return configured end
+  return './build/services.tsc'
+end
+
+local function load_service(path: string, wanted: string): (boolean, Service)
+  local file = io.open(path, 'r')
+  if not file:isopen() then
+    local empty: Service
+    return false, empty
+  end
+  for line in file:lines() do
+    local ok: boolean
+    local service: Service
+    ok, service = parse_service_record(line)
+    if ok and service.name == wanted then
+      file:close()
+      return true, service
+    end
+  end
+  file:close()
+  local empty: Service
+  return false, empty
+end
+
+local function print_services(path: string, filter: QueryKind)
+  local file = io.open(path, 'r')
+  if not file:isopen() then
+    io.stderr:write('theseus: cannot open compiled service records: ', path, '\n')
+    os.exit(2)
+  end
+  local count: integer = 0
+  for line in file:lines() do
+    local ok: boolean
+    local service: Service
+    ok, service = parse_service_record(line)
+    if ok then
+      local selected = filter == QueryKind.Services or
+        (filter == QueryKind.FailedServices and service.state == ServiceState.Failed) or
+        (filter == QueryKind.RunningServices and service.state == ServiceState.Running)
+      if selected then
+        print(service.name, state_name(service.state))
+        count = count + 1
+      end
+    end
+  end
+  file:close()
+  if count == 0 and filter ~= QueryKind.Services then
+    print('(none)')
+  end
+end
+
+local function parse_the_query(): Query
+  local query: Query
+  if #arg == 1 and arg[1] == 'status' then
+    query.kind = QueryKind.SystemStatus
+    return query
+  end
+  if #arg == 1 and arg[1] == 'services' then
+    query.kind = QueryKind.Services
+    return query
+  end
+  if #arg == 2 and arg[2] == 'services' then
+    if arg[1] == 'failed' then query.kind = QueryKind.FailedServices; return query end
+    if arg[1] == 'running' then query.kind = QueryKind.RunningServices; return query end
+  end
+  if #arg == 3 and arg[2] == 'of' then
+    query.subject = arg[3]
+    if arg[1] == 'status' then query.kind = QueryKind.ServiceStatus; return query end
+    if arg[1] == 'state' then query.kind = QueryKind.ServiceState; return query end
+    if arg[1] == 'restart-policy' then query.kind = QueryKind.ServiceRestartPolicy; return query end
+  end
+  query.kind = QueryKind.Invalid
+  return query
+end
+
+local function parse_theseus_query(): Query
+  local query: Query
+  if #arg == 1 and arg[1] == 'status' then
+    query.kind = QueryKind.SystemStatus
+    return query
+  end
+  if #arg == 1 and arg[1] == 'services' then
+    query.kind = QueryKind.Services
+    return query
+  end
+  if #arg == 2 then
+    query.subject = arg[2]
+    if arg[1] == 'status' then query.kind = QueryKind.ServiceStatus; return query end
+    if arg[1] == 'state' then query.kind = QueryKind.ServiceState; return query end
+  end
+  query.kind = QueryKind.Invalid
+  return query
+end
+
+local function query_mode_is_the(): boolean
+  if #arg[0] < 3 then return false end
+  return string.sub(arg[0], -3) == 'the'
+end
+
+local function show_service(service: Service)
+  print(service.name)
+  print('  state       ', state_name(service.state))
+  print('  restart     ', restart_name(service.restart))
+  print('  max-restarts', service.max_restarts)
+  print('  argv-record ', service.argv_serialized)
+  print('  source       CUE -> TSC1')
+end
+
+local function execute_query(query: Query)
+  local path = records_path()
+  if query.kind == QueryKind.SystemStatus then
+    print('Theseus userspace bootstrap')
+    print('  pid1         no')
+    print('  supervisor   model-only')
+    print('  records      ', path)
+    print('  language     Nelua')
+    print('  config       CUE')
+    return
+  end
+  if query.kind == QueryKind.Services or query.kind == QueryKind.FailedServices or
+     query.kind == QueryKind.RunningServices then
+    print_services(path, query.kind)
+    return
+  end
+  if query.kind == QueryKind.ServiceStatus or query.kind == QueryKind.ServiceState or
+     query.kind == QueryKind.ServiceRestartPolicy then
+    local found: boolean
+    local service: Service
+    found, service = load_service(path, query.subject)
+    if not found then
+      io.stderr:write('theseus: unknown service: ', query.subject, '\n')
+      os.exit(3)
+    end
+    if query.kind == QueryKind.ServiceStatus then
+      show_service(service)
+    elseif query.kind == QueryKind.ServiceState then
+      print(state_name(service.state))
+    else
+      print(restart_name(service.restart))
+    end
+    return
+  end
+  io.stderr:write('theseus: invalid query\n')
+  if query_mode_is_the() then
+    io.stderr:write('usage: the status [of SERVICE] | the state of SERVICE | the services | the failed services\n')
+  else
+    io.stderr:write('usage: theseus status [SERVICE] | theseus state SERVICE | theseus services\n')
+  end
+  os.exit(64)
+end
+
+local function selftest()
+  assert(can_transition(ServiceState.Absent, ServiceState.Planned))
+  assert(can_transition(ServiceState.Planned, ServiceState.Starting))
+  assert(can_transition(ServiceState.Starting, ServiceState.Ready))
+  assert(can_transition(ServiceState.Ready, ServiceState.Running))
+  assert(can_transition(ServiceState.Running, ServiceState.Failed))
+  assert(can_transition(ServiceState.Failed, ServiceState.Backoff))
+  assert(can_transition(ServiceState.Backoff, ServiceState.Starting))
+  assert(not can_transition(ServiceState.Absent, ServiceState.Running))
+  assert(not can_transition(ServiceState.Running, ServiceState.Planned))
+
+  local ok: boolean
+  local service: Service
+  ok, service = parse_service_record('TSC1\tpostgresql\t/usr/bin/postgres\31-D\31/var/lib/postgresql\ton-failure\t5')
+  assert(ok)
+  assert(service.name == 'postgresql')
+  assert(service.state == ServiceState.Planned)
+  assert(service.restart == RestartPolicy.OnFailure)
+  assert(service.max_restarts == 5)
+
+  ok, service = parse_service_record('TSC0\tbad\t/bin/false\tnever\t0')
+  assert(not ok)
+  ok, service = parse_service_record('TSC1\tbad\t/bin/false\tmaybe\t0')
+  assert(not ok)
+  ok, service = parse_service_record('TSC1\tbad\t/bin/false\tnever\t-1')
+  assert(not ok)
+
+  print('Theseus core self-test passed')
+end
+
+if #arg == 1 and arg[1] == '--selftest' then
+  selftest()
+  os.exit(0)
+end
+
+local query = query_mode_is_the() and parse_the_query() or parse_theseus_query()
+execute_query(query)

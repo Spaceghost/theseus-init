@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cue-and-nelua:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUE
+        uses: cue-lang/setup-cue@v1.0.0
+        with:
+          version: v0.17.1
+
+      - name: Validate CUE service model
+        run: |
+          set -eux
+          cue version
+          cue vet ./...
+          mkdir -p build
+          cue export ./services/postgresql.cue -e compiled --out text > build/services.tsc
+          test "$(cut -f1 build/services.tsc)" = TSC1
+
+      - name: Build pinned Nelua compiler
+        run: |
+          set -eux
+          rm -rf /tmp/nelua-lang
+          git init /tmp/nelua-lang
+          git -C /tmp/nelua-lang remote add origin https://github.com/edubart/nelua-lang.git
+          git -C /tmp/nelua-lang fetch --depth 1 origin 9ccf28d
+          git -C /tmp/nelua-lang checkout --detach FETCH_HEAD
+          make -C /tmp/nelua-lang -j2
+          /tmp/nelua-lang/nelua -h >/dev/null
+
+      - name: Compile Theseus
+        run: |
+          set -eux
+          /tmp/nelua-lang/nelua src/theseus.nelua --release -o build/theseus
+          test -x build/theseus
+
+      - name: Run core and grammar contracts
+        run: |
+          set -eux
+          build/theseus --selftest
+          ln -sf theseus build/the
+          export THESEUS_RECORDS="$PWD/build/services.tsc"
+          build/theseus status postgresql | grep -F 'PLANNED'
+          build/the status of postgresql | grep -F 'PLANNED'
+          test "$(build/the state of postgresql)" = PLANNED
+          test "$(build/the restart-policy of postgresql)" = on-failure
+          build/the services | grep -F 'postgresql'
+          build/the failed services | grep -F '(none)'

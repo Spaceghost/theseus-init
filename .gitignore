@@ -1,0 +1,6 @@
+build/
+*.c
+*.o
+*.so
+*.a
+*.out
