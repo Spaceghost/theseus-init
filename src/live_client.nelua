@@ -46,11 +46,12 @@ local function fill_address(address: *SockaddrUn, path: string)
 end
 
 local function write_all(fd: cint, text: string): boolean
-  local offset: integer = 0
-  while offset < #text do
-    local wrote = c_write(fd, &text.data[offset], (@csize)(#text - offset))
+  local remaining = text
+  while #remaining > 0 do
+    local wrote = c_write(fd, (@cstring)(remaining), (@csize)(#remaining))
     if wrote <= 0 then return false end
-    offset = offset + wrote
+    if wrote == #remaining then return true end
+    remaining = string.sub(remaining, wrote + 1)
   end
   return true
 end
