@@ -43,7 +43,7 @@ jobs:
       - name: Compile Theseus
         run: |
           set -eux
-          /tmp/nelua-lang/nelua src/theseus.nelua --release -o build/theseus
+          /tmp/nelua-lang/nelua --compile-binary --release -o build/theseus src/theseus.nelua
           test -x build/theseus
 
       - name: Run core and grammar contracts
