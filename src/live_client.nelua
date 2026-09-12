@@ -122,7 +122,11 @@ local function show_status(response: string, state_only: boolean): integer
   last_exit, cursor = next_field(response, cursor)
   last_signal, cursor = next_field(response, cursor)
   if magic ~= 'TR1' or kind ~= 'STATUS' or cursor ~= 0 or #name == 0 or #state == 0 then
-    io.stderr:write('theseus: malformed supervisor response\n')
+    io.stderr:write('theseus: malformed supervisor response len=', tostring(#response),
+      ' cursor=', tostring(cursor), ' magic=[', magic, '] kind=[', kind,
+      '] name=[', name, '] state=[', state, '] pid=[', pid, '] pidfd=[', pidfd,
+      '] restarts=[', restarts, '] last-exit=[', last_exit,
+      '] last-signal=[', last_signal, '] raw=[', response, ']\n')
     return 65
   end
   if state_only then print(state); return 0 end
@@ -157,7 +161,7 @@ local function shutdown(): integer
     return 69
   end
   if response ~= 'TR1\tOK\n' then
-    io.stderr:write('theseus: supervisor rejected shutdown\n')
+    io.stderr:write('theseus: supervisor rejected shutdown response=[', response, ']\n')
     return 70
   end
   print('Theseus supervisor stopped cleanly')
