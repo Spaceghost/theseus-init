@@ -116,45 +116,45 @@ local function load_graph(path: string, graph: *Graph): boolean
     return false
   end
   for line in file:lines() do
-    if #line == 0 then goto continue end
-    if string.sub(line, 1, 5) == 'TSC3\t' then
-      if graph.service_count >= MAX_SERVICES then
-        io.stderr:write('theseus-graph: service bound exceeded\n')
+    if #line > 0 then
+      if string.sub(line, 1, 5) == 'TSC3\t' then
+        if graph.service_count >= MAX_SERVICES then
+          io.stderr:write('theseus-graph: service bound exceeded\n')
+          file:close()
+          return false
+        end
+        local ok: boolean
+        local service: GraphService
+        ok, service = parse_service(line)
+        if not ok or find_service(graph, service.name) >= 0 then
+          io.stderr:write('theseus-graph: malformed or duplicate service record\n')
+          file:close()
+          return false
+        end
+        graph.services[graph.service_count] = service
+        graph.service_count = graph.service_count + 1
+      elseif string.sub(line, 1, 5) == 'TGT1\t' then
+        if graph.target_count >= MAX_TARGETS then
+          io.stderr:write('theseus-graph: target bound exceeded\n')
+          file:close()
+          return false
+        end
+        local ok: boolean
+        local target: Target
+        ok, target = parse_target(line)
+        if not ok or find_target(graph, target.name) >= 0 then
+          io.stderr:write('theseus-graph: malformed or duplicate target record\n')
+          file:close()
+          return false
+        end
+        graph.targets[graph.target_count] = target
+        graph.target_count = graph.target_count + 1
+      else
+        io.stderr:write('theseus-graph: unknown record type\n')
         file:close()
         return false
       end
-      local ok: boolean
-      local service: GraphService
-      ok, service = parse_service(line)
-      if not ok or find_service(graph, service.name) >= 0 then
-        io.stderr:write('theseus-graph: malformed or duplicate service record\n')
-        file:close()
-        return false
-      end
-      graph.services[graph.service_count] = service
-      graph.service_count = graph.service_count + 1
-    elseif string.sub(line, 1, 5) == 'TGT1\t' then
-      if graph.target_count >= MAX_TARGETS then
-        io.stderr:write('theseus-graph: target bound exceeded\n')
-        file:close()
-        return false
-      end
-      local ok: boolean
-      local target: Target
-      ok, target = parse_target(line)
-      if not ok or find_target(graph, target.name) >= 0 then
-        io.stderr:write('theseus-graph: malformed or duplicate target record\n')
-        file:close()
-        return false
-      end
-      graph.targets[graph.target_count] = target
-      graph.target_count = graph.target_count + 1
-    else
-      io.stderr:write('theseus-graph: unknown record type\n')
-      file:close()
-      return false
     end
-    ::continue::
   end
   file:close()
   return graph.service_count > 0 and graph.target_count > 0
