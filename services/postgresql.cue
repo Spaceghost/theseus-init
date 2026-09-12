@@ -20,4 +20,5 @@ service: schema.#Service & {
 
 // TSC1 is intentionally tiny and non-JSON. Unit separator preserves argv
 // boundaries inside the third tab-delimited field.
-compiled: "TSC1\t\(service.name)\t\(strings.Join(service.exec, \"\u001f\"))\t\(service.restart)\t\(service.maxRestarts)"
+let argvSeparator = "\u001f"
+compiled: "TSC1\t\(service.name)\t\(strings.Join(service.exec, argvSeparator))\t\(service.restart)\t\(service.maxRestarts)"
