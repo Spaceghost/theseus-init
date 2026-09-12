@@ -24,7 +24,7 @@ jobs:
           set -eux
           cue vet ./...
           mkdir -p build
-          cue export ./tests/graph.cue -e compiled --out text > build/graph.tsc
+          cue export ./graphfixtures -e compiled --out text > build/graph.tsc
           test "$(grep -c '^TSC3' build/graph.tsc)" -eq 8
           test "$(grep -c '^TGT1' build/graph.tsc)" -eq 3
 
