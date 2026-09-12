@@ -1,0 +1,182 @@
+-- Theseus live local client. Compile once and invoke as `theseus` or `the`.
+-- `the` has no mutating grammar.
+
+require 'arg'
+require 'io'
+require 'os'
+require 'string'
+
+local function c_socket(domain: cint, kind: cint, protocol: cint): cint <cimport 'socket', nodecl, cinclude '<sys/socket.h>'> end
+local function c_connect(fd: cint, address: pointer, length: cuint): cint <cimport 'connect', nodecl, cinclude '<sys/socket.h>'> end
+local function c_read(fd: cint, buffer: pointer, count: csize): clong <cimport 'read', nodecl, cinclude '<unistd.h>'> end
+local function c_write(fd: cint, buffer: pointer, count: csize): clong <cimport 'write', nodecl, cinclude '<unistd.h>'> end
+local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
+local AF_UNIX: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local SOCK_STREAM: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+
+local SockaddrUn = @record{
+  sun_family: cushort,
+  sun_path: [108]cchar,
+}
+
+local function is_the(): boolean
+  if #arg[0] < 3 then return false end
+  return string.sub(arg[0], -3) == 'the'
+end
+
+local function socket_path(): string
+  local path = os.getenv('THESEUS_SOCKET')
+  if #path == 0 then
+    io.stderr:write('theseus: THESEUS_SOCKET is required in userspace mode\n')
+    os.exit(64)
+  end
+  if #path > 100 or string.byte(path, 1) ~= 47 then
+    io.stderr:write('theseus: invalid socket path\n')
+    os.exit(64)
+  end
+  return path
+end
+
+local function fill_address(address: *SockaddrUn, path: string)
+  address.sun_family = (@cushort)(AF_UNIX)
+  for i: integer = 0, 107 do address.sun_path[i] = 0 end
+  for i: isize = 1, #path do
+    address.sun_path[i - 1] = (@cchar)(string.byte(path, i))
+  end
+end
+
+local function write_all(fd: cint, text: string): boolean
+  local offset: integer = 0
+  while offset < #text do
+    local wrote = c_write(fd, &text.data[offset], (@csize)(#text - offset))
+    if wrote <= 0 then return false end
+    offset = offset + wrote
+  end
+  return true
+end
+
+local function read_line(fd: cint): (boolean, string)
+  local buffer: [512]cchar
+  local used: integer = 0
+  while used < 511 do
+    local got = c_read(fd, &buffer[used], (@csize)(511 - used))
+    if got <= 0 then return false, '' end
+    local end_at = used + got
+    for i: integer = used, end_at - 1 do
+      if buffer[i] == 10 then
+        buffer[i + 1] = 0
+        return true, (@cstring)(&buffer[0])
+      end
+    end
+    used = end_at
+  end
+  return false, ''
+end
+
+local function exchange(request: string): (boolean, string)
+  local path = socket_path()
+  local fd = c_socket(AF_UNIX, SOCK_STREAM, 0)
+  if fd < 0 then return false, '' end
+  local address: SockaddrUn
+  fill_address(&address, path)
+  if c_connect(fd, &address, (@cuint)(2 + #path + 1)) ~= 0 then
+    c_close(fd)
+    return false, ''
+  end
+  if not write_all(fd, request) then c_close(fd); return false, '' end
+  local ok: boolean
+  local response: string
+  ok, response = read_line(fd)
+  c_close(fd)
+  return ok, response
+end
+
+local function next_field(line: string, cursor: isize): (string, isize)
+  local first, last = string.find(line, '\t', cursor, true)
+  if first == 0 then
+    local final = string.sub(line, cursor)
+    if #final > 0 and string.byte(final, #final) == 10 then final = string.sub(final, 1, #final - 1) end
+    return final, 0
+  end
+  return string.sub(line, cursor, first - 1), last + 1
+end
+
+local function show_status(response: string, state_only: boolean): integer
+  local cursor: isize = 1
+  local magic: string
+  local kind: string
+  local name: string
+  local state: string
+  local pid: string
+  local pidfd: string
+  local restarts: string
+  local last_exit: string
+  local last_signal: string
+  magic, cursor = next_field(response, cursor)
+  kind, cursor = next_field(response, cursor)
+  name, cursor = next_field(response, cursor)
+  state, cursor = next_field(response, cursor)
+  pid, cursor = next_field(response, cursor)
+  pidfd, cursor = next_field(response, cursor)
+  restarts, cursor = next_field(response, cursor)
+  last_exit, cursor = next_field(response, cursor)
+  last_signal, cursor = next_field(response, cursor)
+  if magic ~= 'TR1' or kind ~= 'STATUS' or cursor ~= 0 or #name == 0 or #state == 0 then
+    io.stderr:write('theseus: malformed supervisor response\n')
+    return 65
+  end
+  if state_only then print(state); return 0 end
+  print(name)
+  print('  state      ', state)
+  print('  pid        ', pid)
+  print('  identity    pidfd')
+  print('  pidfd      ', pidfd)
+  print('  restarts   ', restarts)
+  print('  last-exit  ', last_exit)
+  print('  last-signal', last_signal)
+  return 0
+end
+
+local function query_status(name: string, state_only: boolean): integer
+  local ok: boolean
+  local response: string
+  ok, response = exchange('TQ1\tSTATUS\t' .. name .. '\n')
+  if not ok then
+    io.stderr:write('theseus: supervisor socket unavailable\n')
+    return 69
+  end
+  return show_status(response, state_only)
+end
+
+local function shutdown(): integer
+  local ok: boolean
+  local response: string
+  ok, response = exchange('TQ1\tSHUTDOWN\n')
+  if not ok then
+    io.stderr:write('theseus: supervisor socket unavailable\n')
+    return 69
+  end
+  if response ~= 'TR1\tOK\n' then
+    io.stderr:write('theseus: supervisor rejected shutdown\n')
+    return 70
+  end
+  print('Theseus supervisor stopped cleanly')
+  return 0
+end
+
+if is_the() then
+  if #arg == 3 and arg[2] == 'of' and arg[1] == 'status' then
+    os.exit(query_status(arg[3], false))
+  end
+  if #arg == 3 and arg[2] == 'of' and arg[1] == 'state' then
+    os.exit(query_status(arg[3], true))
+  end
+  io.stderr:write('usage: the status of SERVICE | the state of SERVICE\n')
+  os.exit(64)
+end
+
+if #arg == 2 and arg[1] == 'status' then os.exit(query_status(arg[2], false)) end
+if #arg == 2 and arg[1] == 'state' then os.exit(query_status(arg[2], true)) end
+if #arg == 1 and arg[1] == 'daemon-stop' then os.exit(shutdown()) end
+io.stderr:write('usage: theseus status SERVICE | theseus state SERVICE | theseus daemon-stop\n')
+os.exit(64)
