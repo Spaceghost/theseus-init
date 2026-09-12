@@ -144,7 +144,7 @@ local function can_transition(from: ServiceState, to: ServiceState): boolean
   end
   if from == ServiceState.Running then
     return to == ServiceState.Degraded or to == ServiceState.Stopping or
-           to == ServiceState.Failed
+           to == ServiceState.Stopped or to == ServiceState.Failed
   end
   if from == ServiceState.Degraded then
     return to == ServiceState.Running or to == ServiceState.Stopping or
@@ -610,6 +610,7 @@ local function selftest()
   assert(can_transition(ServiceState.Starting, ServiceState.Ready))
   assert(can_transition(ServiceState.Ready, ServiceState.Running))
   assert(can_transition(ServiceState.Running, ServiceState.Failed))
+  assert(can_transition(ServiceState.Running, ServiceState.Stopped))
   assert(can_transition(ServiceState.Failed, ServiceState.Backoff))
   assert(can_transition(ServiceState.Backoff, ServiceState.Starting))
   assert(not can_transition(ServiceState.Absent, ServiceState.Running))
