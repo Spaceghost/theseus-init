@@ -75,16 +75,15 @@ jobs:
           fi
           test "$rc" -eq 69
           grep -F 'refusing to spawn it' build/postgresql-run.txt
-          ! grep -F 'spawn postgresql' build/postgresql-run.txt
+          ! grep -F 'spawn' build/postgresql-run.txt
 
       - name: Supervise successful child with pidfd identity
         run: |
           set -eux
           export THESEUS_RECORDS="$PWD/build/services.tsc"
           build/theseus run true-once | tee build/true-once.txt
-          grep -F 'spawn true-once pid ' build/true-once.txt
-          grep -F ' pidfd ' build/true-once.txt
-          grep -F 'result true-once STOPPED attempts 1 restarts 0 exit 0 signal 0' build/true-once.txt
+          grep -E '^spawn[[:space:]]+true-once[[:space:]]+pid[[:space:]]+[0-9]+[[:space:]]+pidfd[[:space:]]+[0-9]+[[:space:]]+attempt[[:space:]]+1$' build/true-once.txt
+          grep -E '^result[[:space:]]+true-once[[:space:]]+STOPPED[[:space:]]+attempts[[:space:]]+1[[:space:]]+restarts[[:space:]]+0[[:space:]]+exit[[:space:]]+0[[:space:]]+signal[[:space:]]+0$' build/true-once.txt
 
       - name: Apply bounded on-failure restart policy
         run: |
@@ -97,17 +96,16 @@ jobs:
             rc=$?
           fi
           test "$rc" -eq 1
-          test "$(grep -c '^spawn false-restart ' build/false-restart.txt)" -eq 3
-          test "$(grep -c '^restart false-restart ' build/false-restart.txt)" -eq 2
-          grep -F 'result false-restart FAILED attempts 3 restarts 2 exit 1 signal 0' build/false-restart.txt
+          test "$(grep -Ec '^spawn[[:space:]]+false-restart[[:space:]]' build/false-restart.txt)" -eq 3
+          test "$(grep -Ec '^restart[[:space:]]+false-restart[[:space:]]' build/false-restart.txt)" -eq 2
+          grep -E '^result[[:space:]]+false-restart[[:space:]]+FAILED[[:space:]]+attempts[[:space:]]+3[[:space:]]+restarts[[:space:]]+2[[:space:]]+exit[[:space:]]+1[[:space:]]+signal[[:space:]]+0$' build/false-restart.txt
 
       - name: Stop a live child through its pidfd
         run: |
           set -eux
           export THESEUS_RECORDS="$PWD/build/services.tsc"
           build/theseus run sleep-stop --stop-after-ms 25 | tee build/sleep-stop.txt
-          grep -F 'transition sleep-stop STARTING READY' build/sleep-stop.txt
-          grep -F 'transition sleep-stop READY RUNNING' build/sleep-stop.txt
-          grep -F 'signal sleep-stop pidfd ' build/sleep-stop.txt
-          grep -F ' signal 15' build/sleep-stop.txt
-          grep -F 'result sleep-stop STOPPED attempts 1 restarts 0 exit -1 signal 15' build/sleep-stop.txt
+          grep -E '^transition[[:space:]]+sleep-stop[[:space:]]+STARTING[[:space:]]+READY$' build/sleep-stop.txt
+          grep -E '^transition[[:space:]]+sleep-stop[[:space:]]+READY[[:space:]]+RUNNING$' build/sleep-stop.txt
+          grep -E '^signal[[:space:]]+sleep-stop[[:space:]]+pidfd[[:space:]]+[0-9]+[[:space:]]+signal[[:space:]]+15$' build/sleep-stop.txt
+          grep -E '^result[[:space:]]+sleep-stop[[:space:]]+STOPPED[[:space:]]+attempts[[:space:]]+1[[:space:]]+restarts[[:space:]]+0[[:space:]]+exit[[:space:]]+-1[[:space:]]+signal[[:space:]]+15$' build/sleep-stop.txt
