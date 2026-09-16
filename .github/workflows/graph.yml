@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   native-target-plan:
-    runs-on: ubuntu-latest
+    runs-on: incus-spaceghost-theseus-init
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
