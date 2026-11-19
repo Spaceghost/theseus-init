@@ -8,6 +8,9 @@ local function c_read(fd: cint, data: pointer, length: csize): clong <cimport 'r
 local function c_write(fd: cint, data: pointer, length: csize): clong <cimport 'write', nodecl, cinclude '<unistd.h>'> end
 local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
 local function c_fork(): cint <cimport 'fork', nodecl, cinclude '<unistd.h>'> end
+local function c_getpid(): cint <cimport 'getpid', nodecl, cinclude '<unistd.h>'> end
+local function c_getppid(): cint <cimport 'getppid', nodecl, cinclude '<unistd.h>'> end
+local function c_prctl(option: cint, arg2: culong, arg3: culong, arg4: culong, arg5: culong): cint <cimport 'prctl', nodecl, cinclude '<sys/prctl.h>'> end
 local function c_exit(code: cint): void <cimport '_exit', nodecl, cinclude '<unistd.h>'> end
 local function c_kill(pid: cint, signal: cint): cint <cimport 'kill', nodecl, cinclude '<signal.h>'> end
 local function c_waitpid(pid: cint, status: *cint, flags: cint): cint <cimport 'waitpid', nodecl, cinclude '<sys/wait.h>'> end
@@ -25,6 +28,7 @@ local MSG_DONTWAIT: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
 local MSG_NOSIGNAL: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
 local POLLOUT: cshort <cimport, nodecl, cinclude '<poll.h>'>
 local SIGPIPE: cint <cimport, nodecl, cinclude '<signal.h>'>
+local PR_SET_PDEATHSIG: cint <cimport, nodecl, cinclude '<sys/prctl.h>'>
 local SIGKILL: cint <cimport, nodecl, cinclude '<signal.h>'>
 local SIG_IGN: Handler <cimport, nodecl, cinclude '<signal.h>'>
 local WNOHANG: cint <cimport, nodecl, cinclude '<sys/wait.h>'>
@@ -80,8 +84,13 @@ global function start_daemon_log(): boolean
     c_close(pair[0]); c_close(pair[1])
     return false
   end
+  local parent = c_getpid()
   writer = c_fork()
   if writer == 0 then
+    -- The writer may be blocked in output when the daemon is killed.
+    if c_prctl(PR_SET_PDEATHSIG, (@culong)(SIGKILL), 0, 0, 0) ~= 0 or c_getppid() ~= parent then
+      c_exit(126)
+    end
     c_close(pair[0])
     write_loop(pair[1])
     c_exit(0)

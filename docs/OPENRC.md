@@ -162,6 +162,7 @@ printf 'TSC2\ttree\t%s\037tree\037%s\tnever\t0\tnone\n' /opt/theseus/bin/control
 
 Each cycle starts a service with a detached process, verifies the
 live instance rejects a competing launch, and kills the daemon
-with SIGKILL. The next launch must bring the service up again
+with SIGKILL while its log output is blocked. The log writer must
+exit with the daemon. The next launch must bring the service up again
 after clearing the previous processes, then shut down without
 leaving an instance cgroup or runtime files.

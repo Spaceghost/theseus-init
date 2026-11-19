@@ -14,6 +14,7 @@ local function c_waitpid(pid: cint, status: *cint, opts: cint): cint <cimport 'w
 local function c_pipe(fds: *cint): cint <cimport 'pipe', nodecl, cinclude '<unistd.h>'> end
 local function c_fcntl(fd: cint, command: cint, value: cint): cint <cimport 'fcntl', nodecl, cinclude '<fcntl.h>'> end
 local function c_ioctl(fd: cint, request: cint, value: *cint): cint <cimport 'ioctl', nodecl, cinclude '<sys/ioctl.h>'> end
+local function c_write(fd: cint, data: pointer, count: csize): clong <cimport 'write', nodecl, cinclude '<unistd.h>'> end
 local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
 local function c_dup2(oldfd: cint, fd: cint): cint <cimport 'dup2', nodecl, cinclude '<unistd.h>'> end
 local function c_access(path: cstring, mode: cint): cint <cimport 'access', nodecl, cinclude '<unistd.h>'> end
@@ -65,11 +66,17 @@ local function content(path: string): string
   return data
 end
 
-local function start_daemon(program: cstring, selection: cstring, target: cstring): (cint, cint)
+local function start_daemon(program: cstring, selection: cstring, target: cstring, prefill: facultative(boolean)): (cint, cint)
   local output: [2]cint
   assert(c_pipe(&output[0]) == 0, 'cannot create stalled output')
   assert(c_fcntl(output[0], F_SETPIPE_SZ, OutputCapacity) == OutputCapacity, 'cannot size stalled output')
   assert(c_fcntl(output[0], F_SETFD, FD_CLOEXEC) == 0, 'cannot protect output reader')
+  ## if not prefill.type.is_niltype then
+  if prefill then
+    local padding: [4096]byte
+    assert(c_write(output[1], &padding[0], #padding) == #padding, 'cannot prefill output pipe')
+  end
+  ## end
   local argv: [4]cstring = {program, selection, target, nilptr}
   local parent = c_getpid()
   local pid = c_fork()
@@ -252,7 +259,7 @@ local function qualify_recovery(bindir: string, work: string, root: string)
   local recovery = work .. '/instance'
   local first_marker, second_marker = work .. '/first.pid', work .. '/second.pid'
   assert(not exists(first_marker) and not exists(second_marker), 'stale tree fixture')
-  local first, first_output = start_daemon(program, 'tree', nilptr)
+  local first, first_output = start_daemon(program, 'tree', nilptr, true)
   wait_file(first_marker)
   wait_state(client, 'tree', 'RUNNING')
   local tree = pid_of(client, 'tree')
@@ -261,6 +268,14 @@ local function qualify_recovery(bindir: string, work: string, root: string)
   local descendant = (@cint)(tonumber(fields[2]))
   local tree_path = '/proc/' .. tostring(tree)
   local descendant_path = '/proc/' .. tostring(descendant)
+  local daemon_pid = tostring(first)
+  local children = content('/proc/' .. daemon_pid .. '/task/' .. daemon_pid .. '/children')
+  local writer_path = ''
+  for pid in string.gmatch(children, '%d+') do
+    local child = '/proc/' .. pid
+    if content(child .. '/comm') == 'theseusd\n' then writer_path = child end
+  end
+  assert(#writer_path > 0, 'daemon log writer was not running')
   local belongs = content(descendant_path .. '/cgroup')
   local prefix = '0::' .. string.sub(root, #'/sys/fs/cgroup' + 1) .. '/theseus-instance-'
   assert(string.find(belongs, prefix, 1, true) == 1, belongs)
@@ -274,6 +289,7 @@ local function qualify_recovery(bindir: string, work: string, root: string)
   c_close(competitor_output)
   assert(pid_of(client, 'tree') == tree and exists(descendant_path), 'duplicate launch disturbed live work')
   assert(c_kill(first, SIGKILL) == 0 and wait_daemon(first) == 137, 'daemon did not receive SIGKILL')
+  wait_not_present(writer_path)
   c_close(first_output)
   assert(exists(descendant_path) and exists(recovery .. '/control.sock'), 'crash left no recovery work')
 
