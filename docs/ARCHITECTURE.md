@@ -17,7 +17,7 @@ CUE service declarations
         |
         | validate + compile
         v
-TSC1 deterministic records
+TSC2 service records / TSC3 graph records
         |
         v
 Nelua Theseus core
@@ -53,15 +53,34 @@ ABSENT -> PLANNED -> STARTING -> READY -> RUNNING
 
 Illegal transitions are rejected rather than silently coerced.
 
-## TSC1
+## Runtime records
 
-The bootstrap runtime record is deliberately narrow:
+The one-shot and live supervisors consume records in this TSC2 format.
 
 ```text
-TSC1<TAB>name<TAB>argv-with-US-separators<TAB>restart-policy<TAB>max-restarts
+TSC2<TAB>name<TAB>argv-with-US-separators<TAB>restart-policy<TAB>max-restarts<TAB>readiness-kind
 ```
 
-TSC1 is not intended to become a kitchen-sink wire format. It exists to prove the CUE-to-Nelua boundary without adding JSON or a runtime CUE evaluator. A later binary format may replace it once process supervision and compatibility requirements settle.
+The argv field holds up to 32 arguments. Empty arguments after the executable
+are preserved.
+
+The graph planner consumes TSC3 service records, which append the
+`requires`, `wants`, `after`, and `before` lists to the service fields. It
+reads target membership from TGT1 records in the same input.
+
+## Userspace daemon
+
+Set `THESEUS_SOCKET` to an absolute path in a directory controlled by the
+daemon's user. The socket is created with mode 0600. The daemon handles
+up to eight active requests, each with a one-second deadline for sending
+the request line. Partial requests and restart backoff share the poll
+loop with child exit detection.
+
+`theseus daemon-stop`, SIGTERM, and SIGINT initiate shutdown. The daemon
+signals its direct child through the pidfd and gives it one second to
+exit. If that expires, it sends SIGKILL and waits up to one more second
+for exit. The daemon acknowledges a successful control shutdown after
+the child has been reaped and the socket removed.
 
 ## PID 1 boundary
 

@@ -1,15 +1,18 @@
 package schema
 
-import "strings"
+import (
+  "list"
+  "strings"
+)
 
 #ServiceName: string & =~"^[a-zA-Z0-9][a-zA-Z0-9._@:+-]{0,62}$"
-#SafeText: string & !~"[\\t\\r\\n\\x1f]"
+#SafeText: string & !~"[\\t\\r\\n\\x00\\x1f]"
 #RestartPolicy: "never" | "on-failure" | "always"
 #ReadinessKind: "none" | "pid" | "unix-socket"
 
 #Service: {
   name: #ServiceName
-  exec: [#SafeText, ...#SafeText] & [_, ...]
+  exec: [#SafeText & != "", ...#SafeText] & list.MaxItems(32)
 
   requires: *[] | [...#ServiceName]
   wants:    *[] | [...#ServiceName]

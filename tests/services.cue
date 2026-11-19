@@ -8,6 +8,13 @@ import (
 services: [
   schema.#CompiledService & {
     service: {
+      name: "argv-roundtrip"
+      exec: ["/bin/echo", "first arg", "", "last arg", ""]
+      restart: "never"
+    }
+  },
+  schema.#CompiledService & {
+    service: {
       name: "true-once"
       exec: ["/bin/true"]
       restart: "never"

@@ -1,0 +1,93 @@
+-- Black-box control socket regression tests and a SIGTERM-resistant child.
+
+require 'arg'
+require 'io'
+require 'os'
+require 'string'
+
+local function c_socket(domain: cint, kind: cint, protocol: cint): cint <cimport 'socket', nodecl, cinclude '<sys/socket.h>'> end
+local function c_connect(fd: cint, address: pointer, length: cuint): cint <cimport 'connect', nodecl, cinclude '<sys/socket.h>'> end
+local function c_shutdown(fd: cint, how: cint): cint <cimport 'shutdown', nodecl, cinclude '<sys/socket.h>'> end
+local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
+local function c_read(fd: cint, buffer: pointer, count: csize): clong <cimport 'read', nodecl, cinclude '<unistd.h>'> end
+local function c_write(fd: cint, buffer: pointer, count: csize): clong <cimport 'write', nodecl, cinclude '<unistd.h>'> end
+local function c_pause(): cint <cimport 'pause', nodecl, cinclude '<unistd.h>'> end
+local SignalHandler = @function(cint): void
+local function c_signal(signal: cint, handler: SignalHandler): SignalHandler <cimport 'signal', nodecl, cinclude '<signal.h>'> end
+local AF_UNIX: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local SOCK_STREAM: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local SHUT_RD: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local SIGTERM: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SIG_IGN: SignalHandler <cimport, nodecl, cinclude '<signal.h>'>
+local SIG_ERR: SignalHandler <cimport, nodecl, cinclude '<signal.h>'>
+local POLLIN: cshort <cimport, nodecl, cinclude '<poll.h>'>
+local Pollfd = @record{fd: cint, events: cshort, revents: cshort}
+local function c_poll(fds: *Pollfd, count: culong, timeout_ms: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
+local SockaddrUn = @record{sun_family: cushort, sun_path: [108]cchar}
+
+local function connect(): cint
+  local path = os.getenv('THESEUS_SOCKET')
+  assert(#path > 0 and #path <= 100, 'test requires THESEUS_SOCKET')
+  local address: SockaddrUn = {sun_family = (@cushort)(AF_UNIX)}
+  for i: isize = 1, #path do address.sun_path[i - 1] = (@cchar)(string.byte(path, i)) end
+  local fd = c_socket(AF_UNIX, SOCK_STREAM, 0)
+  assert(fd >= 0, 'socket failed')
+  assert(c_connect(fd, &address, (@cuint)(2 + #path + 1)) == 0, 'connect failed')
+  return fd
+end
+
+local function send(fd: cint, request: string)
+  assert(c_write(fd, (@cstring)(request), (@csize)(#request)) == #request, 'test write failed')
+end
+
+local function expect_status(fd: cint)
+  local event: Pollfd = {fd = fd, events = POLLIN}
+  local buffer: [255]cchar
+  local used: integer = 0
+  while used < 255 do
+    assert(c_poll(&event, 1, 750) == 1, 'control request stalled')
+    local got = c_read(fd, &buffer[used], (@csize)(255 - used))
+    assert(got > 0, 'no status response')
+    used = used + got
+    if buffer[used - 1] == 10 then
+      local line: string = {data = &buffer[0], size = (@usize)(used)}
+      assert(string.find(line, 'TR1\tSTATUS\tsleep-stop\tRUNNING\t', 1, true) == 1,
+            'unexpected status response')
+      return
+    end
+  end
+  assert(false, 'oversized status response')
+end
+
+if arg[1] == 'ignore-term' then
+  assert(c_signal(SIGTERM, SIG_IGN) ~= SIG_ERR, 'failed to ignore SIGTERM')
+  local marker = io.open(arg[2], 'w')
+  assert(marker:isopen(), 'failed to create readiness marker')
+  marker:close()
+  while true do c_pause() end
+end
+
+local request = 'TQ1\tSTATUS\tsleep-stop\n'
+local fragmented = connect()
+send(fragmented, 'TQ1\tSTAT')
+
+local disconnected = connect()
+assert(c_shutdown(disconnected, SHUT_RD) == 0, 'shutdown read side failed')
+send(disconnected, request)
+c_close(disconnected)
+
+local healthy = connect()
+send(healthy, request)
+expect_status(healthy)
+c_close(healthy)
+
+send(fragmented, 'US\tsleep-stop\n')
+expect_status(fragmented)
+c_close(fragmented)
+
+local idle = connect()
+local event: Pollfd = {fd = idle, events = POLLIN}
+assert(c_poll(&event, 1, 3000) == 1, 'idle connection never expired')
+local byte: cchar
+assert(c_read(idle, &byte, 1) == 0, 'idle connection received unexpected data')
+c_close(idle)

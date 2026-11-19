@@ -9,8 +9,9 @@ require 'string'
 local function c_socket(domain: cint, kind: cint, protocol: cint): cint <cimport 'socket', nodecl, cinclude '<sys/socket.h>'> end
 local function c_connect(fd: cint, address: pointer, length: cuint): cint <cimport 'connect', nodecl, cinclude '<sys/socket.h>'> end
 local function c_read(fd: cint, buffer: pointer, count: csize): clong <cimport 'read', nodecl, cinclude '<unistd.h>'> end
-local function c_write(fd: cint, buffer: pointer, count: csize): clong <cimport 'write', nodecl, cinclude '<unistd.h>'> end
+local function c_send(fd: cint, buffer: pointer, count: csize, flags: cint): clong <cimport 'send', nodecl, cinclude '<sys/socket.h>'> end
 local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
+local MSG_NOSIGNAL: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
 local AF_UNIX: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
 local SOCK_STREAM: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
 
@@ -48,7 +49,7 @@ end
 local function write_all(fd: cint, text: string): boolean
   local remaining = text
   while #remaining > 0 do
-    local wrote = c_write(fd, (@cstring)(remaining), (@csize)(#remaining))
+    local wrote = c_send(fd, (@cstring)(remaining), (@csize)(#remaining), MSG_NOSIGNAL)
     if wrote <= 0 then return false end
     if wrote == #remaining then return true end
     remaining = string.sub(remaining, wrote + 1)

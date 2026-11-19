@@ -41,7 +41,15 @@ Generated C from Nelua is a build artifact, never maintained source. Shell scrip
 
 ## Current status
 
-Bootstrap implementation in progress. The first executable milestone intentionally runs as an ordinary process rather than PID 1.
+The userspace daemon supervises one foreground child per invocation. It
+tracks the child with a Linux pidfd, applies bounded restart policy, and
+serves status and shutdown requests over a local Unix socket. The native
+target planner validates dependencies and produces an execution order.
+
+Target execution, Unix socket readiness for services, descendant
+ownership, and compatibility with the Alpine OpenRC corpus are still
+pending. The rescue entry point below is separate from the service
+supervisor.
 
 ## Early boot in nebox
 

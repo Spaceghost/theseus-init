@@ -1,3 +1,5 @@
+## cflags '-D_GNU_SOURCE'
+
 -- Theseus userspace supervisor bootstrap.
 -- Maintained implementation is Nelua. CUE emits TSC2 records consumed here.
 
@@ -251,7 +253,9 @@ local function decode_exec_argv(serialized: string, out: *ExecArgv): boolean
       item = string.sub(serialized, cursor, first - 1)
       cursor = last + 1
     end
-    if #item == 0 then return false end
+    if (count == 0 and #item == 0) or string.find(item, '\0', 1, true) ~= 0 then
+      return false
+    end
     out.storage[count] = item
     out.cargs[count] = (@cstring)(out.storage[count])
     count = count + 1

@@ -1,3 +1,5 @@
+## cflags '-D_GNU_SOURCE'
+
 -- Long-lived Theseus userspace supervisor.
 -- Maintained implementation is Nelua; CUE is compiled away before runtime.
 
@@ -12,24 +14,48 @@ local function c__exit(status: cint): void <cimport '_exit', nodecl, cinclude '<
 local function c_waitpid(pid: cint, status: *cint, options: cint): cint <cimport 'waitpid', nodecl, cinclude '<sys/wait.h>'> end
 local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
 local function c_kill(pid: cint, signal: cint): cint <cimport 'kill', nodecl, cinclude '<signal.h>'> end
-local function c_usleep(usec: cuint): cint <cimport 'usleep', nodecl, cinclude '<unistd.h>'> end
 local function c_syscall2(number: clong, a1: clong, a2: clong): clong <cimport 'syscall', nodecl, cinclude '<unistd.h>'> end
 local function c_syscall4(number: clong, a1: clong, a2: clong, a3: pointer, a4: clong): clong <cimport 'syscall', nodecl, cinclude '<unistd.h>'> end
 local function c_socket(domain: cint, kind: cint, protocol: cint): cint <cimport 'socket', nodecl, cinclude '<sys/socket.h>'> end
 local function c_bind(fd: cint, address: pointer, length: cuint): cint <cimport 'bind', nodecl, cinclude '<sys/socket.h>'> end
 local function c_listen(fd: cint, backlog: cint): cint <cimport 'listen', nodecl, cinclude '<sys/socket.h>'> end
-local function c_accept(fd: cint, address: pointer, length: pointer): cint <cimport 'accept', nodecl, cinclude '<sys/socket.h>'> end
+local function c_accept4(fd: cint, address: pointer, length: pointer, flags: cint): cint <cimport 'accept4', nodecl, cinclude '<sys/socket.h>'> end
 local function c_read(fd: cint, buffer: pointer, count: csize): clong <cimport 'read', nodecl, cinclude '<unistd.h>'> end
-local function c_write(fd: cint, buffer: pointer, count: csize): clong <cimport 'write', nodecl, cinclude '<unistd.h>'> end
+local function c_send(fd: cint, buffer: pointer, count: csize, flags: cint): clong <cimport 'send', nodecl, cinclude '<sys/socket.h>'> end
 local function c_unlink(path: cstring): cint <cimport 'unlink', nodecl, cinclude '<unistd.h>'> end
 local function c_access(path: cstring, mode: cint): cint <cimport 'access', nodecl, cinclude '<unistd.h>'> end
-local function c_chmod(path: cstring, mode: cuint): cint <cimport 'chmod', nodecl, cinclude '<sys/stat.h>'> end
+local function c_umask(mode: cuint): cuint <cimport 'umask', nodecl, cinclude '<sys/stat.h>'> end
+
+local SignalHandler = @function(cint): void
+local function c_signal(signal: cint, handler: SignalHandler): SignalHandler <cimport 'signal', nodecl, cinclude '<signal.h>'> end
+local Sigset: type <cimport 'sigset_t', nodecl, cinclude '<signal.h>'> = @record{}
+local Timespec: type <cimport 'struct timespec', nodecl, cinclude '<time.h>'> = @record{tv_sec: clong, tv_nsec: clong}
+local function c_sigemptyset(set: *Sigset): cint <cimport 'sigemptyset', nodecl, cinclude '<signal.h>'> end
+local function c_sigaddset(set: *Sigset, signal: cint): cint <cimport 'sigaddset', nodecl, cinclude '<signal.h>'> end
+local function c_sigprocmask(how: cint, set: *Sigset, previous: *Sigset): cint <cimport 'sigprocmask', nodecl, cinclude '<signal.h>'> end
+local function c_signalfd(fd: cint, set: *Sigset, flags: cint): cint <cimport 'signalfd', nodecl, cinclude '<sys/signalfd.h>'> end
+local function c_clock_gettime(clock: cint, value: *Timespec): cint <cimport 'clock_gettime', nodecl, cinclude '<time.h>'> end
 
 local Pollfd = @record{fd: cint, events: cshort, revents: cshort}
 local function c_poll(fds: *Pollfd, count: culong, timeout_ms: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
 
 local AF_UNIX: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
 local SOCK_STREAM: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local SOCK_CLOEXEC: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local SOCK_NONBLOCK: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local MSG_NOSIGNAL: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local SIG_BLOCK: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SIG_SETMASK: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SIGCHLD: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SIG_DFL: SignalHandler <cimport, nodecl, cinclude '<signal.h>'>
+local SIG_ERR: SignalHandler <cimport, nodecl, cinclude '<signal.h>'>
+local SIGINT: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SFD_CLOEXEC: cint <cimport, nodecl, cinclude '<sys/signalfd.h>'>
+local CLOCK_MONOTONIC: cint <cimport, nodecl, cinclude '<time.h>'>
+local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EAGAIN: cint <cimport, nodecl, cinclude '<errno.h>'>
+local ESRCH: cint <cimport, nodecl, cinclude '<errno.h>'>
 local POLLIN: cshort <cimport, nodecl, cinclude '<poll.h>'>
 local SYS_pidfd_open: clong <cimport, nodecl, cinclude '<sys/syscall.h>'>
 local SYS_pidfd_send_signal: clong <cimport, nodecl, cinclude '<sys/syscall.h>'>
@@ -62,6 +88,7 @@ local Runtime = @record{
   pidfd: cint,
   attempts: integer,
   restarts: integer,
+  restart_at: integer,
   last_exit: integer,
   last_signal: integer,
 }
@@ -138,7 +165,9 @@ local function decode_argv(serialized: string, out: *ExecArgv): boolean
     local item: string
     if first == 0 then item = string.sub(serialized, cursor); cursor = 0
     else item = string.sub(serialized, cursor, first - 1); cursor = last + 1 end
-    if #item == 0 then return false end
+    if (count == 0 and #item == 0) or string.find(item, '\0', 1, true) ~= 0 then
+      return false
+    end
     out.storage[count] = item
     out.cargs[count] = (@cstring)(out.storage[count])
     count = count + 1
@@ -182,17 +211,47 @@ local function decode_wait(status: cint, runtime: *Runtime)
   end
 end
 
-local function spawn(runtime: *Runtime, argv: *ExecArgv): boolean
+local function monotonic_ms(): integer
+  local now: Timespec
+  c_clock_gettime(CLOCK_MONOTONIC, &now)
+  return (@integer)(now.tv_sec) * 1000 + now.tv_nsec // 1000000
+end
+
+local function open_shutdown_fd(child_mask: *Sigset): cint
+  -- A launcher can pass down SIG_IGN. Keep each child waitable until reaped.
+  if c_signal(SIGCHLD, SIG_DFL) == SIG_ERR then return -1 end
+  local mask: Sigset
+  if c_sigemptyset(&mask) ~= 0 or c_sigaddset(&mask, SIGTERM) ~= 0 or
+     c_sigaddset(&mask, SIGINT) ~= 0 or c_sigprocmask(SIG_BLOCK, &mask, child_mask) ~= 0 then
+    return -1
+  end
+  return c_signalfd(-1, &mask, SFD_CLOEXEC)
+end
+
+local function wait_for_child(pid: cint, status: *cint): boolean
+  local waited = c_waitpid(pid, status, 0)
+  while waited < 0 and errno == EINTR do
+    waited = c_waitpid(pid, status, 0)
+  end
+  return waited == pid
+end
+
+local function spawn(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset): boolean
   runtime.state = ServiceState.Starting
   runtime.attempts = runtime.attempts + 1
   local pid = c_fork()
-  if pid == 0 then c_execvp(argv.cargs[0], &argv.cargs[0]); c__exit(127) end
+  if pid == 0 then
+    if c_sigprocmask(SIG_SETMASK, child_mask, nilptr) == 0 then
+      c_execvp(argv.cargs[0], &argv.cargs[0])
+    end
+    c__exit(127)
+  end
   if pid < 0 then runtime.state = ServiceState.Failed; return false end
   local pidfd = pidfd_open_for(pid)
   if pidfd < 0 then
     c_kill(pid, SIGKILL)
     local status: cint = 0
-    c_waitpid(pid, &status, 0)
+    wait_for_child(pid, &status)
     runtime.state = ServiceState.Failed
     return false
   end
@@ -212,21 +271,26 @@ local function should_restart(runtime: *Runtime): boolean
   return false
 end
 
-local function reap_and_maybe_restart(runtime: *Runtime, argv: *ExecArgv): boolean
+local function reap(runtime: *Runtime): boolean
   local status: cint = 0
-  if c_waitpid(runtime.pid, &status, 0) ~= runtime.pid then runtime.state = ServiceState.Failed; return false end
+  if not wait_for_child(runtime.pid, &status) then return false end
   c_close(runtime.pidfd)
   runtime.pidfd = -1
+  runtime.pid = 0
   decode_wait(status, runtime)
+  return true
+end
+
+local function record_exit(runtime: *Runtime): boolean
+  if not reap(runtime) then return false end
+  print('daemon-exit', runtime.service.name, 'code', runtime.last_exit, 'signal', runtime.last_signal)
   if runtime.last_exit == 0 and runtime.last_signal == 0 then runtime.state = ServiceState.Stopped
   else runtime.state = ServiceState.Failed end
   if should_restart(runtime) and runtime.restarts < runtime.service.max_restarts then
-    runtime.restarts = runtime.restarts + 1
-    runtime.state = ServiceState.Backoff
-    local delay = runtime.restarts * 10
+    local delay = (runtime.restarts + 1) * 10
     if delay > 1000 then delay = 1000 end
-    c_usleep((@cuint)(delay * 1000))
-    return spawn(runtime, argv)
+    runtime.restart_at = monotonic_ms() + delay
+    runtime.state = ServiceState.Backoff
   end
   return true
 end
@@ -250,7 +314,7 @@ end
 local function write_all(fd: cint, text: string): boolean
   local remaining = text
   while #remaining > 0 do
-    local wrote = c_write(fd, (@cstring)(remaining), (@csize)(#remaining))
+    local wrote = c_send(fd, (@cstring)(remaining), (@csize)(#remaining), MSG_NOSIGNAL)
     if wrote <= 0 then return false end
     if wrote == #remaining then return true end
     remaining = string.sub(remaining, wrote + 1)
@@ -258,22 +322,29 @@ local function write_all(fd: cint, text: string): boolean
   return true
 end
 
-local function read_line(fd: cint): (boolean, string)
-  local buffer: [256]cchar
-  local used: integer = 0
-  while used < 255 do
-    local got = c_read(fd, &buffer[used], (@csize)(255 - used))
-    if got <= 0 then return false, '' end
-    local end_at = used + got
-    for i: integer = used, end_at - 1 do
-      if buffer[i] == 10 then
-        local length: usize = (@usize)(i + 1)
-        return true, string.copy((@string){data=&buffer[0], size=length})
-      end
+local ControlClient = @record{
+  buffer: [255]cchar,
+  used: integer,
+  deadline: integer,
+}
+local RequestState = @enum{Pending = 0, Complete, Closed, Invalid}
+local ControlTimeout <comptime> = 1000
+local MaxClients <comptime> = 8
+
+local function read_request(fd: cint, client: *ControlClient): (RequestState, string)
+  local got = c_read(fd, &client.buffer[client.used], (@csize)(255 - client.used))
+  if got < 0 and (errno == EAGAIN or errno == EINTR) then return RequestState.Pending, '' end
+  if got <= 0 then return RequestState.Closed, '' end
+  local end_at = client.used + got
+  for i: integer = client.used, end_at - 1 do
+    if client.buffer[i] == 10 then
+      local length: usize = (@usize)(i + 1)
+      return RequestState.Complete, (@string){data=&client.buffer[0], size=length}
     end
-    used = end_at
   end
-  return false, ''
+  client.used = end_at
+  if client.used == 255 then return RequestState.Invalid, '' end
+  return RequestState.Pending, ''
 end
 
 local function write_status(fd: cint, runtime: *Runtime): boolean
@@ -292,17 +363,120 @@ local function write_status(fd: cint, runtime: *Runtime): boolean
     write_all(fd, last_signal) and write_all(fd, '\n')
 end
 
+local function wait_for_exit(fd: cint, timeout: integer): cint
+  local event: Pollfd = {fd = fd, events = POLLIN}
+  local deadline = monotonic_ms() + timeout
+  local ready = c_poll(&event, 1, (@cint)(timeout))
+  while ready < 0 and errno == EINTR do
+    local remaining = deadline - monotonic_ms()
+    if remaining <= 0 then return 0 end
+    ready = c_poll(&event, 1, (@cint)(remaining))
+  end
+  if ready > 0 and (event.revents & POLLIN) == 0 then return -1 end
+  return ready
+end
+
 local function stop_child(runtime: *Runtime): boolean
   if runtime.pidfd < 0 then return true end
   runtime.state = ServiceState.Stopping
-  if not pidfd_send_signal(runtime.pidfd, SIGTERM) then return false end
-  local status: cint = 0
-  if c_waitpid(runtime.pid, &status, 0) ~= runtime.pid then return false end
-  c_close(runtime.pidfd)
-  runtime.pidfd = -1
-  decode_wait(status, runtime)
+  -- ESRCH is expected if the child exits before the signal is sent.
+  if not pidfd_send_signal(runtime.pidfd, SIGTERM) and errno ~= ESRCH then return false end
+  local ready = wait_for_exit(runtime.pidfd, 1000)
+  if ready == 0 then
+    if not pidfd_send_signal(runtime.pidfd, SIGKILL) and errno ~= ESRCH then return false end
+    ready = wait_for_exit(runtime.pidfd, 1000)
+  end
+  if ready <= 0 or not reap(runtime) then return false end
   runtime.state = ServiceState.Stopped
   return true
+end
+
+local function serve(listener: cint, shutdown_fd: cint, runtime: *Runtime, argv: *ExecArgv,
+                     child_mask: *Sigset): (integer, cint)
+  local fds: [3 + MaxClients]Pollfd
+  fds[0] = {fd = listener, events = POLLIN}
+  fds[1] = {fd = shutdown_fd, events = POLLIN}
+  fds[2].events = POLLIN
+  local clients: [MaxClients]ControlClient
+  for slot: integer = 0, MaxClients - 1 do
+    fds[slot + 3] = {fd = -1, events = POLLIN}
+  end
+
+  local exit_code: integer = 0
+  local shutdown_client: cint = -1
+  local status_request = 'TQ1\tSTATUS\t' .. runtime.service.name .. '\n'
+  while true do
+    fds[2].fd = runtime.pidfd
+    local deadline: integer = 0
+    if runtime.state == ServiceState.Backoff then deadline = runtime.restart_at end
+    local now = monotonic_ms()
+    local free_slot: integer = -1
+    for slot: integer = 0, MaxClients - 1 do
+      local event = &fds[slot + 3]
+      local expires = clients[slot].deadline
+      if event.fd >= 0 and expires <= now then
+        c_close(event.fd)
+        event.fd = -1
+      end
+      if event.fd < 0 then free_slot = slot
+      elseif deadline == 0 or expires < deadline then deadline = expires end
+    end
+    fds[0].fd = listener
+    if free_slot < 0 then fds[0].fd = -1 end
+
+    local timeout: cint = -1
+    if deadline > now then timeout = (@cint)(deadline - now)
+    elseif deadline ~= 0 then timeout = 0 end
+    local ready = c_poll(&fds[0], 3 + MaxClients, timeout)
+    if ready < 0 then
+      if errno ~= EINTR then exit_code = 79; break end
+    else
+      if fds[1].revents ~= 0 then break end
+      if fds[2].revents ~= 0 then
+        if (fds[2].revents & POLLIN) == 0 or not record_exit(runtime) then exit_code = 80; break end
+      end
+
+      for slot: integer = 0, MaxClients - 1 do
+        local event = &fds[slot + 3]
+        if event.revents == 0 then continue end
+        local state, request = read_request(event.fd, &clients[slot])
+        if state == RequestState.Pending then continue end
+        if state == RequestState.Complete and request == 'TQ1\tSHUTDOWN\n' then
+          shutdown_client = event.fd
+          event.fd = -1
+          break
+        end
+        if state == RequestState.Complete and request == status_request then
+          write_status(event.fd, runtime)
+        elseif state ~= RequestState.Closed then
+          write_all(event.fd, 'TR1\tERROR\trequest\n')
+        end
+        c_close(event.fd)
+        event.fd = -1
+      end
+      if shutdown_client >= 0 then break end
+
+      if (fds[0].revents & POLLIN) ~= 0 then
+        local fd = c_accept4(listener, nilptr, nilptr, SOCK_CLOEXEC | SOCK_NONBLOCK)
+        if fd >= 0 then
+          fds[free_slot + 3].fd = fd
+          clients[free_slot].used = 0
+          clients[free_slot].deadline = monotonic_ms() + ControlTimeout
+        elseif errno ~= EAGAIN and errno ~= EINTR then exit_code = 79; break end
+      elseif fds[0].revents ~= 0 then exit_code = 79; break end
+
+      if runtime.state == ServiceState.Backoff and monotonic_ms() >= runtime.restart_at then
+        runtime.restarts = runtime.restarts + 1
+        if not spawn(runtime, argv, child_mask) then exit_code = 80; break end
+      end
+    end
+  end
+
+  for slot: integer = 0, MaxClients - 1 do
+    local fd = fds[slot + 3].fd
+    if fd >= 0 then c_close(fd) end
+  end
+  return exit_code, shutdown_client
 end
 
 local function main(): integer
@@ -325,57 +499,42 @@ local function main(): integer
     io.stderr:write('theseusd: refusing pre-existing control socket path: ', path, '\n')
     return 73
   end
-  local listener = c_socket(AF_UNIX, SOCK_STREAM, 0)
+  local child_mask: Sigset
+  local shutdown_fd = open_shutdown_fd(&child_mask)
+  if shutdown_fd < 0 then return 74 end
+  local listener = c_socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)
   if listener < 0 then return 74 end
   local address: SockaddrUn
   fill_address(&address, path)
-  if c_bind(listener, &address, (@cuint)(2 + #path + 1)) ~= 0 then c_close(listener); return 75 end
-  if c_chmod((@cstring)(path), 0x180) ~= 0 then c_close(listener); c_unlink((@cstring)(path)); return 76 end
+  -- Create the socket with mode 0600. There is no wider-access bind window.
+  local previous_mask = c_umask(0x7f) -- octal 0177
+  local bound = c_bind(listener, &address, (@cuint)(2 + #path + 1))
+  c_umask(previous_mask)
+  if bound ~= 0 then return 75 end
   if c_listen(listener, 8) ~= 0 then c_close(listener); c_unlink((@cstring)(path)); return 77 end
 
   local runtime: Runtime = {service = service, state = ServiceState.Planned, pidfd = -1, last_exit = -1}
-  if not spawn(&runtime, &argv) then c_close(listener); c_unlink((@cstring)(path)); return 78 end
-
-  local fds: [2]Pollfd
-  fds[0].fd = listener
-  fds[0].events = POLLIN
-  local shutting_down = false
-  while not shutting_down do
-    fds[1].fd = runtime.pidfd
-    fds[1].events = POLLIN
-    fds[0].revents = 0
-    fds[1].revents = 0
-    local ready = c_poll(&fds[0], 2, -1)
-    if ready < 0 then stop_child(&runtime); c_close(listener); c_unlink((@cstring)(path)); return 79 end
-    if runtime.pidfd >= 0 and (fds[1].revents & POLLIN) ~= 0 then
-      if not reap_and_maybe_restart(&runtime, &argv) then c_close(listener); c_unlink((@cstring)(path)); return 80 end
-    end
-    if (fds[0].revents & POLLIN) ~= 0 then
-      local client = c_accept(listener, nilptr, nilptr)
-      if client >= 0 then
-        local got: boolean
-        local request: string
-        got, request = read_line(client)
-        if got and request == 'TQ1\tSTATUS\t' .. service.name .. '\n' then
-          if not write_status(client, &runtime) then
-            c_close(client); stop_child(&runtime); c_close(listener); c_unlink((@cstring)(path)); return 81
-          end
-        elseif got and request == 'TQ1\tSHUTDOWN\n' then
-          local stopped = stop_child(&runtime)
-          if stopped then write_all(client, 'TR1\tOK\n')
-          else write_all(client, 'TR1\tERROR\tshutdown\n') end
-          shutting_down = true
-        else
-          write_all(client, 'TR1\tERROR\trequest\n')
-        end
-        c_close(client)
-      end
-    end
+  local exit_code: integer = 78
+  local shutdown_client: cint = -1
+  if spawn(&runtime, &argv, &child_mask) then
+    exit_code, shutdown_client = serve(listener, shutdown_fd, &runtime, &argv, &child_mask)
   end
+
   c_close(listener)
+  local stopped = stop_child(&runtime)
   c_unlink((@cstring)(path))
+  c_close(shutdown_fd)
+  if shutdown_client >= 0 then
+    if stopped then write_all(shutdown_client, 'TR1\tOK\n')
+    else write_all(shutdown_client, 'TR1\tERROR\tshutdown\n') end
+    c_close(shutdown_client)
+  end
+  if not stopped then
+    io.stderr:write('theseusd: failed to stop owned child\n')
+    return 81
+  end
   print('daemon-stopped', service.name)
-  return 0
+  return exit_code
 end
 
 os.exit(main())

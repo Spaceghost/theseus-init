@@ -28,7 +28,7 @@ jobs:
           cue export ./services/postgresql.cue -e compiled --out text > build/services.tsc
           cue export ./tests/services.cue -e compiled --out text >> build/services.tsc
           test "$(cut -f1 build/services.tsc | sort -u)" = TSC2
-          test "$(wc -l < build/services.tsc)" -eq 4
+          test "$(wc -l < build/services.tsc)" -eq 5
 
       - name: Build pinned Nelua compiler
         run: |
@@ -62,6 +62,13 @@ jobs:
           test "$(build/the restart-policy of postgresql)" = on-failure
           build/the services | grep -F 'postgresql'
           build/the failed services | grep -F '(none)'
+
+      - name: Preserve empty and space-containing arguments from CUE
+        run: |
+          set -eux
+          export THESEUS_RECORDS="$PWD/build/services.tsc"
+          build/theseus run argv-roundtrip >build/argv-roundtrip.txt
+          grep -Fx 'first arg  last arg ' build/argv-roundtrip.txt
 
       - name: Refuse unsupported readiness before effects
         run: |
@@ -116,6 +123,7 @@ jobs:
           mkdir -p build/live
           /tmp/nelua-lang/nelua --compile-binary --release -o build/live/theseusd src/supervisor.nelua
           /tmp/nelua-lang/nelua --compile-binary --release -o build/live/theseus src/live_client.nelua
+          /tmp/nelua-lang/nelua --compile-binary --release -o build/live/control-test tests/live_control.nelua
           ln -sf theseus build/live/the
           test -x build/live/theseusd
           test -x build/live/theseus
@@ -130,7 +138,7 @@ jobs:
           daemon_pid=$!
           cleanup() {
             if test -S "$THESEUS_SOCKET"; then
-              build/live/theseus daemon-stop >/dev/null 2>&1 || true
+              timeout 3s build/live/theseus daemon-stop >/dev/null 2>&1 || true
             fi
             kill "$daemon_pid" 2>/dev/null || true
             wait "$daemon_pid" 2>/dev/null || true
@@ -153,7 +161,8 @@ jobs:
           test -n "$child_pid"
           kill -0 "$child_pid"
           test "$(build/live/the state of sleep-stop)" = RUNNING
-          build/live/theseus daemon-stop
+          timeout 8s build/live/control-test
+          timeout 3s build/live/theseus daemon-stop
           wait "$daemon_pid"
           test ! -e "$THESEUS_SOCKET"
           if kill -0 "$child_pid" 2>/dev/null; then
@@ -161,4 +170,68 @@ jobs:
             exit 1
           fi
           grep -E '^daemon-stopped[[:space:]]+sleep-stop$' build/live/daemon.log
+          trap - EXIT
+
+      - name: Handle SIGTERM and reap a SIGTERM-resistant child
+        run: |
+          set -eux
+          job_dir="$(mktemp -d "$RUNNER_TEMP/theseus.XXXXXXXX")"
+          export THESEUS_SOCKET="$job_dir/control.sock"
+          export THESEUS_RECORDS="$job_dir/services.tsc"
+          printf 'TSC2\tstubborn\t%s\037ignore-term\037%s\talways\t10\tpid\n' \
+            "$PWD/build/live/control-test" "$job_dir/ready" > "$THESEUS_RECORDS"
+          build/live/theseusd stubborn >build/live/stubborn.log 2>&1 &
+          daemon_pid=$!
+          child_pid=
+          cleanup() {
+            kill "$daemon_pid" 2>/dev/null || true
+            if test -n "$child_pid"; then kill -KILL "$child_pid" 2>/dev/null || true; fi
+            wait "$daemon_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for i in $(seq 1 100); do
+            if test -f "$job_dir/ready"; then break; fi
+            sleep 0.02
+          done
+          test -f "$job_dir/ready"
+          timeout 3s build/live/the status of stubborn > "$job_dir/status"
+          child_pid=$(awk '$1 == "pid" {print $2}' "$job_dir/status")
+          test -n "$child_pid"
+          kill -TERM "$daemon_pid"
+          timeout 5s tail --pid="$daemon_pid" -f /dev/null
+          wait "$daemon_pid"
+          test ! -e "$THESEUS_SOCKET"
+          ! kill -0 "$child_pid" 2>/dev/null
+          test "$(grep -c '^daemon-spawn' build/live/stubborn.log)" -eq 1
+          trap - EXIT
+          rm -f "$job_dir/ready" "$job_dir/services.tsc" "$job_dir/status"
+          rmdir "$job_dir"
+
+      - name: Reap live daemon failures and enforce the restart budget
+        run: |
+          set -eux
+          export THESEUS_RECORDS="$PWD/build/services.tsc"
+          export THESEUS_SOCKET="$RUNNER_TEMP/theseus-restart-$GITHUB_RUN_ID.sock"
+          test ! -e "$THESEUS_SOCKET"
+          build/live/theseusd false-restart >build/live/restart.log 2>&1 &
+          daemon_pid=$!
+          trap 'kill "$daemon_pid" 2>/dev/null || true; wait "$daemon_pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 100); do
+            if test -f build/live/restart.log && test "$(grep -c '^daemon-exit' build/live/restart.log || true)" -eq 3; then break; fi
+            sleep 0.02
+          done
+          timeout 3s build/live/the status of false-restart >build/live/restart-status.txt
+          awk '
+            $1 == "state" && $2 == "FAILED" { state = 1 }
+            $1 == "pid" && $2 == 0 { pid = 1 }
+            $1 == "pidfd" && $2 == -1 { pidfd = 1 }
+            $1 == "restarts" && $2 == 2 { restarts = 1 }
+            $1 == "last-exit" && $2 == 1 { last = 1 }
+            END { exit !(state && pid && pidfd && restarts && last) }
+          ' build/live/restart-status.txt
+          timeout 3s build/live/theseus daemon-stop
+          wait "$daemon_pid"
+          test "$(grep -c '^daemon-spawn' build/live/restart.log)" -eq 3
+          test "$(grep -c '^daemon-exit' build/live/restart.log)" -eq 3
+          test ! -e "$THESEUS_SOCKET"
           trap - EXIT
