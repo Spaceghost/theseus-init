@@ -5,6 +5,7 @@ require 'arg'
 require 'io'
 require 'os'
 require 'string'
+require 'src.theseus.openrc'
 
 local function c_socket(domain: cint, kind: cint, protocol: cint): cint <cimport 'socket', nodecl, cinclude '<sys/socket.h>'> end
 local function c_connect(fd: cint, address: pointer, length: cuint): cint <cimport 'connect', nodecl, cinclude '<sys/socket.h>'> end
@@ -170,6 +171,7 @@ local function shutdown(): integer
   return 0
 end
 
+dispatch_openrc(is_the())
 if is_the() then
   if #arg == 3 and arg[2] == 'of' and arg[1] == 'status' then
     os.exit(query_status(arg[3], false))
@@ -177,12 +179,12 @@ if is_the() then
   if #arg == 3 and arg[2] == 'of' and arg[1] == 'state' then
     os.exit(query_status(arg[3], true))
   end
-  io.stderr:write('usage: the status of SERVICE | the state of SERVICE\n')
+  io.stderr:write('usage: the status of SERVICE | the state of SERVICE | the status of openrc SERVICE\n')
   os.exit(64)
 end
 
 if #arg == 2 and arg[1] == 'status' then os.exit(query_status(arg[2], false)) end
 if #arg == 2 and arg[1] == 'state' then os.exit(query_status(arg[2], true)) end
 if #arg == 1 and arg[1] == 'daemon-stop' then os.exit(shutdown()) end
-io.stderr:write('usage: theseus status SERVICE | theseus state SERVICE | theseus daemon-stop\n')
+io.stderr:write('usage: theseus status SERVICE | theseus state SERVICE | theseus daemon-stop | theseus openrc SERVICE ACTION\n')
 os.exit(64)

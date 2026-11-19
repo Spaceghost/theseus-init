@@ -12,6 +12,7 @@ the services
 the failed services
 the running services
 the status of SERVICE
+the status of openrc SERVICE
 the state of SERVICE
 the restart-policy of SERVICE
 ```
@@ -23,6 +24,8 @@ theseus status SERVICE
 theseus state SERVICE
 theseus services
 ```
+
+OpenRC actions use the explicit `theseus openrc SERVICE ACTION` form.
 
 Later mutating commands such as `theseus start`, `restart`, `stop`, and target transactions must never be inferred from `the` prose.
 

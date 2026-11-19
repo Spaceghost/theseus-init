@@ -1,0 +1,92 @@
+-- Compare the adapter with the installed Alpine OpenRC package scripts.
+require 'arg'
+require 'io'
+require 'os'
+require 'string'
+
+local function c_fork(): cint <cimport 'fork', nodecl, cinclude '<unistd.h>'> end
+local function c_execv(path: cstring, argv: *cstring): cint <cimport 'execv', nodecl, cinclude '<unistd.h>'> end
+local function c_exit(code: cint): void <cimport '_exit', nodecl, cinclude '<unistd.h>'> end
+local function c_waitpid(pid: cint, status: *cint, options: cint): cint <cimport 'waitpid', nodecl, cinclude '<sys/wait.h>'> end
+local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
+
+local Runner = @enum{OpenRC = 0, Theseus}
+local rc_service: cstring = '/sbin/rc-service'
+
+local function run(program: cstring, first: cstring, second: cstring, third: cstring,
+                   fourth: cstring, fifth: cstring): integer
+  local argv: [7]cstring = {program, first, second, third, fourth, fifth, nilptr}
+  local pid = c_fork()
+  assert(pid >= 0, 'test fork failed')
+  if pid == 0 then
+    c_execv(program, &argv[0])
+    c_exit(127)
+  end
+  local status: cint
+  local result = c_waitpid(pid, &status, 0)
+  while result < 0 and errno == EINTR do result = c_waitpid(pid, &status, 0) end
+  assert(result == pid, 'test waitpid failed')
+  if (status & 0x7f) ~= 0 then return 128 + (status & 0x7f) end
+  return (status >> 8) & 0xff
+end
+
+local function action(runner: Runner, service: cstring, command: cstring): integer
+  if runner == Runner.OpenRC then return run(rc_service, service, command, nilptr, nilptr, nilptr) end
+  return run((@cstring)(arg[1]), 'openrc', service, command, nilptr, nilptr)
+end
+
+local function verify_status(service: cstring, started: boolean)
+  local baseline = action(Runner.OpenRC, service, 'status')
+  assert((baseline == 0) == started, 'unexpected OpenRC status')
+  assert(action(Runner.Theseus, service, 'status') == baseline, 'theseus changed OpenRC status')
+  assert(run((@cstring)(arg[2]), 'status', 'of', 'openrc', service, nilptr) == baseline,
+         'the changed OpenRC status')
+end
+
+local function workload(service: cstring): integer
+  local name = tostring(service)
+  if name == 'postgresql' then
+    return run('/usr/bin/psql', '-XAtq', '-d',
+               'host=/run/postgresql user=postgres dbname=postgres connect_timeout=2',
+               '-c', 'SELECT 42')
+  end
+  if name == 'lighttpd' then
+    return run('/usr/bin/wget', '-q', '-O', '/dev/null', 'http://127.0.0.1:8080/', nilptr)
+  end
+  return run('/bin/busybox', 'pidof', 'crond', nilptr, nilptr, nilptr)
+end
+
+local function cycle(runner: Runner, service: cstring)
+  verify_status(service, false)
+  assert(workload(service) ~= 0, 'service workload already active')
+  assert(action(runner, service, 'start') == 0, 'start failed')
+  verify_status(service, true)
+  assert(workload(service) == 0, 'service workload failed after start')
+  assert(action(runner, service, 'restart') == 0, 'restart failed')
+  verify_status(service, true)
+  assert(workload(service) == 0, 'service workload failed after restart')
+  if tostring(service) == 'postgresql' then
+    assert(action(runner, service, 'reload') == 0, 'reload failed')
+    assert(workload(service) == 0, 'service workload failed after reload')
+  end
+  assert(action(runner, service, 'stop') == 0, 'stop failed')
+  verify_status(service, false)
+  assert(workload(service) ~= 0, 'service workload survived stop')
+end
+
+assert(#arg >= 3, 'usage: alpine-openrc-test THESEUS THE SERVICE...')
+for i: integer = 3, #arg do
+  local name = arg[i]
+  assert(name == 'postgresql' or name == 'lighttpd' or name == 'cronie', 'unknown workload fixture')
+  print('openrc-corpus', name, 'baseline')
+  cycle(Runner.OpenRC, (@cstring)(name))
+  print('openrc-corpus', name, 'adapter')
+  cycle(Runner.Theseus, (@cstring)(name))
+  print('openrc-corpus', name, 'pass')
+end
+
+local missing: cstring = 'theseus-package-not-installed'
+local baseline = action(Runner.OpenRC, missing, 'status')
+assert(baseline ~= 0 and action(Runner.Theseus, missing, 'status') == baseline,
+       'missing service exit status changed')

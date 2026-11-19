@@ -4,7 +4,10 @@
 
 It is written in **Nelua**. Its native service model is declared in **CUE**. No Lua runtime, no maintained C implementation, no YAML service language, and no database is required to boot.
 
-OpenRC is supported as a compatibility personality rather than as Theseus's internal model. Existing Alpine packages should continue to work while native Theseus services gain stronger supervision, readiness, restart policy, explicit dependency transactions, and structured state.
+The OpenRC adapter runs installed Alpine service scripts through the
+system OpenRC runtime. Native Theseus services have their own lifecycle
+and dependency model. See [OpenRC compatibility](docs/OPENRC.md) for the
+command surface and package evidence.
 
 ## Philosophy
 
@@ -48,8 +51,8 @@ services with Unix socket readiness, the daemon waits for a listener
 owned by the supervised process. The native
 target planner validates dependencies and produces an execution order.
 
-Target execution, descendant ownership, and compatibility with the
-Alpine OpenRC corpus are still pending. The rescue entry point below is separate from the service
+Target execution, descendant ownership, and broader Alpine package
+qualification are still pending. The rescue entry point below is separate from the service
 supervisor.
 
 ## Early boot in nebox

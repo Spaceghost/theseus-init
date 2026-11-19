@@ -7,6 +7,7 @@ require 'arg'
 require 'io'
 require 'os'
 require 'string'
+require 'src.theseus.openrc'
 
 -- Linux/POSIX boundary. These are declarations in maintained Nelua, not
 -- hand-maintained C helpers. Child-side work after fork is deliberately only
@@ -619,9 +620,9 @@ local function execute_query(query: Query)
   end
   io.stderr:write('theseus: invalid query\n')
   if query_mode_is_the() then
-    io.stderr:write('usage: the status [of SERVICE] | the state of SERVICE | the services | the failed services\n')
+    io.stderr:write('usage: the status [of SERVICE] | the state of SERVICE | the services | the failed services | the status of openrc SERVICE\n')
   else
-    io.stderr:write('usage: theseus status [SERVICE] | theseus state SERVICE | theseus services | theseus run SERVICE [--stop-after-ms N]\n')
+    io.stderr:write('usage: theseus status [SERVICE] | theseus state SERVICE | theseus services | theseus run SERVICE [--stop-after-ms N] | theseus openrc SERVICE ACTION\n')
   end
   os.exit(64)
 end
@@ -672,5 +673,6 @@ if #arg == 1 and arg[1] == '--selftest' then
   os.exit(0)
 end
 
+dispatch_openrc(query_mode_is_the())
 local query = query_mode_is_the() and parse_the_query() or parse_theseus_query()
 execute_query(query)
