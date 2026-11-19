@@ -145,6 +145,20 @@ jobs:
             test "$code" -eq 64
           done
 
+      - name: Refuse a non-cgroup delegation before starting a service
+        run: |
+          set -eux
+          export THESEUS_RECORDS="$PWD/build/services.tsc"
+          export THESEUS_SOCKET="$RUNNER_TEMP/theseus-invalid-cgroup-$GITHUB_RUN_ID.sock"
+          export THESEUS_CGROUP_ROOT="$PWD/build"
+          test ! -e "$THESEUS_SOCKET"
+          rc=0
+          timeout 3s build/live/theseusd sleep-stop >build/live/invalid-cgroup.log 2>&1 || rc=$?
+          test "$rc" -eq 83
+          test ! -e "$THESEUS_SOCKET"
+          grep -F 'invalid cgroup v2 delegation' build/live/invalid-cgroup.log
+          ! grep -F 'daemon-spawn' build/live/invalid-cgroup.log
+
       - name: Query live state and shut down without orphans
         run: |
           set -eux

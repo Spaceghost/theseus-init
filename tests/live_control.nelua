@@ -18,6 +18,9 @@ local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unis
 local function c_read(fd: cint, buffer: pointer, count: csize): clong <cimport 'read', nodecl, cinclude '<unistd.h>'> end
 local function c_write(fd: cint, buffer: pointer, count: csize): clong <cimport 'write', nodecl, cinclude '<unistd.h>'> end
 local function c_pause(): cint <cimport 'pause', nodecl, cinclude '<unistd.h>'> end
+local function c_fork(): cint <cimport 'fork', nodecl, cinclude '<unistd.h>'> end
+local function c_setsid(): cint <cimport 'setsid', nodecl, cinclude '<unistd.h>'> end
+local function c_getpid(): cint <cimport 'getpid', nodecl, cinclude '<unistd.h>'> end
 local SignalHandler = @function(cint): void
 local function c_signal(signal: cint, handler: SignalHandler): SignalHandler <cimport 'signal', nodecl, cinclude '<signal.h>'> end
 local AF_UNIX: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
@@ -70,6 +73,40 @@ local function expect_status(fd: cint)
   assert(false, 'oversized status response')
 end
 
+local function wait_for_file(path: string)
+  while true do
+    local file = io.open(path, 'r')
+    if file:isopen() then file:close(); return end
+    c_usleep(10000)
+  end
+end
+
+if arg[1] == 'tree' then
+  local dir = arg[2]
+  local first = io.open(dir .. '/first.pid', 'r')
+  local restarting = first:isopen()
+  if restarting then first:close() end
+  local leader = c_getpid()
+  local descendant = c_fork()
+  assert(descendant >= 0, 'tree fixture fork failed')
+  if descendant == 0 then
+    assert(c_setsid() >= 0, 'tree fixture setsid failed')
+    assert(c_signal(SIGTERM, SIG_IGN) ~= SIG_ERR, 'tree fixture cannot ignore SIGTERM')
+    local marker = dir .. '/first.pid'
+    if restarting then marker = dir .. '/second.pid' end
+    local file = io.open(marker, 'w')
+    assert(file:isopen(), 'tree fixture cannot create marker')
+    file:write(tostring(leader), ' ', tostring(c_getpid()), '\n')
+    file:close()
+    while true do c_pause() end
+  end
+  if not restarting then
+    wait_for_file(dir .. '/exit')
+    os.exit(42)
+  end
+  while true do c_pause() end
+end
+
 if arg[1] == 'ignore-term' then
   assert(c_signal(SIGTERM, SIG_IGN) ~= SIG_ERR, 'failed to ignore SIGTERM')
   local marker = io.open(arg[2], 'w')
@@ -80,13 +117,7 @@ end
 
 if arg[1] == 'listen' then
   local path = arg[2]
-  if #arg >= 3 then
-    while true do
-      local gate = io.open(arg[3], 'r')
-      if gate:isopen() then gate:close(); break end
-      c_usleep(10000)
-    end
-  end
+  if #arg >= 3 then wait_for_file(arg[3]) end
   local address = endpoint(path)
   local fd = c_socket(AF_UNIX, SOCK_STREAM, 0)
   assert(fd >= 0, 'readiness fixture socket failed')

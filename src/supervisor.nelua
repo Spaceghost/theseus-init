@@ -9,6 +9,7 @@ require 'math'
 require 'os'
 require 'string'
 require 'src.theseus.graph'
+require 'src.theseus.cgroup'
 
 local function c_fork(): cint <cimport 'fork', nodecl, cinclude '<unistd.h>'> end
 local function c_execvp(file: cstring, argv: *cstring): cint <cimport 'execvp', nodecl, cinclude '<unistd.h>'> end
@@ -106,6 +107,9 @@ local Runtime = @record{
   pid: cint,
   pidfd: cint,
   execfd: cint,
+  cgroup: ServiceCgroup,
+  drain_by: integer,
+  exit_state: ServiceState,
   attempts: integer,
   restarts: integer,
   action_at: integer,
@@ -291,10 +295,13 @@ local function spawn(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset): b
   local pid = c_fork()
   if pid == 0 then
     c_close(handshake[0])
-    if c_sigprocmask(SIG_SETMASK, child_mask, nilptr) == 0 then
-      c_execvp(argv.cargs[0], &argv.cargs[0])
+    local failed: cchar = 2
+    if cgroup_enter(&runtime.cgroup) then
+      failed = 1
+      if c_sigprocmask(SIG_SETMASK, child_mask, nilptr) == 0 then
+        c_execvp(argv.cargs[0], &argv.cargs[0])
+      end
     end
-    local failed: cchar = 1
     c_write(handshake[1], &failed, 1)
     c__exit(127)
   end
@@ -338,6 +345,10 @@ local function record_exec(runtime: *Runtime): boolean
   close_execfd(runtime)
   if runtime.state ~= ServiceState.Starting then return true end
   if got > 0 then
+    if failed == 2 then
+      print('TE1', 'ownership', runtime.service.name, runtime.attempts, 'placement-failed')
+      return false
+    end
     print('TE1', 'service', runtime.service.name, runtime.attempts, 'exec-failed')
   elseif runtime.service.readiness == ReadinessKind.UnixSocket then
     runtime.action_at = monotonic_ms()
@@ -368,25 +379,44 @@ local function reap(runtime: *Runtime): boolean
   return true
 end
 
-local function record_exit(runtime: *Runtime): boolean
-  local premature = runtime.state == ServiceState.Starting or runtime.state == ServiceState.Stopping
-  if not reap(runtime) then return false end
-  if runtime.state == ServiceState.Starting then
-    print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'exited-before-ready')
-  end
+local function finish_exit(runtime: *Runtime)
+  runtime.state = runtime.exit_state
+  runtime.drain_by = 0
   runtime.action_at = 0
-  print('daemon-exit', runtime.service.name, 'code', runtime.last_exit, 'signal', runtime.last_signal)
-  if premature or runtime.last_exit ~= 0 or runtime.last_signal ~= 0 then
-    runtime.state = ServiceState.Failed
-  else
-    runtime.state = ServiceState.Stopped
-  end
   if should_restart(runtime) and runtime.restarts < runtime.service.max_restarts then
     local delay = (runtime.restarts + 1) * 10
     if delay > 1000 then delay = 1000 end
     runtime.action_at = monotonic_ms() + delay
     runtime.state = ServiceState.Backoff
   end
+end
+
+local function record_exit(runtime: *Runtime): boolean
+  local premature = runtime.state == ServiceState.Starting or runtime.state == ServiceState.Stopping
+  if not reap(runtime) then return false end
+  if runtime.state == ServiceState.Starting then
+    print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'exited-before-ready')
+  end
+  print('daemon-exit', runtime.service.name, 'code', runtime.last_exit, 'signal', runtime.last_signal)
+  runtime.exit_state = ServiceState.Stopped
+  if premature or runtime.last_exit ~= 0 or runtime.last_signal ~= 0 then
+    runtime.exit_state = ServiceState.Failed
+  end
+
+  local ownership = cgroup_state(&runtime.cgroup)
+  if ownership == CgroupState.Empty then
+    finish_exit(runtime)
+    return true
+  end
+  if ownership == CgroupState.Error or not cgroup_kill(&runtime.cgroup) then
+    io.stderr:write('theseusd: cannot drain cgroup for ', runtime.service.name, '\n')
+    return false
+  end
+  print('TE1', 'ownership', runtime.service.name, runtime.attempts, 'draining')
+  runtime.state = ServiceState.Stopping
+  local now = monotonic_ms()
+  runtime.drain_by = now + 1000
+  runtime.action_at = now + 10
   return true
 end
 
@@ -457,6 +487,20 @@ end
 local function advance_service(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset): boolean
   local now = monotonic_ms()
   if runtime.action_at == 0 or now < runtime.action_at then return true end
+  if runtime.drain_by ~= 0 then
+    local ownership = cgroup_state(&runtime.cgroup)
+    if ownership == CgroupState.Empty then
+      print('TE1', 'ownership', runtime.service.name, runtime.attempts, 'drained')
+      finish_exit(runtime)
+      return true
+    end
+    if ownership == CgroupState.Error or now >= runtime.drain_by then
+      io.stderr:write('theseusd: cgroup did not drain for ', runtime.service.name, '\n')
+      return false
+    end
+    runtime.action_at = math.min(now + 10, runtime.drain_by)
+    return true
+  end
   if runtime.state == ServiceState.Backoff then
     runtime.action_at = 0
     runtime.restarts = runtime.restarts + 1
@@ -555,17 +599,40 @@ local function wait_for_exit(fd: cint, timeout: integer): cint
   return ready
 end
 
-local function stop_child(runtime: *Runtime): boolean
+local function stop_leader(runtime: *Runtime): boolean
   if runtime.pidfd < 0 then return true end
-  runtime.state = ServiceState.Stopping
-  -- ESRCH is expected if the child exits before the signal is sent.
   if not signal_child(runtime, SIGTERM) then return false end
   local ready = wait_for_exit(runtime.pidfd, 1000)
   if ready == 0 then
     if not signal_child(runtime, SIGKILL) then return false end
     ready = wait_for_exit(runtime.pidfd, 1000)
   end
-  if ready <= 0 or not reap(runtime) then return false end
+  return ready > 0 and reap(runtime)
+end
+
+local function drain_cgroup(runtime: *Runtime): boolean
+  local state = cgroup_state(&runtime.cgroup)
+  if state == CgroupState.Empty then return true end
+  if state == CgroupState.Error or not cgroup_kill(&runtime.cgroup) then return false end
+  print('TE1', 'ownership', runtime.service.name, runtime.attempts, 'draining')
+  local deadline = monotonic_ms() + 1000
+  repeat
+    state = cgroup_state(&runtime.cgroup)
+    if state == CgroupState.Empty then
+      print('TE1', 'ownership', runtime.service.name, runtime.attempts, 'drained')
+      return true
+    end
+    if state == CgroupState.Error then return false end
+    c_poll(nilptr, 0, 10)
+  until monotonic_ms() >= deadline
+  return false
+end
+
+local function stop_child(runtime: *Runtime): boolean
+  runtime.state = ServiceState.Stopping
+  local leader_stopped = stop_leader(runtime)
+  local group_empty = drain_cgroup(runtime)
+  if not leader_stopped or not group_empty then return false end
   runtime.state = ServiceState.Stopped
   return true
 end
@@ -848,6 +915,15 @@ local function main(): integer
     io.stderr:write('theseusd: refusing pre-existing control socket path: ', path, '\n')
     return 73
   end
+  local root: cint = -1
+  local delegation = os.getenv('THESEUS_CGROUP_ROOT')
+  if #delegation > 0 then
+    root = cgroup_open_root(delegation)
+    if root < 0 then
+      io.stderr:write('theseusd: invalid cgroup v2 delegation: ', delegation, '\n')
+      return 83
+    end
+  end
   local child_mask: Sigset
   local shutdown_fd = open_shutdown_fd(&child_mask)
   if shutdown_fd < 0 then return 74 end
@@ -864,13 +940,28 @@ local function main(): integer
 
   local exit_code: integer = 78
   local shutdown_client: cint = -1
-  if group.target then
-    exit_code = advance_target(&group, &child_mask)
-  elseif spawn(&group.runtimes[0], &group.arguments[0], &child_mask) then
-    exit_code = 0
+  local resources_ready = true
+  if root >= 0 then
+    for i: integer = 0, group.count - 1 do
+      local runtime = &group.runtimes[i]
+      if not cgroup_create(root, i, &runtime.cgroup) then
+        io.stderr:write('theseusd: cannot create cgroup for ', runtime.service.name, '\n')
+        exit_code = 83
+        resources_ready = false
+        break
+      end
+      print('TE1', 'ownership', runtime.service.name, 0, 'assigned', runtime.cgroup.name)
+    end
   end
-  if exit_code == 0 then
-    exit_code, shutdown_client = serve(listener, shutdown_fd, &group, &child_mask)
+  if resources_ready then
+    if group.target then
+      exit_code = advance_target(&group, &child_mask)
+    elseif spawn(&group.runtimes[0], &group.arguments[0], &child_mask) then
+      exit_code = 0
+    end
+    if exit_code == 0 then
+      exit_code, shutdown_client = serve(listener, shutdown_fd, &group, &child_mask)
+    end
   end
 
   c_close(listener)
@@ -880,8 +971,13 @@ local function main(): integer
     if runtime.pidfd >= 0 and group.target then
       print('TE1', 'target', group.name, 'stopping', runtime.service.name)
     end
-    if not stop_child(runtime) then stopped = false end
+    if resources_ready and not stop_child(runtime) then stopped = false end
+    if root >= 0 and not cgroup_remove(root, &runtime.cgroup) then
+      io.stderr:write('theseusd: cannot remove cgroup for ', runtime.service.name, '\n')
+      stopped = false
+    end
   end
+  if root >= 0 then c_close(root) end
   c_unlink((@cstring)(path))
   c_close(shutdown_fd)
   if shutdown_client >= 0 then

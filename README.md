@@ -51,8 +51,12 @@ a local Unix socket. A target uses the validated dependency order and
 waits for the configured service readiness before admitting subsequent
 services. Run it with `theseusd --target TARGET`.
 
-Application-level health checks, descendant ownership, and broader
-Alpine package qualification are still pending. The rescue entry point below is separate from the service
+Set `THESEUS_CGROUP_ROOT` to a delegated cgroup v2 directory to track
+and clean up each service's descendants. See
+[resource ownership](docs/ARCHITECTURE.md#resource-ownership).
+
+Application-level health checks and broader Alpine package qualification
+are still pending. The rescue entry point below is separate from the service
 supervisor.
 
 ## Early boot in nebox

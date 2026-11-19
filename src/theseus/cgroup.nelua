@@ -1,0 +1,96 @@
+-- One private cgroup v2 directory per service, under an administrator's delegation.
+require 'string'
+
+local Statfs: type <cimport 'struct statfs', nodecl, cinclude '<sys/statfs.h>'> = @record{f_type: clong}
+local function c_fstatfs(fd: cint, info: *Statfs): cint <cimport 'fstatfs', nodecl, cinclude '<sys/statfs.h>'> end
+local function c_open(path: cstring, flags: cint): cint <cimport 'open', nodecl, cinclude '<fcntl.h>'> end
+local function c_openat(dir: cint, name: cstring, flags: cint): cint <cimport 'openat', nodecl, cinclude '<fcntl.h>'> end
+local function c_mkdirat(dir: cint, name: cstring, mode: cuint): cint <cimport 'mkdirat', nodecl, cinclude '<sys/stat.h>'> end
+local function c_unlinkat(dir: cint, name: cstring, flags: cint): cint <cimport 'unlinkat', nodecl, cinclude '<unistd.h>'> end
+local function c_pread(fd: cint, buffer: pointer, count: csize, offset: clong): clong <cimport 'pread', nodecl, cinclude '<unistd.h>'> end
+local function c_write(fd: cint, data: pointer, count: csize): clong <cimport 'write', nodecl, cinclude '<unistd.h>'> end
+local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
+local function c_getpid(): cint <cimport 'getpid', nodecl, cinclude '<unistd.h>'> end
+local O_CLOEXEC: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_DIRECTORY: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_NOFOLLOW: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_RDONLY: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_WRONLY: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local AT_REMOVEDIR: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
+local CGROUP2_SUPER_MAGIC: clong <cimport, nodecl, cinclude '<linux/magic.h>'>
+
+global ServiceCgroup = @record{
+  name: string,
+  procs: cint,
+  kill: cint,
+  events: cint,
+}
+
+global function cgroup_open_root(path: string): cint
+  if string.byte(path, 1) ~= 47 then return -1 end
+  local root = c_open((@cstring)(path), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+  if root < 0 then return -1 end
+  local info: Statfs <noinit>
+  if c_fstatfs(root, &info) == 0 and info.f_type == CGROUP2_SUPER_MAGIC then return root end
+  c_close(root)
+  return -1
+end
+
+global function cgroup_create(root: cint, slot: integer, group: *ServiceCgroup): boolean
+  local name = 'theseus-' .. tostring(c_getpid()) .. '-' .. tostring(slot)
+  if c_mkdirat(root, (@cstring)(name), 0x1c0) ~= 0 then return false end -- 0700
+  group.name = name
+  group.procs = -1
+  group.kill = -1
+  group.events = -1
+  local dir = c_openat(root, (@cstring)(name), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+  if dir < 0 then return false end
+  group.procs = c_openat(dir, 'cgroup.procs', O_WRONLY | O_CLOEXEC | O_NOFOLLOW)
+  group.kill = c_openat(dir, 'cgroup.kill', O_WRONLY | O_CLOEXEC | O_NOFOLLOW)
+  group.events = c_openat(dir, 'cgroup.events', O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+  c_close(dir)
+  return group.procs >= 0 and group.kill >= 0 and group.events >= 0
+end
+
+global function cgroup_remove(root: cint, group: *ServiceCgroup): boolean
+  if #group.name == 0 then return true end
+  if group.events >= 0 then c_close(group.events) end
+  if group.kill >= 0 then c_close(group.kill) end
+  if group.procs >= 0 then c_close(group.procs) end
+  return c_unlinkat(root, (@cstring)(group.name), AT_REMOVEDIR) == 0
+end
+
+local function write_value(fd: cint, value: cstring): boolean
+  local size = c_write(fd, value, 1)
+  while size < 0 and errno == EINTR do size = c_write(fd, value, 1) end
+  return size == 1
+end
+
+-- Placement precedes exec so the service cannot fork outside its cgroup.
+global function cgroup_enter(group: *ServiceCgroup): boolean
+  return #group.name == 0 or write_value(group.procs, '0')
+end
+
+global function cgroup_kill(group: *ServiceCgroup): boolean
+  return write_value(group.kill, '1')
+end
+
+global CgroupState = @enum{Error = 0, Empty, Populated}
+
+global function cgroup_state(group: *ServiceCgroup): CgroupState
+  if #group.name == 0 then return CgroupState.Empty end
+  local buffer: [256]byte
+  local count = c_pread(group.events, &buffer[0], #buffer, 0)
+  while count < 0 and errno == EINTR do count = c_pread(group.events, &buffer[0], #buffer, 0) end
+  if count <= 0 then return CgroupState.Error end
+  local text: string = {data = &buffer[0], size = (@usize)(count)}
+  if string.sub(text, 1, 12) == 'populated 0\n' or string.find(text, '\npopulated 0\n', 1, true) ~= 0 then
+    return CgroupState.Empty
+  end
+  if string.sub(text, 1, 12) == 'populated 1\n' or string.find(text, '\npopulated 1\n', 1, true) ~= 0 then
+    return CgroupState.Populated
+  end
+  return CgroupState.Error
+end

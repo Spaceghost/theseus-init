@@ -132,6 +132,33 @@ owned direct children in reverse plan order. Target events report
 running, failed, skipped, and stopping outcomes. One daemon manages
 one target, and the target contains up to 32 services.
 
+## Resource ownership
+
+Set `THESEUS_CGROUP_ROOT` to an absolute path to an administrator-delegated
+cgroup v2 directory. The daemon and its children need permission to
+migrate into a new leaf of that delegation. The daemon creates a
+private cgroup per selected service and places the child there before
+exec, so its descendants enter the same cgroup.
+
+After a leader exits, Theseus uses `cgroup.kill` if the leaf is still
+populated. The event loop waits for `populated 0` before allowing a restart.
+During explicit shutdown, the daemon first gives the leader its normal
+SIGTERM grace period. It then clears any remaining descendants and
+removes only the cgroups it created. Active work in sibling cgroups is
+outside the cleanup.
+
+The daemon reports assignments, placement failures, and drain progress
+as `TE1 ownership` events. The OS's reaper handles orphaned descendants
+after they exit. The daemon reaps its own leaders and confirms kernel
+cgroup emptiness before declaring cleanup successful.
+
+The delegation is for trusted services operating under the same
+process-management account. Use file permissions or credentials to
+prevent services from moving themselves into other cgroups if that
+matters to their deployment. Leave the variable unset for direct-child
+pidfd supervision without a cgroup delegation. The one-shot runner
+and the OpenRC adapter keep their own process-management contracts.
+
 ## PID 1 boundary
 
 The userspace supervisor must prove, in order:
