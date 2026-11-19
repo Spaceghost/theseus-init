@@ -65,8 +65,10 @@ local SIG_ERR: SignalHandler <cimport, nodecl, cinclude '<signal.h>'>
 local SIG_SETMASK: cint <cimport, nodecl, cinclude '<signal.h>'>
 local SFD_CLOEXEC: cint <cimport, nodecl, cinclude '<sys/signalfd.h>'>
 local SFD_NONBLOCK: cint <cimport, nodecl, cinclude '<sys/signalfd.h>'>
+local POLLOUT: cshort <cimport, nodecl, cinclude '<poll.h>'>
 local POLLIN: cshort <cimport, nodecl, cinclude '<poll.h>'>
 local WNOHANG: cint <cimport, nodecl, cinclude '<sys/wait.h>'>
+local EAGAIN: cint <cimport, nodecl, cinclude '<errno.h>'>
 local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
 local ECHILD: cint <cimport, nodecl, cinclude '<errno.h>'>
 local EEXIST: cint <cimport, nodecl, cinclude '<errno.h>'>
@@ -91,8 +93,16 @@ local Session = @record{worker: cint, rescue: cint, rescue_at: integer}
 local console: cint = -1
 
 local function report(event: string)
+  if console < 0 then return end
   local line = 'TI1\t' .. event .. '\n'
-  if console >= 0 then c_write(console, line.data, #line) end
+  local written = c_write(console, line.data, #line)
+  if written == #line or (written < 0 and errno ~= EAGAIN and errno ~= EINTR) then return end
+  -- Retry a transiently busy console without letting it hold up PID 1.
+  local output: Pollfd = {fd = console, events = POLLOUT}
+  if c_poll(&output, 1, 10) <= 0 or (output.revents & POLLOUT) == 0 then return end
+  local offset: usize = 0
+  if written > 0 then offset = (@usize)(written) end
+  c_write(console, &line.data[offset], #line - offset)
 end
 
 local function now_ms(): integer
