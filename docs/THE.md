@@ -6,7 +6,9 @@ The grammar is intentionally tiny and deterministic. It is not natural-language 
 
 The installed live client queries the running supervisor. Set
 `THESEUS_SOCKET` to its control socket. Under Theseus PID 1,
-the socket is `/run/theseus-init/control.sock`.
+the socket is `/run/theseus-init/control.sock`. A native query waits
+up to five seconds for a complete reply. A timed-out query exits
+with status 69 and reports the deadline.
 
 ```text
 the services

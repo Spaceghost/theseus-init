@@ -12,9 +12,24 @@ local function c_connect(fd: cint, address: pointer, length: cuint): cint <cimpo
 local function c_read(fd: cint, buffer: pointer, count: csize): clong <cimport 'read', nodecl, cinclude '<unistd.h>'> end
 local function c_send(fd: cint, buffer: pointer, count: csize, flags: cint): clong <cimport 'send', nodecl, cinclude '<sys/socket.h>'> end
 local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
+local Timespec: type <cimport 'struct timespec', nodecl, cinclude '<time.h>'> = @record{tv_sec: clong, tv_nsec: clong}
+local function c_clock_gettime(clock: cint, value: *Timespec): cint <cimport 'clock_gettime', nodecl, cinclude '<time.h>'> end
+local Pollfd = @record{fd: cint, events: cshort, revents: cshort}
+local function c_poll(fds: *Pollfd, count: culong, timeout: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
+local CLOCK_MONOTONIC: cint <cimport, nodecl, cinclude '<time.h>'>
+local POLLIN: cshort <cimport, nodecl, cinclude '<poll.h>'>
+local POLLOUT: cshort <cimport, nodecl, cinclude '<poll.h>'>
+local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EAGAIN: cint <cimport, nodecl, cinclude '<errno.h>'>
+local SOCK_NONBLOCK: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
 local MSG_NOSIGNAL: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
 local AF_UNIX: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
 local SOCK_STREAM: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+
+local QueryTimeout <comptime> = 5000
+-- Allow the daemon to drain every service in a full target.
+local ShutdownTimeout <comptime> = 140000
 
 local SockaddrUn = @record{
   sun_family: cushort,
@@ -47,10 +62,29 @@ local function fill_address(address: *SockaddrUn, path: string)
   end
 end
 
-local function write_all(fd: cint, text: string): boolean
+local function monotonic_ms(): integer
+  local now: Timespec
+  assert(c_clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+  return (@integer)(now.tv_sec) * 1000 + now.tv_nsec // 1000000
+end
+
+local function wait_socket(fd: cint, events: cshort, deadline: integer): boolean
+  local event: Pollfd = {fd = fd, events = events}
+  while true do
+    local remaining = deadline - monotonic_ms()
+    if remaining <= 0 then return false end
+    local ready = c_poll(&event, 1, (@cint)(remaining))
+    if ready > 0 then return (event.revents & events) ~= 0 end
+    if ready == 0 or errno ~= EINTR then return false end
+  end
+end
+
+local function write_all(fd: cint, text: string, deadline: integer): boolean
   local remaining = text
   while #remaining > 0 do
+    if not wait_socket(fd, POLLOUT, deadline) then return false end
     local wrote = c_send(fd, (@cstring)(remaining), (@csize)(#remaining), MSG_NOSIGNAL)
+    if wrote < 0 and (errno == EINTR or errno == EAGAIN) then continue end
     if wrote <= 0 then return false end
     if wrote == #remaining then return true end
     remaining = string.sub(remaining, wrote + 1)
@@ -58,12 +92,14 @@ local function write_all(fd: cint, text: string): boolean
   return true
 end
 
-local function read_line(fd: cint): (boolean, string)
+local function read_line(fd: cint, deadline: integer): (boolean, string)
   -- A snapshot can carry all 32 services with 63-byte names.
   local buffer: [4096]cchar
   local used: integer = 0
   while used < #buffer do
+    if not wait_socket(fd, POLLIN, deadline) then return false, '' end
     local got = c_read(fd, &buffer[used], (@csize)(#buffer - used))
+    if got < 0 and (errno == EINTR or errno == EAGAIN) then continue end
     if got <= 0 then return false, '' end
     local end_at = used + got
     for i: integer = used, end_at - 1 do
@@ -77,22 +113,28 @@ local function read_line(fd: cint): (boolean, string)
   return false, ''
 end
 
-local function exchange(request: string): (boolean, string)
+local function exchange_failed(deadline: integer): (boolean, string)
+  if monotonic_ms() >= deadline then
+    io.stderr:write('theseus: supervisor request timed out\n')
+  else
+    io.stderr:write('theseus: supervisor socket unavailable\n')
+  end
+  return false, ''
+end
+
+local function exchange(request: string, timeout: integer): (boolean, string)
   local path = socket_path()
-  local fd = c_socket(AF_UNIX, SOCK_STREAM, 0)
-  if fd < 0 then return false, '' end
+  local deadline = monotonic_ms() + timeout
+  local fd = c_socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0)
+  if fd < 0 then return exchange_failed(deadline) end
+  defer c_close(fd) end
   local address: SockaddrUn
   fill_address(&address, path)
-  if c_connect(fd, &address, (@cuint)(2 + #path + 1)) ~= 0 then
-    c_close(fd)
-    return false, ''
-  end
-  if not write_all(fd, request) then c_close(fd); return false, '' end
-  local ok: boolean
-  local response: string
-  ok, response = read_line(fd)
-  c_close(fd)
-  return ok, response
+  if c_connect(fd, &address, (@cuint)(2 + #path + 1)) ~= 0 or
+     not write_all(fd, request, deadline) then return exchange_failed(deadline) end
+  local ok, response = read_line(fd, deadline)
+  if not ok then return exchange_failed(deadline) end
+  return true, response
 end
 
 local function next_field(line: string, cursor: isize): (string, isize)
@@ -148,11 +190,8 @@ end
 local function query_status(name: string, state_only: boolean): integer
   local ok: boolean
   local response: string
-  ok, response = exchange('TQ1\tSTATUS\t' .. name .. '\n')
-  if not ok then
-    io.stderr:write('theseus: supervisor socket unavailable\n')
-    return 69
-  end
+  ok, response = exchange('TQ1\tSTATUS\t' .. name .. '\n', QueryTimeout)
+  if not ok then return 69 end
   return show_status(response, state_only)
 end
 
@@ -174,11 +213,8 @@ local function print_services(response: string, filter: string): boolean
 end
 
 local function query_services(filter: string): integer
-  local ok, response = exchange('TQ1\tSERVICES\n')
-  if not ok then
-    io.stderr:write('theseus: supervisor socket unavailable\n')
-    return 69
-  end
+  local ok, response = exchange('TQ1\tSERVICES\n', QueryTimeout)
+  if not ok then return 69 end
   if not print_services(response, filter) then
     io.stderr:write('theseus: malformed services response\n')
     return 65
@@ -189,11 +225,8 @@ end
 local function shutdown(): integer
   local ok: boolean
   local response: string
-  ok, response = exchange('TQ1\tSHUTDOWN\n')
-  if not ok then
-    io.stderr:write('theseus: supervisor socket unavailable\n')
-    return 69
-  end
+  ok, response = exchange('TQ1\tSHUTDOWN\n', ShutdownTimeout)
+  if not ok then return 69 end
   if response ~= 'TR1\tOK\n' then
     io.stderr:write('theseus: supervisor rejected shutdown response=[', response, ']\n')
     return 70

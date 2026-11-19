@@ -12,6 +12,16 @@ local function c_read(fd: cint, data: pointer, length: csize): clong <cimport 'r
 local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
 local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
 
+local Timespec: type <cimport 'struct timespec', nodecl, cinclude '<time.h>'> = @record{tv_sec: clong, tv_nsec: clong}
+local function c_clock_gettime(clock: cint, value: *Timespec): cint <cimport 'clock_gettime', nodecl, cinclude '<time.h>'> end
+local CLOCK_MONOTONIC: cint <cimport, nodecl, cinclude '<time.h>'>
+
+global function test_monotonic_ms(): integer
+  local now: Timespec
+  assert(c_clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+  return (@integer)(now.tv_sec) * 1000 + now.tv_nsec // 1000000
+end
+
 global TestCommand = @[13]cstring
 
 global function execute_test_command(argv: TestCommand, capture: boolean): (integer, string)

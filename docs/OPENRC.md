@@ -45,6 +45,14 @@ one containing Mosquitto. Both stack a shared level with Cronie and loopback net
 confirms that Cronie's PID survives the switch, the broker accepts a
 publish, and an empty runlevel stops all three services.
 
+Alpine 3.24.4 with OpenRC 0.63.2-r0 also passed. The signed live
+client matched status output and exit codes for 65 installed
+scripts. All six workloads, PostgreSQL reload, and the stacked
+runlevel switch passed. The same signed bundle booted twice as
+PID 1 with PostgreSQL, Cronie, and Mosquitto. The second boot read
+the transaction the native client committed during the first
+shutdown.
+
 ## Reproduce the comparison
 
 1. Build `src/theseus.nelua` as `theseus` and
@@ -84,8 +92,10 @@ Repeat with the binary built from `src/live_client.nelua` and its own
 `the` symlink to exercise the live client's entry point. This corpus
 covers service commands and ordinary runlevel switches in userspace.
 The `--catalog-status` mode compares status output and exit codes
-for every service listed by the installed OpenRC. Boot behavior
-remains unqualified.
+for every service listed by the installed OpenRC. Workload
+checks use a 30-second readiness window and report time to first
+successful reply. When testing Caddy, put its OpenRC output and
+error logs in a directory writable by the Caddy user.
 
 ## Soak native targets alongside OpenRC
 

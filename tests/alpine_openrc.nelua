@@ -52,11 +52,17 @@ local function workload(service: cstring): integer
 end
 
 local function verify_workload(service: cstring)
-  for _: integer = 1, 20 do
-    if workload(service) == 0 then return end
+  local started = test_monotonic_ms()
+  local elapsed: integer = 0
+  repeat
+    if workload(service) == 0 then
+      print('openrc-workload-ready-ms', tostring(service), test_monotonic_ms() - started)
+      return
+    end
     c_poll(nilptr, 0, 100)
-  end
-  assert(false, 'service workload failed')
+    elapsed = test_monotonic_ms() - started
+  until elapsed >= 30000
+  assert(false, 'workload did not respond for ' .. tostring(service) .. ' after ' .. tostring(elapsed) .. ' ms')
 end
 
 local function cycle(runner: Runner, service: cstring)

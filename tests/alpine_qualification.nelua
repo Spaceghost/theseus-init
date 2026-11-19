@@ -24,8 +24,6 @@ local function c_getppid(): cint <cimport 'getppid', nodecl, cinclude '<unistd.h
 local function c_kill(pid: cint, sig: cint): cint <cimport 'kill', nodecl, cinclude '<signal.h>'> end
 local function c_prctl(option: cint, arg2: culong, arg3: culong, arg4: culong, arg5: culong): cint <cimport 'prctl', nodecl, cinclude '<sys/prctl.h>'> end
 local function c_poll(fds: pointer, count: culong, timeout: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
-local Timespec: type <cimport 'struct timespec', nodecl, cinclude '<time.h>'> = @record{tv_sec: clong, tv_nsec: clong}
-local function c_clock_gettime(clock: cint, value: *Timespec): cint <cimport 'clock_gettime', nodecl, cinclude '<time.h>'> end
 local FIONREAD: cint <cimport, nodecl, cinclude '<sys/ioctl.h>'>
 local OutputCapacity: cint = 4096
 local F_SETPIPE_SZ: cint <cimport, nodecl, cinclude '<fcntl.h>'>
@@ -35,25 +33,18 @@ local PR_SET_PDEATHSIG: cint <cimport, nodecl, cinclude '<sys/prctl.h>'>
 local SIGKILL: cint <cimport, nodecl, cinclude '<signal.h>'>
 local SIGTERM: cint <cimport, nodecl, cinclude '<signal.h>'>
 local WNOHANG: cint <cimport, nodecl, cinclude '<sys/wait.h>'>
-local CLOCK_MONOTONIC: cint <cimport, nodecl, cinclude '<time.h>'>
 local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
 local ENOENT: cint <cimport, nodecl, cinclude '<errno.h>'>
 local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
-
-local function monotonic_ms(): integer
-  local now: Timespec
-  assert(c_clock_gettime(CLOCK_MONOTONIC, &now) == 0)
-  return (@integer)(now.tv_sec) * 1000 + now.tv_nsec // 1000000
-end
 
 local function exists(path: string): boolean
   return c_access((@cstring)(path), 0) == 0
 end
 
 local function wait_file(path: string)
-  local deadline = monotonic_ms() + 3000
+  local deadline = test_monotonic_ms() + 3000
   while not exists(path) do
-    assert(monotonic_ms() < deadline, 'fixture did not publish ' .. path)
+    assert(test_monotonic_ms() < deadline, 'fixture did not publish ' .. path)
     c_poll(nilptr, 0, 10)
   end
 end
@@ -96,9 +87,9 @@ local function start_daemon(program: cstring, selection: cstring, target: cstrin
 end
 
 local function wait_daemon(pid: cint): integer
-  local deadline = monotonic_ms() + 8000
+  local deadline = test_monotonic_ms() + 8000
   local status: cint
-  while monotonic_ms() < deadline do
+  while test_monotonic_ms() < deadline do
     local result = c_waitpid(pid, &status, WNOHANG)
     if result == pid then
       if (status & 0x7f) ~= 0 then return 128 + (status & 0x7f) end
@@ -115,8 +106,8 @@ local function daemon_command(client: cstring, verb: cstring, service: cstring):
 end
 
 local function wait_state(client: cstring, service: cstring, state: string)
-  local deadline = monotonic_ms() + 5000
-  while monotonic_ms() < deadline do
+  local deadline = test_monotonic_ms() + 5000
+  while test_monotonic_ms() < deadline do
     local code, value = daemon_command(client, 'state', service)
     if code == 0 and value == state .. '\n' then return end
     c_poll(nilptr, 0, 20)
@@ -125,9 +116,9 @@ local function wait_state(client: cstring, service: cstring, state: string)
 end
 
 local function wait_not_present(path: string)
-  local deadline = monotonic_ms() + 3000
+  local deadline = test_monotonic_ms() + 3000
   while exists(path) do
-    assert(monotonic_ms() < deadline, 'path survived cleanup: ' .. path)
+    assert(test_monotonic_ms() < deadline, 'path survived cleanup: ' .. path)
     c_poll(nilptr, 0, 10)
   end
 end
@@ -158,8 +149,8 @@ end
 
 local function retry_workload(command: TestCommand, expected: string)
   local details = ''
-  local deadline = monotonic_ms() + 3000
-  while monotonic_ms() < deadline do
+  local deadline = test_monotonic_ms() + 3000
+  while test_monotonic_ms() < deadline do
     local code, output = execute_test_command(command, true)
     if code == 0 and output == expected then return end
     details = output
@@ -343,12 +334,12 @@ else
     assert(not exists(work .. '/' .. FixtureFiles[i]), 'work directory contains a previous fixture: ' .. FixtureFiles[i])
   end
 end
-local start = monotonic_ms()
+local start = test_monotonic_ms()
 local cycles: integer = 0
 repeat
   if recovery then qualify_recovery(bindir, work, root)
   else qualify(bindir, work, root) end
   cycles = cycles + 1
-  print('QUAL1', 'cycle', cycles, monotonic_ms() - start)
-until monotonic_ms() - start >= seconds * 1000
-print('QUAL1', 'pass', cycles, monotonic_ms() - start)
+  print('QUAL1', 'cycle', cycles, test_monotonic_ms() - start)
+until test_monotonic_ms() - start >= seconds * 1000
+print('QUAL1', 'pass', cycles, test_monotonic_ms() - start)
