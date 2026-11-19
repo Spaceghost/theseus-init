@@ -1,6 +1,18 @@
 require 'io'
 require 'string'
 
+local GraphDiagnostic = @function(string): void
+local report_graph_error: GraphDiagnostic
+
+global function set_native_graph_diagnostics(reporter: GraphDiagnostic)
+  report_graph_error = reporter
+end
+
+local function diagnose(message: string)
+  if report_graph_error then report_graph_error(message)
+  else io.stderr:write(message) end
+end
+
 global NativeMaxServices <comptime> = 32
 local MAX_TARGETS: integer = 16
 
@@ -131,7 +143,7 @@ end
 global function load_native_graph(path: string, graph: *NativeGraph): boolean
   local file = io.open(path, 'r')
   if not file:isopen() then
-    io.stderr:write('theseus-graph: cannot open graph records: ', path, '\n')
+    diagnose('theseus-graph: cannot open graph records: ' .. path .. '\n')
     return false
   end
   for line in file:lines() do
@@ -139,7 +151,7 @@ global function load_native_graph(path: string, graph: *NativeGraph): boolean
       local prefix = string.sub(line, 1, 5)
       if prefix == 'TSC3\t' or prefix == 'TSC5\t' or prefix == 'TSC7\t' then
         if graph.service_count >= NativeMaxServices then
-          io.stderr:write('theseus-graph: service bound exceeded\n')
+          diagnose('theseus-graph: service bound exceeded\n')
           file:close()
           return false
         end
@@ -147,7 +159,7 @@ global function load_native_graph(path: string, graph: *NativeGraph): boolean
         local service: GraphService
         ok, service = parse_service(line)
         if not ok or find_service(graph, service.name) >= 0 then
-          io.stderr:write('theseus-graph: malformed or duplicate service record\n')
+          diagnose('theseus-graph: malformed or duplicate service record\n')
           file:close()
           return false
         end
@@ -155,7 +167,7 @@ global function load_native_graph(path: string, graph: *NativeGraph): boolean
         graph.service_count = graph.service_count + 1
       elseif string.sub(line, 1, 5) == 'TGT1\t' then
         if graph.target_count >= MAX_TARGETS then
-          io.stderr:write('theseus-graph: target bound exceeded\n')
+          diagnose('theseus-graph: target bound exceeded\n')
           file:close()
           return false
         end
@@ -163,14 +175,14 @@ global function load_native_graph(path: string, graph: *NativeGraph): boolean
         local target: Target
         ok, target = parse_target(line)
         if not ok or find_target(graph, target.name) >= 0 then
-          io.stderr:write('theseus-graph: malformed or duplicate target record\n')
+          diagnose('theseus-graph: malformed or duplicate target record\n')
           file:close()
           return false
         end
         graph.targets[graph.target_count] = target
         graph.target_count = graph.target_count + 1
       else
-        io.stderr:write('theseus-graph: unknown record type\n')
+        diagnose('theseus-graph: unknown record type\n')
         file:close()
         return false
       end
@@ -191,7 +203,7 @@ local function select_refs(graph: *NativeGraph, list: string, selected: *[Native
     local index = find_service(graph, name)
     if index < 0 then
       if hard then
-        io.stderr:write('theseus-graph: missing hard dependency: ', name, '\n')
+        diagnose('theseus-graph: missing hard dependency: ' .. name .. '\n')
         return false, changed
       end
     elseif not selected[index] then
@@ -210,7 +222,7 @@ local function select_target(graph: *NativeGraph, target: *Target,
     name, cursor = next_list_item(target.members, cursor)
     local index = find_service(graph, name)
     if index < 0 then
-      io.stderr:write('theseus-graph: target member is missing: ', name, '\n')
+      diagnose('theseus-graph: target member is missing: ' .. name .. '\n')
       return false
     end
     selected[index] = true
@@ -259,7 +271,7 @@ global function plan_native_target(graph: *NativeGraph, target_name: string, res
   result.count = 0
   local target_index = find_target(graph, target_name)
   if target_index < 0 then
-    io.stderr:write('theseus-graph: unknown target: ', target_name, '\n')
+    diagnose('theseus-graph: unknown target: ' .. target_name .. '\n')
     return 3
   end
 
@@ -291,7 +303,7 @@ global function plan_native_target(graph: *NativeGraph, target_name: string, res
       end
     end
     if candidate < 0 then
-      io.stderr:write('theseus-graph: dependency/order cycle in target: ', target_name, '\n')
+      diagnose('theseus-graph: dependency/order cycle in target: ' .. target_name .. '\n')
       return 67
     end
     emitted[candidate] = true

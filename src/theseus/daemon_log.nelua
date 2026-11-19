@@ -1,0 +1,176 @@
+-- A private writer owns potentially blocking stdout and stderr writes.
+require 'string'
+
+local function c_socketpair(domain: cint, kind: cint, protocol: cint, fds: *cint): cint <cimport 'socketpair', nodecl, cinclude '<sys/socket.h>'> end
+local function c_setsockopt(fd: cint, level: cint, option: cint, value: pointer, length: cuint): cint <cimport 'setsockopt', nodecl, cinclude '<sys/socket.h>'> end
+local function c_send(fd: cint, data: pointer, length: csize, flags: cint): clong <cimport 'send', nodecl, cinclude '<sys/socket.h>'> end
+local function c_read(fd: cint, data: pointer, length: csize): clong <cimport 'read', nodecl, cinclude '<unistd.h>'> end
+local function c_write(fd: cint, data: pointer, length: csize): clong <cimport 'write', nodecl, cinclude '<unistd.h>'> end
+local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
+local function c_fork(): cint <cimport 'fork', nodecl, cinclude '<unistd.h>'> end
+local function c_exit(code: cint): void <cimport '_exit', nodecl, cinclude '<unistd.h>'> end
+local function c_kill(pid: cint, signal: cint): cint <cimport 'kill', nodecl, cinclude '<signal.h>'> end
+local function c_waitpid(pid: cint, status: *cint, flags: cint): cint <cimport 'waitpid', nodecl, cinclude '<sys/wait.h>'> end
+local PollEvent = @record{fd: cint, events: cshort, revents: cshort}
+local function c_poll(event: *PollEvent, count: culong, timeout: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
+local Handler = @function(cint): void
+local function c_signal(signal: cint, handler: Handler): Handler <cimport 'signal', nodecl, cinclude '<signal.h>'> end
+
+local AF_UNIX: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local SOCK_SEQPACKET: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local SOCK_CLOEXEC: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local SOL_SOCKET: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local SO_SNDBUF: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local MSG_DONTWAIT: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local MSG_NOSIGNAL: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local POLLOUT: cshort <cimport, nodecl, cinclude '<poll.h>'>
+local SIGPIPE: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SIGKILL: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SIG_IGN: Handler <cimport, nodecl, cinclude '<signal.h>'>
+local WNOHANG: cint <cimport, nodecl, cinclude '<sys/wait.h>'>
+local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EAGAIN: cint <cimport, nodecl, cinclude '<errno.h>'>
+local ECHILD: cint <cimport, nodecl, cinclude '<errno.h>'>
+
+local PacketSize <comptime> = 4096
+local channel: cint = -1
+local writer: cint = -1
+local dropped: integer = 0
+
+local function deliver(fd: cint, packet: *[PacketSize]byte, size: isize): boolean
+  local offset: isize = 1
+  while offset < size do
+    local n = c_write(fd, &packet[offset], (@csize)(size - offset))
+    if n > 0 then
+      offset = offset + n
+    elseif n < 0 and errno == EAGAIN then
+      local event: PollEvent = {fd = fd, events = POLLOUT}
+      local ready = c_poll(&event, 1, -1)
+      if ready < 0 and errno == EINTR then continue end
+      if ready <= 0 or (event.revents & POLLOUT) == 0 then return false end
+    elseif n == 0 or errno ~= EINTR then
+      return false
+    end
+  end
+  return true
+end
+
+local function write_loop(fd: cint)
+  -- Closing one output must not kill the writer or discard the other sink.
+  c_signal(SIGPIPE, SIG_IGN)
+  local active: [3]boolean = {false, true, true}
+  local packet: [PacketSize]byte
+  while true do
+    local size = c_read(fd, &packet[0], #packet)
+    if size < 0 and errno == EINTR then continue end
+    if size <= 0 then return end
+    local sink = packet[0] - 48
+    if sink >= 1 and sink <= 2 and active[sink] then
+      active[sink] = deliver((@cint)(sink), &packet, size)
+    end
+  end
+end
+
+global function start_daemon_log(): boolean
+  local pair: [2]cint
+  if c_socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, &pair[0]) ~= 0 then return false end
+  local capacity: cint = 65536
+  if c_setsockopt(pair[0], SOL_SOCKET, SO_SNDBUF, &capacity, (@cuint)(#cint)) ~= 0 then
+    c_close(pair[0]); c_close(pair[1])
+    return false
+  end
+  writer = c_fork()
+  if writer == 0 then
+    c_close(pair[0])
+    write_loop(pair[1])
+    c_exit(0)
+  end
+  c_close(pair[1])
+  if writer < 0 then c_close(pair[0]); return false end
+  channel = pair[0]
+  return true
+end
+
+local function disconnect()
+  if channel >= 0 then c_close(channel); channel = -1 end
+end
+
+local function enqueue(sink: string, line: string): boolean
+  if channel < 0 then return false end
+  if #line >= PacketSize then line = string.sub(line, 1, PacketSize - 2) .. '\n' end
+  local packet = sink .. line
+  local sent = c_send(channel, packet.data, packet.size, MSG_DONTWAIT | MSG_NOSIGNAL)
+  if sent < 0 and errno ~= EAGAIN and errno ~= EINTR then disconnect() end
+  return sent == #packet
+end
+
+global function flush_daemon_log_loss(): boolean
+  if dropped == 0 then return true end
+  if not enqueue('1', 'TE1\tlog\tdropped\t' .. tostring(dropped) .. '\n') then return false end
+  dropped = 0
+  return true
+end
+
+global function daemon_log_writable_fd(): cint
+  if dropped == 0 then return -1 end
+  return channel
+end
+
+local function emit(sink: string, line: string)
+  if channel < 0 then return end
+  if not flush_daemon_log_loss() or not enqueue(sink, line) then dropped = dropped + 1 end
+end
+
+global function daemon_log(...: varargs)
+  local line = ''
+  ## for i = 1, select('#', ...) do
+    ## if i > 1 then
+    line = line .. '\t'
+    ## end
+    line = line .. tostring(#[select(i, ...)]#)
+  ## end
+  emit('1', line .. '\n')
+end
+
+global function daemon_log_error(...: varargs)
+  local line = ''
+  ## for i = 1, select('#', ...) do
+    line = line .. tostring(#[select(i, ...)]#)
+  ## end
+  emit('2', line)
+end
+
+global function daemon_log_pid(): cint
+  return writer
+end
+
+global function daemon_log_reaped()
+  writer = -1
+  disconnect()
+end
+
+global function finish_daemon_log()
+  flush_daemon_log_loss()
+  disconnect()
+  if writer < 0 then return end
+  local status: cint
+  -- Allow the writer to flush on normal exit, with a bounded wait for a
+  -- collector that has stopped reading. An unreaped child owns its PID.
+  for _: integer = 1, 25 do
+    local result = c_waitpid(writer, &status, WNOHANG)
+    if result == writer or (result < 0 and errno == ECHILD) then
+      writer = -1
+      return
+    end
+    c_poll(nilptr, 0, 10)
+  end
+  c_kill(writer, SIGKILL)
+  local result = c_waitpid(writer, &status, WNOHANG)
+  for _: integer = 1, 10 do
+    if result ~= 0 and (result >= 0 or errno ~= EINTR) then break end
+    c_poll(nilptr, 0, 10)
+    result = c_waitpid(writer, &status, WNOHANG)
+  end
+  writer = -1
+end

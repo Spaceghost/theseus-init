@@ -213,6 +213,25 @@ emits the readiness, ownership and target records described above.
 The attempt increases on each service start. The legacy daemon log
 lines and control status reply remain available.
 
+### Log delivery under backpressure
+
+The supervisor queues its own records and diagnostics to a private
+log writer over a bounded Unix socket. The writer owns blocking output
+to stdout and stderr. The supervisor never waits for the collector
+during service supervision or control requests.
+
+When the queue fills, new records are dropped. Once queue space is
+available again, the writer receives a tab-separated record with
+fields `TE1`, `log`, `dropped`, and the count. A collector that stays
+unavailable can miss the queued tail and the loss notice. Shutdown
+allows the writer a short drain interval, then terminates it if it
+cannot finish. Control shutdown acknowledgement concerns service
+cleanup and remains independent of log delivery.
+
+Service and probe processes retain their inherited stdout and stderr.
+Their own blocking writes remain subject to the behavior of their
+collector.
+
 ## PID 1 boundary
 
 The userspace supervisor must prove, in order:

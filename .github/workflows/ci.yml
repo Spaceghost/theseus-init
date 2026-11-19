@@ -486,7 +486,9 @@ jobs:
           test "$(timeout 2s build/live/the state of probe-timeout)" = FAILED
           grep -F "$(printf 'TE1\treadiness\tprobe-timeout\t1\tprobe-timeout')" build/live/probe-timeout.log
           grep -F "$(printf 'TE1\treadiness\tprobe-timeout\t1\ttimeout')" build/live/probe-timeout.log
-          test -z "$(cat "/proc/$daemon_pid/task/$daemon_pid/children")"
+          leader_pid="$(awk '$1 == "daemon-spawn" {print $4}' build/live/probe-timeout.log)"
+          test "$leader_pid" -gt 0 && test ! -e "/proc/$leader_pid"
+          test "$(wc -w < "/proc/$daemon_pid/task/$daemon_pid/children")" -eq 1
           probe_pid="$(cat "$job_dir/slow-probe.pid")"
           test "$probe_pid" -gt 0 && test ! -e "/proc/$probe_pid"
           timeout 4s build/live/theseus daemon-stop
@@ -530,4 +532,108 @@ jobs:
           timeout 4s build/live/theseus daemon-stop
           wait "$daemon_pid"
           test ! -e "$THESEUS_SOCKET"
+          trap - EXIT
+
+      - name: Keep supervision responsive with stalled and closed log collectors
+        run: |
+          set -eux
+          job_dir="$(mktemp -d "$RUNNER_TEMP/log.XXXXXXXX")"
+          export THESEUS_SOCKET="$job_dir/control.sock"
+          export THESEUS_RECORDS="$job_dir/services.tsc"
+          printf 'TSC2\tchurn\t%s\037log-churn\037%s\tnever\t0\tnone\n' \
+            "$PWD/build/live/control-test" "$job_dir/complete" > "$THESEUS_RECORDS"
+          mkfifo "$job_dir/log.pipe"
+          exec 4<>"$job_dir/log.pipe"
+          # Fill the collector pipe before Theseus can write its first record.
+          dd if=/dev/zero oflag=nonblock bs=4096 count=512 status=none >&4 2>/dev/null || true
+          build/live/theseusd churn 4>&- >"$job_dir/log.pipe" 2>&1 &
+          daemon_pid=$!
+          collector=
+          trap 'exec 4>&-; kill "$daemon_pid" 2>/dev/null || true; wait "$daemon_pid" 2>/dev/null || true; if test -n "$collector"; then kill "$collector" 2>/dev/null || true; fi' EXIT
+          for i in $(seq 1 180); do
+            if test -f "$job_dir/complete"; then break; fi
+            kill -0 "$daemon_pid"
+            sleep 0.02
+          done
+          test -f "$job_dir/complete"
+          test "$(timeout 2s build/live/the state of churn)" = RUNNING
+          leader="$(timeout 2s build/live/the status of churn | awk '$1 == "pid" {print $2}')"
+          test "$leader" -gt 0
+          (
+            exec 4>&-
+            exec 5<"$job_dir/log.pipe"
+            touch "$job_dir/collector-open"
+            exec cat <&5
+          ) >"$job_dir/recovered.log" &
+          collector=$!
+          for i in $(seq 1 100); do
+            if test -f "$job_dir/collector-open"; then break; fi
+            sleep 0.02
+          done
+          test -f "$job_dir/collector-open"
+          exec 4>&-
+          for i in $(seq 1 150); do
+            if grep -aEq 'TE1[[:space:]]+log[[:space:]]+dropped[[:space:]]+[1-9]' "$job_dir/recovered.log"; then break; fi
+            sleep 0.02
+          done
+          grep -aE 'TE1[[:space:]]+log[[:space:]]+dropped[[:space:]]+[1-9]' "$job_dir/recovered.log"
+          kill "$collector"
+          wait "$collector" || true
+          collector=
+          test "$(timeout 2s build/live/the state of churn)" = RUNNING
+          timeout 3s build/live/theseus daemon-stop
+          timeout 3s tail --pid="$daemon_pid" -f /dev/null
+          wait "$daemon_pid"
+          test ! -e "/proc/$leader"
+          test ! -e "$THESEUS_SOCKET"
+          trap - EXIT
+
+          mkfifo "$job_dir/stall.pipe"
+          exec 4<>"$job_dir/stall.pipe"
+          dd if=/dev/zero oflag=nonblock bs=4096 count=512 status=none >&4 2>/dev/null || true
+          rm "$job_dir/complete"
+          export THESEUS_GRAPH="$job_dir/graph.tsc"
+          {
+            printf 'TSC3\tchurn\t%s\037log-churn\037%s\tnever\t0\tnone\t\t\t\t\n' \
+              "$PWD/build/live/control-test" "$job_dir/complete"
+            printf 'TSC3\tflap\t/bin/false\ton-failure\t8\tnone\t\t\tchurn\t\n'
+            printf 'TSC3\tanchor\t/bin/sleep\03730\tnever\t0\tnone\tchurn\tflap\t\t\n'
+            printf 'TGT1\tstall\tanchor\n'
+          } >"$THESEUS_GRAPH"
+          build/live/theseusd --target stall 4>&- >"$job_dir/stall.pipe" 2>&1 &
+          daemon_pid=$!
+          trap 'exec 4>&-; kill "$daemon_pid" 2>/dev/null || true; wait "$daemon_pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 180); do
+            if test -f "$job_dir/complete"; then break; fi
+            kill -0 "$daemon_pid"
+            sleep 0.02
+          done
+          test -f "$job_dir/complete"
+          for i in $(seq 1 150); do
+            if test "$(timeout 2s build/live/the state of flap)" = FAILED; then break; fi
+            sleep 0.02
+          done
+          timeout 2s build/live/the status of flap >"$job_dir/flap.status"
+          awk '$1 == "state" && $2 == "FAILED" { failed=1 }
+               $1 == "restarts" && $2 == 8 { retried=1 }
+               END { exit !(failed && retried) }' "$job_dir/flap.status"
+          logger=
+          for pid in $(cat "/proc/$daemon_pid/task/$daemon_pid/children"); do
+            if test "$(readlink "/proc/$pid/exe" || true)" = "$PWD/build/live/theseusd"; then
+              logger=$pid
+              break
+            fi
+          done
+          test -n "$logger"
+          timeout 3s build/live/theseus daemon-stop
+          timeout 3s tail --pid="$daemon_pid" -f /dev/null
+          wait "$daemon_pid"
+          test ! -e "/proc/$logger"
+          test ! -e "$THESEUS_SOCKET"
+          rc=0
+          THESEUS_GRAPH="$job_dir/absent.tsc" timeout 2s build/live/theseusd --target missing \
+            4>&- >"$job_dir/stall.pipe" 2>&1 || rc=$?
+          test "$rc" -eq 65
+          test ! -e "$THESEUS_SOCKET"
+          exec 4>&-
           trap - EXIT

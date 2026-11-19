@@ -130,6 +130,27 @@ if arg[1] == 'orphan-burst' then
   while true do c_pause() end
 end
 
+if arg[1] == 'log-churn' then
+  for _: integer = 1, 24 do
+    local helper = c_fork()
+    assert(helper >= 0, 'log fixture fork failed')
+    if helper == 0 then
+      for _: integer = 1, 24 do
+        local pid = c_fork()
+        assert(pid >= 0, 'log fixture descendant fork failed')
+        if pid == 0 then c_exit(19) end
+      end
+      c_exit(0)
+    end
+    local status: cint
+    assert(c_waitpid(helper, &status, 0) == helper and status == 0, 'log fixture failed')
+  end
+  local ready = io.open(arg[2], 'w')
+  assert(ready:isopen(), 'log fixture could not publish completion')
+  ready:close()
+  while true do c_pause() end
+end
+
 if arg[1] == 'tree' then
   local dir = arg[2]
   local first = io.open(dir .. '/first.pid', 'r')

@@ -11,6 +11,7 @@ require 'string'
 require 'src.theseus.readiness'
 require 'src.theseus.graph'
 require 'src.theseus.cgroup'
+require 'src.theseus.daemon_log'
 
 local function c_fork(): cint <cimport 'fork', nodecl, cinclude '<unistd.h>'> end
 local function c_execv(file: cstring, argv: *cstring): cint <cimport 'execv', nodecl, cinclude '<unistd.h>'> end
@@ -85,6 +86,7 @@ local EAGAIN: cint <cimport, nodecl, cinclude '<errno.h>'>
 local ESRCH: cint <cimport, nodecl, cinclude '<errno.h>'>
 local O_CLOEXEC: cint <cimport, nodecl, cinclude '<fcntl.h>'>
 local O_NONBLOCK: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local POLLOUT: cshort <cimport, nodecl, cinclude '<poll.h>'>
 local POLLIN: cshort <cimport, nodecl, cinclude '<poll.h>'>
 local SYS_pidfd_open: clong <cimport, nodecl, cinclude '<sys/syscall.h>'>
 local SYS_pidfd_send_signal: clong <cimport, nodecl, cinclude '<sys/syscall.h>'>
@@ -161,7 +163,7 @@ end
 
 local function transition(runtime: *Runtime, state: ServiceState, reason: string)
   if runtime.state == state then return end
-  print('TE1', 'state', runtime.service.name, runtime.attempts,
+  daemon_log('TE1', 'state', runtime.service.name, runtime.attempts,
         state_name(runtime.state), state_name(state), reason)
   runtime.state = state
 end
@@ -361,7 +363,7 @@ local function spawn(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset): b
   if timeout == 0 then timeout = 30000 end
   runtime.ready_by = monotonic_ms() + timeout
   runtime.action_at = runtime.ready_by
-  print('daemon-spawn', runtime.service.name, 'pid', pid, 'pidfd', pidfd, 'attempt', runtime.attempts)
+  daemon_log('daemon-spawn', runtime.service.name, 'pid', pid, 'pidfd', pidfd, 'attempt', runtime.attempts)
   return true
 end
 
@@ -380,10 +382,10 @@ local function record_exec(runtime: *Runtime): boolean
   if runtime.state ~= ServiceState.Starting then return true end
   if got > 0 then
     if failed == 2 then
-      print('TE1', 'ownership', runtime.service.name, runtime.attempts, 'placement-failed')
+      daemon_log('TE1', 'ownership', runtime.service.name, runtime.attempts, 'placement-failed')
       return false
     end
-    print('TE1', 'service', runtime.service.name, runtime.attempts, 'exec-failed')
+    daemon_log('TE1', 'service', runtime.service.name, runtime.attempts, 'exec-failed')
   elseif runtime.service.readiness == ReadinessKind.UnixSocket then
     runtime.action_at = monotonic_ms()
   else
@@ -412,7 +414,7 @@ local function reap(runtime: *Runtime): boolean
   runtime.pidfd = -1
   runtime.pid = 0
   decode_wait(status, runtime)
-  print('TE1', 'service', runtime.service.name, runtime.attempts, 'exited', runtime.last_exit, runtime.last_signal)
+  daemon_log('TE1', 'service', runtime.service.name, runtime.attempts, 'exited', runtime.last_exit, runtime.last_signal)
   return true
 end
 
@@ -440,9 +442,9 @@ local function record_exit(runtime: *Runtime): boolean
   local premature = runtime.state == ServiceState.Starting or runtime.state == ServiceState.Stopping
   if not reap(runtime) then return false end
   if runtime.state == ServiceState.Starting then
-    print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'exited-before-ready')
+    daemon_log('TE1', 'readiness', runtime.service.name, runtime.attempts, 'exited-before-ready')
   end
-  print('daemon-exit', runtime.service.name, 'code', runtime.last_exit, 'signal', runtime.last_signal)
+  daemon_log('daemon-exit', runtime.service.name, 'code', runtime.last_exit, 'signal', runtime.last_signal)
   local now = monotonic_ms()
   if not cancel_probe(runtime, now) then return false end
   runtime.exit_state = ServiceState.Stopped
@@ -458,10 +460,10 @@ local function record_exit(runtime: *Runtime): boolean
   if ownership == CgroupState.Error then return false end
   if ownership == CgroupState.Populated then
     if not cgroup_kill(&runtime.cgroup) then
-      io.stderr:write('theseusd: cannot drain cgroup for ', runtime.service.name, '\n')
+      daemon_log_error('theseusd: cannot drain cgroup for ', runtime.service.name, '\n')
       return false
     end
-    print('TE1', 'ownership', runtime.service.name, runtime.attempts, 'draining')
+    daemon_log('TE1', 'ownership', runtime.service.name, runtime.attempts, 'draining')
   end
   transition(runtime, ServiceState.Stopping, 'drain')
   runtime.drain_by = now + 1000
@@ -471,10 +473,10 @@ end
 
 local function socket_path(): string
   local path = os.getenv('THESEUS_SOCKET')
-  if #path == 0 then io.stderr:write('theseusd: THESEUS_SOCKET is required in userspace mode\n'); os.exit(64) end
+  if #path == 0 then daemon_log_error('theseusd: THESEUS_SOCKET is required in userspace mode\n'); return '' end
   if #path > 100 or string.byte(path, 1) ~= 47 then
-    io.stderr:write('theseusd: socket path must be absolute and <=100 bytes\n')
-    os.exit(64)
+    daemon_log_error('theseusd: socket path must be absolute and <=100 bytes\n')
+    return ''
   end
   return path
 end
@@ -535,7 +537,7 @@ end
 
 local function mark_ready(runtime: *Runtime)
   transition(runtime, ServiceState.Ready, 'readiness-passed')
-  print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'ready')
+  daemon_log('TE1', 'readiness', runtime.service.name, runtime.attempts, 'ready')
   transition(runtime, ServiceState.Running, 'startup-complete')
   runtime.action_at = 0
 end
@@ -584,12 +586,12 @@ local function record_probe(runtime: *Runtime): boolean
   else
     if not runtime.probe_cancelled then
       if now >= runtime.probe_by then
-        print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'probe-timeout')
+        daemon_log('TE1', 'readiness', runtime.service.name, runtime.attempts, 'probe-timeout')
       elseif status ~= 0 then
-        print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'probe-failed',
+        daemon_log('TE1', 'readiness', runtime.service.name, runtime.attempts, 'probe-failed',
               (status >> 8) & 0xff, status & 0x7f)
       elseif now < runtime.ready_by then
-        print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'probe-peer-lost')
+        daemon_log('TE1', 'readiness', runtime.service.name, runtime.attempts, 'probe-peer-lost')
       end
     end
     runtime.action_at = math.min(now + runtime.service.readiness_options.interval, runtime.ready_by)
@@ -604,13 +606,13 @@ local function advance_service(runtime: *Runtime, argv: *ExecArgv, child_mask: *
     local ownership = cgroup_state(&runtime.cgroup)
     if ownership == CgroupState.Empty and runtime.probe_fd < 0 then
       if #runtime.cgroup.name > 0 then
-        print('TE1', 'ownership', runtime.service.name, runtime.attempts, 'drained')
+        daemon_log('TE1', 'ownership', runtime.service.name, runtime.attempts, 'drained')
       end
       finish_exit(runtime)
       return true
     end
     if ownership == CgroupState.Error or now >= runtime.drain_by then
-      io.stderr:write('theseusd: cgroup did not drain for ', runtime.service.name, '\n')
+      daemon_log_error('theseusd: cgroup did not drain for ', runtime.service.name, '\n')
       return false
     end
     runtime.action_at = math.min(now + 10, runtime.drain_by)
@@ -624,7 +626,7 @@ local function advance_service(runtime: *Runtime, argv: *ExecArgv, child_mask: *
   if runtime.state == ServiceState.Starting then
     if now >= runtime.ready_by then
       if not cancel_probe(runtime, now) then return false end
-      print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'timeout')
+      daemon_log('TE1', 'readiness', runtime.service.name, runtime.attempts, 'timeout')
       transition(runtime, ServiceState.Stopping, 'readiness-timeout')
       runtime.kill_sent = false
       runtime.action_at = now + 1000
@@ -633,7 +635,7 @@ local function advance_service(runtime: *Runtime, argv: *ExecArgv, child_mask: *
     if runtime.probe_fd >= 0 then
       if now >= runtime.probe_by then
         if runtime.probe_cancelled or not cancel_probe(runtime, now) then return false end
-        print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'probe-timeout')
+        daemon_log('TE1', 'readiness', runtime.service.name, runtime.attempts, 'probe-timeout')
       end
       runtime.action_at = math.min(runtime.probe_by, runtime.ready_by)
     elseif runtime.execfd < 0 and runtime.service.readiness == ReadinessKind.UnixSocket and has_ready_peer(runtime) then
@@ -650,7 +652,7 @@ local function advance_service(runtime: *Runtime, argv: *ExecArgv, child_mask: *
     runtime.action_at = now + 1000
     return signal_child(runtime, SIGKILL)
   end
-  io.stderr:write('theseusd: could not stop child after readiness timeout\n')
+  daemon_log_error('theseusd: could not stop child after readiness timeout\n')
   return false
 end
 
@@ -734,12 +736,12 @@ local function drain_cgroup(runtime: *Runtime): boolean
   local state = cgroup_state(&runtime.cgroup)
   if state == CgroupState.Empty then return true end
   if state == CgroupState.Error or not cgroup_kill(&runtime.cgroup) then return false end
-  print('TE1', 'ownership', runtime.service.name, runtime.attempts, 'draining')
+  daemon_log('TE1', 'ownership', runtime.service.name, runtime.attempts, 'draining')
   local deadline = monotonic_ms() + 1000
   repeat
     state = cgroup_state(&runtime.cgroup)
     if state == CgroupState.Empty then
-      print('TE1', 'ownership', runtime.service.name, runtime.attempts, 'drained')
+      daemon_log('TE1', 'ownership', runtime.service.name, runtime.attempts, 'drained')
       return true
     end
     if state == CgroupState.Error then return false end
@@ -778,7 +780,7 @@ local function advance_target(group: *Supervision, child_mask: *Sigset): integer
     local runtime = &group.runtimes[i]
     if group.required[i] then
       if terminal(runtime.state) then
-        print('TE1', 'target', group.name, 'failed', runtime.service.name)
+        daemon_log('TE1', 'target', group.name, 'failed', runtime.service.name)
         return 82
       end
     end
@@ -802,10 +804,10 @@ local function advance_target(group: *Supervision, child_mask: *Sigset): integer
     end
     if unavailable >= 0 then
       transition(runtime, ServiceState.Failed, 'dependency-failed')
-      print('TE1', 'target', group.name, 'skipped', runtime.service.name,
+      daemon_log('TE1', 'target', group.name, 'skipped', runtime.service.name,
             group.runtimes[unavailable].service.name)
     elseif not spawn(runtime, &group.arguments[i], child_mask) then
-      print('TE1', 'target', group.name, 'failed', runtime.service.name)
+      daemon_log('TE1', 'target', group.name, 'failed', runtime.service.name)
       return 80
     end
     group.next_start = i + 1
@@ -816,7 +818,7 @@ local function advance_target(group: *Supervision, child_mask: *Sigset): integer
     end
     local last = group.runtimes[group.count - 1].state
     if last == ServiceState.Running or terminal(last) then
-      print('TE1', 'target', group.name, 'running')
+      daemon_log('TE1', 'target', group.name, 'running')
       group.announced = true
     end
   end
@@ -846,10 +848,11 @@ local function reap_notified_child(group: *Supervision, pid: cint): boolean
 
   local status: cint
   if not wait_for_child(pid, &status) then return false end
+  if pid == daemon_log_pid() then daemon_log_reaped(); return true end
   local signal = status & 0x7f
   local code: integer = -1
   if signal == 0 then code = (status >> 8) & 0xff end
-  print('TE1', 'process', pid, 'adopted-exit', code, signal)
+  daemon_log('TE1', 'process', pid, 'adopted-exit', code, signal)
   return true
 end
 
@@ -874,14 +877,15 @@ end
 
 local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *Supervision,
                      child_mask: *Sigset): (integer, cint)
-  local fds: [3 + MaxClients + 3 * NativeMaxServices]Pollfd
-  local first_child = 3 + MaxClients
+  local fds: [4 + MaxClients + 3 * NativeMaxServices]Pollfd
+  local first_child = 4 + MaxClients
   local first_exec = first_child + group.count
   local first_probe = first_exec + group.count
   local count = first_probe + group.count
   fds[0] = {fd = listener, events = POLLIN}
   fds[1] = {fd = shutdown_fd, events = POLLIN}
   fds[2] = {fd = reap_fd, events = POLLIN}
+  fds[3].events = POLLOUT
   for i: integer = 0, group.count - 1 do
     fds[first_child + i].events = POLLIN
     fds[first_exec + i].events = POLLIN
@@ -889,7 +893,7 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
   end
   local clients: [MaxClients]ControlClient
   for slot: integer = 0, MaxClients - 1 do
-    fds[slot + 3] = {fd = -1, events = POLLIN}
+    fds[slot + 4] = {fd = -1, events = POLLIN}
   end
 
   local exit_code: integer = 0
@@ -897,6 +901,7 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
   local more_exits = false
   while true do
     local deadline: integer = 0
+    fds[3].fd = daemon_log_writable_fd()
     for i: integer = 0, group.count - 1 do
       local runtime = &group.runtimes[i]
       fds[first_child + i].fd = runtime.pidfd
@@ -908,7 +913,7 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
     local now = monotonic_ms()
     local free_slot: integer = -1
     for slot: integer = 0, MaxClients - 1 do
-      local event = &fds[slot + 3]
+      local event = &fds[slot + 4]
       local expires = clients[slot].deadline
       if event.fd >= 0 and expires <= now then
         c_close(event.fd)
@@ -929,6 +934,7 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
       if errno ~= EINTR then exit_code = 79; break end
     else
       if fds[1].revents ~= 0 then break end
+      if fds[3].revents ~= 0 then flush_daemon_log_loss() end
       for i: integer = 0, group.count - 1 do
         local runtime = &group.runtimes[i]
         local event = fds[first_child + i].revents
@@ -962,7 +968,7 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
       end
 
       for slot: integer = 0, MaxClients - 1 do
-        local event = &fds[slot + 3]
+        local event = &fds[slot + 4]
         if event.revents == 0 then continue end
         local state, request = read_request(event.fd, &clients[slot])
         if state == RequestState.Pending then continue end
@@ -984,7 +990,7 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
       if (fds[0].revents & POLLIN) ~= 0 then
         local fd = c_accept4(listener, nilptr, nilptr, SOCK_CLOEXEC | SOCK_NONBLOCK)
         if fd >= 0 then
-          fds[free_slot + 3].fd = fd
+          fds[free_slot + 4].fd = fd
           clients[free_slot].used = 0
           clients[free_slot].deadline = monotonic_ms() + ControlTimeout
         elseif errno ~= EAGAIN and errno ~= EINTR then exit_code = 79; break end
@@ -1005,16 +1011,21 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
   end
 
   for slot: integer = 0, MaxClients - 1 do
-    local fd = fds[slot + 3].fd
+    local fd = fds[slot + 4].fd
     if fd >= 0 then c_close(fd) end
   end
   return exit_code, shutdown_client
+end
+
+local function log_graph_diagnostic(message: string)
+  daemon_log_error(message)
 end
 
 local function load_target(name: string, group: *Supervision): integer
   local path = os.getenv('THESEUS_GRAPH')
   if #path == 0 then path = './build/graph.tsc' end
   local graph: NativeGraph
+  set_native_graph_diagnostics(log_graph_diagnostic)
   if not load_native_graph(path, &graph) then return 65 end
   local plan: NativePlan
   local code = plan_native_target(&graph, name, &plan)
@@ -1025,7 +1036,7 @@ local function load_target(name: string, group: *Supervision): integer
     local member = plan.order[i]
     local ok, service = parse_service(graph.services[member].runtime_record)
     if not ok then
-      io.stderr:write('theseusd: invalid runtime fields for ', graph.services[member].name, '\n')
+      daemon_log_error('theseusd: invalid runtime fields for ', graph.services[member].name, '\n')
       return 65
     end
     group.runtimes[i].service = service
@@ -1038,7 +1049,7 @@ local function load_single(name: string, group: *Supervision): integer
   local records = os.getenv('THESEUS_RECORDS')
   if #records == 0 then records = './build/services.tsc' end
   local ok, service = load_service(records, name)
-  if not ok then io.stderr:write('theseusd: unknown service: ', name, '\n'); return 3 end
+  if not ok then daemon_log_error('theseusd: unknown service: ', name, '\n'); return 3 end
   group.count = 1
   group.runtimes[0].service = service
   return 0
@@ -1050,7 +1061,7 @@ local function prepare(group: *Supervision, path: string): integer
     local runtime = &group.runtimes[i]
     local service = &runtime.service
     if not decode_argv(service.argv_serialized, &group.arguments[i]) then
-      io.stderr:write('theseusd: invalid argv for ', service.name, '\n')
+      daemon_log_error('theseusd: invalid argv for ', service.name, '\n')
       return 65
     end
     runtime.pidfd = -1
@@ -1058,7 +1069,7 @@ local function prepare(group: *Supervision, path: string): integer
     runtime.probe_fd = -1
     local probe = service.readiness_options.probe
     if #probe > 0 and (not decode_argv(probe, &runtime.probe_args) or #runtime.probe_args.storage[0] < 2) then
-      io.stderr:write('theseusd: invalid probe argv for ', service.name, '\n')
+      daemon_log_error('theseusd: invalid probe argv for ', service.name, '\n')
       return 65
     end
     runtime.last_exit = -1
@@ -1066,16 +1077,16 @@ local function prepare(group: *Supervision, path: string): integer
     if service.readiness == ReadinessKind.UnixSocket then
       local endpoint = service.readiness_options.path
       if #endpoint == 0 then
-        io.stderr:write('theseusd: recompile the service to supply its unix-socket readiness path\n')
+        daemon_log_error('theseusd: recompile the service to supply its unix-socket readiness path\n')
         return 69
       end
       if endpoint == path then
-        io.stderr:write('theseusd: readiness and control sockets need distinct paths\n')
+        daemon_log_error('theseusd: readiness and control sockets need distinct paths\n')
         return 65
       end
       for j: integer = 0, i - 1 do
         if group.runtimes[j].service.readiness_options.path == endpoint then
-          io.stderr:write('theseusd: multiple services declare readiness at ', endpoint, '\n')
+          daemon_log_error('theseusd: multiple services declare readiness at ', endpoint, '\n')
           return 65
         end
       end
@@ -1083,13 +1094,13 @@ local function prepare(group: *Supervision, path: string): integer
     end
   end
   if socket_probes and not peer_pidfd_available() then
-    io.stderr:write('theseusd: unix-socket readiness requires kernel SO_PEERPIDFD support\n')
+    daemon_log_error('theseusd: unix-socket readiness requires kernel SO_PEERPIDFD support\n')
     return 69
   end
   return 0
 end
 
-local function main(): integer
+local function supervise(shutdown_fd: cint, reap_fd: cint, child_mask: *Sigset): integer
   local group: Supervision
   local code: integer
   if #arg == 2 and arg[1] == '--target' then
@@ -1100,16 +1111,17 @@ local function main(): integer
     group.name = arg[1]
     code = load_single(group.name, &group)
   else
-    io.stderr:write('usage: theseusd SERVICE | theseusd --target TARGET\n')
+    daemon_log_error('usage: theseusd SERVICE | theseusd --target TARGET\n')
     return 64
   end
   if code ~= 0 then return code end
   local path = socket_path()
+  if #path == 0 then return 64 end
   code = prepare(&group, path)
   if code ~= 0 then return code end
 
   if c_access((@cstring)(path), 0) == 0 then
-    io.stderr:write('theseusd: refusing pre-existing control socket path: ', path, '\n')
+    daemon_log_error('theseusd: refusing pre-existing control socket path: ', path, '\n')
     return 73
   end
   local root: cint = -1
@@ -1117,17 +1129,9 @@ local function main(): integer
   if #delegation > 0 then
     root = cgroup_open_root(delegation)
     if root < 0 then
-      io.stderr:write('theseusd: invalid cgroup v2 delegation: ', delegation, '\n')
+      daemon_log_error('theseusd: invalid cgroup v2 delegation: ', delegation, '\n')
       return 83
     end
-  end
-  local child_mask: Sigset
-  local shutdown_fd = open_shutdown_fd(&child_mask)
-  if shutdown_fd < 0 then return 74 end
-  local reap_fd = open_reap_fd()
-  if reap_fd < 0 then
-    io.stderr:write('theseusd: cannot enable child subreaping\n')
-    return 84
   end
   local listener = c_socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)
   if listener < 0 then return 74 end
@@ -1147,22 +1151,22 @@ local function main(): integer
     for i: integer = 0, group.count - 1 do
       local runtime = &group.runtimes[i]
       if not cgroup_create(root, i, &runtime.cgroup) then
-        io.stderr:write('theseusd: cannot create cgroup for ', runtime.service.name, '\n')
+        daemon_log_error('theseusd: cannot create cgroup for ', runtime.service.name, '\n')
         exit_code = 83
         resources_ready = false
         break
       end
-      print('TE1', 'ownership', runtime.service.name, 0, 'assigned', runtime.cgroup.name)
+      daemon_log('TE1', 'ownership', runtime.service.name, 0, 'assigned', runtime.cgroup.name)
     end
   end
   if resources_ready then
     if group.target then
-      exit_code = advance_target(&group, &child_mask)
-    elseif spawn(&group.runtimes[0], &group.arguments[0], &child_mask) then
+      exit_code = advance_target(&group, child_mask)
+    elseif spawn(&group.runtimes[0], &group.arguments[0], child_mask) then
       exit_code = 0
     end
     if exit_code == 0 then
-      exit_code, shutdown_client = serve(listener, shutdown_fd, reap_fd, &group, &child_mask)
+      exit_code, shutdown_client = serve(listener, shutdown_fd, reap_fd, &group, child_mask)
     end
   end
 
@@ -1171,16 +1175,15 @@ local function main(): integer
   for i: integer = group.count - 1, 0, -1 do
     local runtime = &group.runtimes[i]
     if runtime.pidfd >= 0 and group.target then
-      print('TE1', 'target', group.name, 'stopping', runtime.service.name)
+      daemon_log('TE1', 'target', group.name, 'stopping', runtime.service.name)
     end
     if resources_ready and not stop_child(runtime) then stopped = false end
     if root >= 0 and not cgroup_remove(root, &runtime.cgroup) then
-      io.stderr:write('theseusd: cannot remove cgroup for ', runtime.service.name, '\n')
+      daemon_log_error('theseusd: cannot remove cgroup for ', runtime.service.name, '\n')
       stopped = false
     end
   end
   if root >= 0 then c_close(root) end
-  c_close(reap_fd)
   local more = true
   local reap_deadline = monotonic_ms() + 1000
   while more do
@@ -1189,19 +1192,37 @@ local function main(): integer
     if not ok or (more and monotonic_ms() >= reap_deadline) then stopped = false; break end
   end
   c_unlink((@cstring)(path))
-  c_close(shutdown_fd)
   if shutdown_client >= 0 then
     if stopped then write_all(shutdown_client, 'TR1\tOK\n')
     else write_all(shutdown_client, 'TR1\tERROR\tshutdown\n') end
     c_close(shutdown_client)
   end
   if not stopped then
-    io.stderr:write('theseusd: failed to complete child cleanup\n')
+    daemon_log_error('theseusd: failed to complete child cleanup\n')
     return 81
   end
-  if group.target then print('TE1', 'target', group.name, 'stopped', exit_code) end
-  print('daemon-stopped', group.name)
+  if group.target then daemon_log('TE1', 'target', group.name, 'stopped', exit_code) end
+  daemon_log('daemon-stopped', group.name)
   return exit_code
+end
+
+local function main(): integer
+  local child_mask: Sigset
+  local shutdown_fd = open_shutdown_fd(&child_mask)
+  if shutdown_fd < 0 then return 74 end
+  if not start_daemon_log() then return 85 end
+  local reap_fd = open_reap_fd()
+  if reap_fd < 0 then
+    daemon_log_error('theseusd: cannot enable child subreaping\n')
+    c_close(shutdown_fd)
+    finish_daemon_log()
+    return 84
+  end
+  local result = supervise(shutdown_fd, reap_fd, &child_mask)
+  c_close(reap_fd)
+  c_close(shutdown_fd)
+  finish_daemon_log()
+  return result
 end
 
 os.exit(main())
