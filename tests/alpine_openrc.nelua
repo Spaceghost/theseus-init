@@ -8,53 +8,108 @@ local function c_fork(): cint <cimport 'fork', nodecl, cinclude '<unistd.h>'> en
 local function c_execv(path: cstring, argv: *cstring): cint <cimport 'execv', nodecl, cinclude '<unistd.h>'> end
 local function c_exit(code: cint): void <cimport '_exit', nodecl, cinclude '<unistd.h>'> end
 local function c_waitpid(pid: cint, status: *cint, options: cint): cint <cimport 'waitpid', nodecl, cinclude '<sys/wait.h>'> end
+local function c_pipe(fds: *cint): cint <cimport 'pipe', nodecl, cinclude '<unistd.h>'> end
+local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
+local function c_dup2(oldfd: cint, fd: cint): cint <cimport 'dup2', nodecl, cinclude '<unistd.h>'> end
+local function c_read(fd: cint, data: pointer, length: csize): clong <cimport 'read', nodecl, cinclude '<unistd.h>'> end
+local function c_poll(fds: pointer, count: culong, timeout: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
 local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
 local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
 
 local Runner = @enum{OpenRC = 0, Theseus}
+local Command = @[13]cstring
 local rc_service: cstring = '/sbin/rc-service'
 
-local function run(program: cstring, first: cstring, second: cstring, third: cstring,
-                   fourth: cstring, fifth: cstring): integer
-  local argv: [7]cstring = {program, first, second, third, fourth, fifth, nilptr}
+local function execute(argv: Command, capture: boolean): (integer, string)
+  local channel: [2]cint
+  if capture then assert(c_pipe(&channel[0]) == 0, 'test pipe failed') end
   local pid = c_fork()
   assert(pid >= 0, 'test fork failed')
   if pid == 0 then
-    c_execv(program, &argv[0])
+    if capture then
+      c_close(channel[0])
+      if c_dup2(channel[1], 1) < 0 or c_dup2(channel[1], 2) < 0 then c_exit(126) end
+      c_close(channel[1])
+    end
+    c_execv(argv[0], &argv[0])
     c_exit(127)
+  end
+  local output = ''
+  if capture then
+    c_close(channel[1])
+    local buffer: [4096]byte
+    local used: usize = 0
+    while true do
+      assert(used < #buffer, 'captured output exceeded bounds')
+      local count = c_read(channel[0], &buffer[used], #buffer - used)
+      if count < 0 and errno == EINTR then continue end
+      assert(count >= 0, 'test read failed')
+      if count == 0 then break end
+      used = used + (@usize)(count)
+    end
+    output = string.copy((@string){data = &buffer[0], size = used})
+    c_close(channel[0])
   end
   local status: cint
   local result = c_waitpid(pid, &status, 0)
   while result < 0 and errno == EINTR do result = c_waitpid(pid, &status, 0) end
   assert(result == pid, 'test waitpid failed')
-  if (status & 0x7f) ~= 0 then return 128 + (status & 0x7f) end
-  return (status >> 8) & 0xff
+  if (status & 0x7f) ~= 0 then return 128 + (status & 0x7f), output end
+  return (status >> 8) & 0xff, output
+end
+
+local function run(argv: Command): integer
+  local status = execute(argv, false)
+  return status
+end
+
+local function action_args(runner: Runner, service: cstring, command: cstring): Command
+  if runner == Runner.OpenRC then return (@Command){rc_service, service, command} end
+  return (@Command){(@cstring)(arg[1]), 'openrc', service, command}
 end
 
 local function action(runner: Runner, service: cstring, command: cstring): integer
-  if runner == Runner.OpenRC then return run(rc_service, service, command, nilptr, nilptr, nilptr) end
-  return run((@cstring)(arg[1]), 'openrc', service, command, nilptr, nilptr)
+  return run(action_args(runner, service, command))
+end
+
+local function compare_status(service: cstring): integer
+  local baseline, output = execute(action_args(Runner.OpenRC, service, 'status'), true)
+  local adapted, adapted_output = execute(action_args(Runner.Theseus, service, 'status'), true)
+  assert(adapted == baseline and adapted_output == output, 'theseus changed OpenRC status')
+  local queried, queried_output = execute({(@cstring)(arg[2]), 'status', 'of', 'openrc', service}, true)
+  assert(queried == baseline and queried_output == output, 'the changed OpenRC status')
+  return baseline
 end
 
 local function verify_status(service: cstring, started: boolean)
-  local baseline = action(Runner.OpenRC, service, 'status')
-  assert((baseline == 0) == started, 'unexpected OpenRC status')
-  assert(action(Runner.Theseus, service, 'status') == baseline, 'theseus changed OpenRC status')
-  assert(run((@cstring)(arg[2]), 'status', 'of', 'openrc', service, nilptr) == baseline,
-         'the changed OpenRC status')
+  local status = compare_status(service)
+  assert((status == 0) == started, 'unexpected OpenRC status')
 end
 
 local function workload(service: cstring): integer
   local name = tostring(service)
   if name == 'postgresql' then
-    return run('/usr/bin/psql', '-XAtq', '-d',
-               'host=/run/postgresql user=postgres dbname=postgres connect_timeout=2',
-               '-c', 'SELECT 42')
+    return run({'/usr/bin/psql', '-XAtq', '-d',
+               'host=/run/postgresql user=postgres dbname=postgres connect_timeout=2', '-c', 'SELECT 42'})
+  elseif name == 'lighttpd' then
+    return run({'/usr/bin/wget', '-T', '2', '-q', '-O', '/dev/null', 'http://127.0.0.1:8080/'})
+  elseif name == 'caddy' then
+    return run({'/usr/bin/wget', '-T', '2', '-q', '-O', '/dev/null', 'http://127.0.0.1:8081/'})
+  elseif name == 'valkey' then
+    return run({'/bin/busybox', 'timeout', '2', '/usr/bin/valkey-cli', '-h', '127.0.0.1', 'PING'})
+  elseif name == 'mosquitto' then
+    return run({'/bin/busybox', 'timeout', '2', '/usr/bin/mosquitto_pub', '-h', '127.0.0.1',
+                '-q', '1', '-t', 'theseus/corpus', '-m', 'alive'})
   end
-  if name == 'lighttpd' then
-    return run('/usr/bin/wget', '-q', '-O', '/dev/null', 'http://127.0.0.1:8080/', nilptr)
+  return run({'/bin/busybox', 'pidof', 'crond'})
+end
+
+local function verify_workload(service: cstring)
+  for _: integer = 1, 20 do
+    if workload(service) == 0 then return end
+    c_poll(nilptr, 0, 100)
   end
-  return run('/bin/busybox', 'pidof', 'crond', nilptr, nilptr, nilptr)
+  assert(false, 'service workload failed')
 end
 
 local function cycle(runner: Runner, service: cstring)
@@ -62,23 +117,86 @@ local function cycle(runner: Runner, service: cstring)
   assert(workload(service) ~= 0, 'service workload already active')
   assert(action(runner, service, 'start') == 0, 'start failed')
   verify_status(service, true)
-  assert(workload(service) == 0, 'service workload failed after start')
+  verify_workload(service)
   assert(action(runner, service, 'restart') == 0, 'restart failed')
   verify_status(service, true)
-  assert(workload(service) == 0, 'service workload failed after restart')
+  verify_workload(service)
   if tostring(service) == 'postgresql' then
     assert(action(runner, service, 'reload') == 0, 'reload failed')
-    assert(workload(service) == 0, 'service workload failed after reload')
+    verify_workload(service)
   end
   assert(action(runner, service, 'stop') == 0, 'stop failed')
   verify_status(service, false)
   assert(workload(service) ~= 0, 'service workload survived stop')
 end
 
-assert(#arg >= 3, 'usage: alpine-openrc-test THESEUS THE SERVICE...')
+local function switch_level(runner: Runner, name: cstring)
+  if runner == Runner.OpenRC then
+    assert(run({'/sbin/openrc', name}) == 0, 'OpenRC runlevel switch failed')
+  else
+    assert(run({(@cstring)(arg[1]), 'openrc-runlevel', name}) == 0, 'adapter runlevel switch failed')
+  end
+  local baseline, current = execute({'/bin/rc-status', '--runlevel'}, true)
+  local observed, query = execute({(@cstring)(arg[2]), 'openrc-runlevel'}, true)
+  assert(baseline == 0 and current == tostring(name) .. '\n', 'wrong active runlevel')
+  assert(observed == baseline and query == current, 'adapter runlevel query differed')
+end
+
+local function cronie_pid(): string
+  local file = io.open('/run/cronie.pid', 'r')
+  assert(file:isopen(), 'stacked cronie pidfile missing')
+  local pid = file:read('*l')
+  file:close()
+  assert(#pid > 0, 'stacked cronie pidfile empty')
+  return pid
+end
+
+local function level_cycle(runner: Runner)
+  switch_level(runner, 'theseus-a')
+  verify_status('cronie', true)
+  verify_status('valkey', true)
+  verify_status('mosquitto', false)
+  local shared = cronie_pid()
+  switch_level(runner, 'theseus-b')
+  verify_status('cronie', true)
+  verify_status('valkey', false)
+  verify_status('mosquitto', true)
+  assert(cronie_pid() == shared, 'shared service restarted during level switch')
+  verify_workload('mosquitto')
+  switch_level(runner, 'theseus-idle')
+  verify_status('cronie', false)
+  verify_status('valkey', false)
+  verify_status('mosquitto', false)
+end
+
+local function compare_catalog()
+  local code, list = execute({rc_service, '--list'}, true)
+  assert(code == 0 and #list > 0, 'OpenRC service inventory unavailable')
+  local total: integer = 0
+  for name: string in string.gmatch(list, '[^\n]+') do
+    local status = compare_status((@cstring)(name))
+    print('openrc-catalog', name, status)
+    total = total + 1
+  end
+  assert(total > 0)
+  print('openrc-catalog', 'total', total)
+end
+
+assert(#arg >= 3, 'usage: alpine-openrc-test THESEUS THE SERVICE... or --runlevels or --catalog-status')
+if #arg == 3 and arg[3] == '--catalog-status' then
+  compare_catalog()
+  os.exit(0)
+end
+if #arg == 3 and arg[3] == '--runlevels' then
+  level_cycle(Runner.OpenRC)
+  level_cycle(Runner.Theseus)
+  print('openrc-corpus', 'stacked-runlevels', 'pass')
+  os.exit(0)
+end
 for i: integer = 3, #arg do
   local name = arg[i]
-  assert(name == 'postgresql' or name == 'lighttpd' or name == 'cronie', 'unknown workload fixture')
+  assert(name == 'postgresql' or name == 'lighttpd' or name == 'cronie' or name == 'caddy' or
+         name == 'valkey' or name == 'mosquitto', 'unknown workload fixture')
   print('openrc-corpus', name, 'baseline')
   cycle(Runner.OpenRC, (@cstring)(name))
   print('openrc-corpus', name, 'adapter')
@@ -86,7 +204,4 @@ for i: integer = 3, #arg do
   print('openrc-corpus', name, 'pass')
 end
 
-local missing: cstring = 'theseus-package-not-installed'
-local baseline = action(Runner.OpenRC, missing, 'status')
-assert(baseline ~= 0 and action(Runner.Theseus, missing, 'status') == baseline,
-       'missing service exit status changed')
+assert(compare_status('theseus-package-not-installed') ~= 0, 'missing service returned success')

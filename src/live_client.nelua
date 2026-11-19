@@ -179,12 +179,12 @@ if is_the() then
   if #arg == 3 and arg[2] == 'of' and arg[1] == 'state' then
     os.exit(query_status(arg[3], true))
   end
-  io.stderr:write('usage: the status of SERVICE | the state of SERVICE | the status of openrc SERVICE\n')
+  io.stderr:write('usage: the status of SERVICE | the state of SERVICE | the status of openrc SERVICE | the openrc-runlevel\n')
   os.exit(64)
 end
 
 if #arg == 2 and arg[1] == 'status' then os.exit(query_status(arg[2], false)) end
 if #arg == 2 and arg[1] == 'state' then os.exit(query_status(arg[2], true)) end
 if #arg == 1 and arg[1] == 'daemon-stop' then os.exit(shutdown()) end
-io.stderr:write('usage: theseus status SERVICE | theseus state SERVICE | theseus daemon-stop | theseus openrc SERVICE ACTION\n')
+io.stderr:write('usage: theseus status SERVICE | theseus state SERVICE | theseus daemon-stop | theseus openrc SERVICE ACTION | theseus openrc-runlevel RUNLEVEL\n')
 os.exit(64)

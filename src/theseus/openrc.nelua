@@ -13,6 +13,17 @@ local function valid_name(name: string): boolean
   return string.find(name, '^[a-zA-Z0-9][a-zA-Z0-9._@:+-]*$') == 1
 end
 
+local function exec_backend(backend: cstring, argv: *cstring): integer
+  c_execv(backend, argv)
+  local error_code = errno
+  if error_code == ENOENT then
+    io.stderr:write('theseus: OpenRC backend unavailable at ', tostring(backend), '\n')
+    return 69
+  end
+  io.stderr:write('theseus: cannot execute ', tostring(backend), ', errno ', tostring(error_code), '\n')
+  return 71
+end
+
 local function openrc_command(service: string, action: string): integer
   if not valid_name(service) then
     io.stderr:write('theseus: invalid OpenRC service name\n')
@@ -24,17 +35,33 @@ local function openrc_command(service: string, action: string): integer
   end
   local backend: cstring = '/sbin/rc-service'
   local argv: [5]cstring = {backend, '--', (@cstring)(service), (@cstring)(action), nilptr}
-  c_execv(backend, &argv[0])
-  if errno == ENOENT then
-    io.stderr:write('theseus: OpenRC backend unavailable at /sbin/rc-service\n')
-    return 69
+  return exec_backend(backend, &argv[0])
+end
+
+local function openrc_runlevel(name: string): integer
+  if not valid_name(name) then
+    io.stderr:write('theseus: invalid OpenRC runlevel name\n')
+    return 64
   end
-  io.stderr:write('theseus: cannot execute OpenRC backend, errno ', tostring(errno), '\n')
-  return 71
+  if name == 'sysinit' or name == 'boot' or name == 'single' or
+     name == 'reboot' or name == 'shutdown' then
+    io.stderr:write('theseus: OpenRC boot and shutdown levels require the system init\n')
+    return 64
+  end
+  local backend: cstring = '/sbin/openrc'
+  local argv: [4]cstring = {backend, '--', (@cstring)(name), nilptr}
+  return exec_backend(backend, &argv[0])
+end
+
+local function current_openrc_runlevel(): integer
+  local backend: cstring = '/bin/rc-status'
+  local argv: [3]cstring = {backend, '--runlevel', nilptr}
+  return exec_backend(backend, &argv[0])
 end
 
 global function dispatch_openrc(read_only: boolean)
   if read_only then
+    if #arg == 1 and arg[1] == 'openrc-runlevel' then os.exit(current_openrc_runlevel()) end
     if #arg == 4 and arg[1] == 'status' and arg[2] == 'of' and arg[3] == 'openrc' then
       os.exit(openrc_command(arg[4], 'status'))
     end
@@ -44,5 +71,11 @@ global function dispatch_openrc(read_only: boolean)
       os.exit(64)
     end
     os.exit(openrc_command(arg[2], arg[3]))
+  elseif #arg > 0 and arg[1] == 'openrc-runlevel' then
+    if #arg ~= 2 then
+      io.stderr:write('usage: theseus openrc-runlevel RUNLEVEL\n')
+      os.exit(64)
+    end
+    os.exit(openrc_runlevel(arg[2]))
   end
 end

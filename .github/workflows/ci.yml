@@ -144,6 +144,15 @@ jobs:
             code=0
             "$path/the" openrc postgresql stop || code=$?
             test "$code" -eq 64
+            code=0
+            "$path/theseus" openrc-runlevel --help || code=$?
+            test "$code" -eq 64
+            code=0
+            "$path/theseus" openrc-runlevel shutdown || code=$?
+            test "$code" -eq 64
+            code=0
+            "$path/the" openrc-runlevel default || code=$?
+            test "$code" -eq 64
           done
 
       - name: Refuse a non-cgroup delegation before starting a service

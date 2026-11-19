@@ -13,6 +13,7 @@ the failed services
 the running services
 the status of SERVICE
 the status of openrc SERVICE
+the openrc-runlevel
 the state of SERVICE
 the restart-policy of SERVICE
 ```

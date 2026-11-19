@@ -622,9 +622,9 @@ local function execute_query(query: Query)
   end
   io.stderr:write('theseus: invalid query\n')
   if query_mode_is_the() then
-    io.stderr:write('usage: the status [of SERVICE] | the state of SERVICE | the services | the failed services | the status of openrc SERVICE\n')
+    io.stderr:write('usage: the status [of SERVICE] | the state of SERVICE | the services | the failed services | the status of openrc SERVICE | the openrc-runlevel\n')
   else
-    io.stderr:write('usage: theseus status [SERVICE] | theseus state SERVICE | theseus services | theseus run SERVICE [--stop-after-ms N] | theseus openrc SERVICE ACTION\n')
+    io.stderr:write('usage: theseus status [SERVICE] | theseus state SERVICE | theseus services | theseus run SERVICE [--stop-after-ms N] | theseus openrc SERVICE ACTION | theseus openrc-runlevel RUNLEVEL\n')
   end
   os.exit(64)
 end
