@@ -183,6 +183,15 @@ jobs:
           build/theseus-install "$work/releases" ../escape "$work/input" || code=$?
           test "$code" -eq 64
           test "$(ls -A "$work/releases")" = known
+          mkdir "$work/releases/reserved"
+          mv "$work/worker" "$work/input/theseusd.real"
+          rm "$work/input/theseusd"
+          mv "$work/input/theseusd.real" "$work/input/theseusd"
+          code=0
+          build/theseus-install "$work/releases" reserved "$work/input" || code=$?
+          test "$code" -eq 73
+          test -z "$(ls -A "$work/releases/reserved")"
+
 
       - name: Keep OpenRC arguments explicit and the status grammar read-only
         run: |

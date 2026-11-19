@@ -1,6 +1,7 @@
 ## cflags '-D_GNU_SOURCE'
 
 -- Explicitly selected Linux PID 1 entry point. The service supervisor is a child.
+require 'arg'
 require 'io'
 require 'os'
 require 'string'
@@ -199,6 +200,8 @@ local function select_bundle(): boolean
   if size <= 0 or size == #path then return false end
   local executable: string = {data = &path[0], size = (@usize)(size)}
   local prefix = TheseusReleaseRoot .. '/'
+  local selected = arg[0]
+  if string.sub(selected, 1, #prefix) == prefix and selected ~= executable then return false end
   if string.sub(executable, 1, #prefix) ~= prefix then return true end
   local matched, fields = string.match(string.sub(executable, #prefix + 1), '^([^/]+)/theseus%-init$')
   if not matched or not valid_theseus_release_id(fields[1]) then return false end

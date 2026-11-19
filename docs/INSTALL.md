@@ -36,7 +36,7 @@ that mounts the root must pass the selected executable to PID 1.
    On Alpine add theseus.openrc=1 for OpenRC. The init executable uses
    theseusd and graph.tsc from its own directory. The matching client
    and the symlink live there too. A release ID and its directory
-   must remain stable while an entry refers to them.
+   must remain stable while an entry refers to them. Select the\n   installed executable by its actual path.
 4. Trial the candidate using the boot menu or a boot-once mechanism.
    Keep the console open, verify the target and real application
    readiness, and test a normal reboot. Only then select the candidate
