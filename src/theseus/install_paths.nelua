@@ -1,0 +1,7 @@
+require 'string'
+
+global TheseusReleaseRoot <comptime> = '/opt/theseus/releases'
+
+global function valid_theseus_release_id(id: string): boolean
+  return #id <= 64 and string.find(id, '^[a-zA-Z0-9][a-zA-Z0-9._-]*$') == 1
+end

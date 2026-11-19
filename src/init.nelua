@@ -5,6 +5,7 @@ require 'io'
 require 'os'
 require 'string'
 require 'src.theseus.recovery'
+require 'src.theseus.install_paths'
 
 local Sigset: type <cimport 'sigset_t', nodecl, cinclude '<signal.h>'> = @record{}
 local Statfs: type <cimport 'struct statfs', nodecl, cinclude '<sys/statfs.h>'> = @record{f_type: clong}
@@ -17,6 +18,7 @@ local function c_execv(path: cstring, argv: *cstring): cint <cimport 'execv', no
 local function c_exit(status: cint): void <cimport '_exit', nodecl, cinclude '<unistd.h>'> end
 local function c_open(path: cstring, flags: cint): cint <cimport 'open', nodecl, cinclude '<fcntl.h>'> end
 local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
+local function c_readlink(path: cstring, data: pointer, size: csize): clong <cimport 'readlink', nodecl, cinclude '<unistd.h>'> end
 local function c_read(fd: cint, data: pointer, count: csize): clong <cimport 'read', nodecl, cinclude '<unistd.h>'> end
 local function c_write(fd: cint, data: pointer, count: csize): clong <cimport 'write', nodecl, cinclude '<unistd.h>'> end
 local function c_dup2(source: cint, dest: cint): cint <cimport 'dup2', nodecl, cinclude '<unistd.h>'> end
@@ -84,7 +86,8 @@ local Console: cstring = '/dev/console'
 local RuntimeDir = '/run/theseus-init'
 local SocketPath = RuntimeDir .. '/control.sock'
 local Delegation = '/sys/fs/cgroup/theseus-init'
-local Worker: cstring = '/sbin/theseusd'
+local worker_path = '/sbin/theseusd'
+local graph_path = '/etc/theseus/graph.tsc'
 local OpenRC: cstring = '/sbin/openrc'
 local Rescue: cstring = '/bin/sh'
 -- 32 services each get up to four seconds for probe, leader, and cgroup cleanup.
@@ -190,6 +193,22 @@ local function notification(fd: cint, timeout: cint): (boolean, Action)
   return true, Action.None
 end
 
+local function select_bundle(): boolean
+  local path: [4096]byte <noinit>
+  local size = c_readlink('/proc/self/exe', &path[0], #path)
+  if size <= 0 or size == #path then return false end
+  local executable: string = {data = &path[0], size = (@usize)(size)}
+  local prefix = TheseusReleaseRoot .. '/'
+  if string.sub(executable, 1, #prefix) ~= prefix then return true end
+  local matched, fields = string.match(string.sub(executable, #prefix + 1), '^([^/]+)/theseus%-init$')
+  if not matched or not valid_theseus_release_id(fields[1]) then return false end
+  local bundle = prefix .. fields[1]
+  worker_path = bundle .. '/theseusd'
+  graph_path = bundle .. '/graph.tsc'
+  report('release\t' .. fields[1])
+  return true
+end
+
 local function unblock_signals()
   local unblocked: Sigset
   if c_sigemptyset(&unblocked) ~= 0 or c_sigprocmask(SIG_SETMASK, &unblocked, nilptr) ~= 0 then c_exit(126) end
@@ -211,12 +230,13 @@ local function launch(rescue: boolean): cint
     local argv: [3]cstring = {Rescue, '-i', nilptr}
     c_execv(Rescue, &argv[0])
   else
-    if c_setenv('THESEUS_GRAPH', '/etc/theseus/graph.tsc', 1) ~= 0 or
+    if c_setenv('THESEUS_GRAPH', (@cstring)(graph_path), 1) ~= 0 or
        c_setenv('THESEUS_CGROUP_ROOT', (@cstring)(Delegation), 1) ~= 0 or
        c_setenv('THESEUS_RECOVERY_DIR', (@cstring)(RuntimeDir), 1) ~= 0 or
        c_setenv('THESEUS_SOCKET', (@cstring)(SocketPath), 1) ~= 0 then c_exit(126) end
-    local argv: [4]cstring = {Worker, '--target', 'default', nilptr}
-    c_execv(Worker, &argv[0])
+    local worker = (@cstring)(worker_path)
+    local argv: [4]cstring = {worker, '--target', 'default', nilptr}
+    c_execv(worker, &argv[0])
   end
   c_exit(127)
   return -1
@@ -387,6 +407,8 @@ local function run()
     reason = 'missing-opt-in'
   elseif preferred_rescue then
     reason = 'requested'
+  elseif not select_bundle() then
+    reason = 'release-path'
   elseif not provision_run() then
     reason = 'boot-filesystems'
   else

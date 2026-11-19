@@ -1,0 +1,136 @@
+## cflags '-D_GNU_SOURCE'
+
+-- Publish one complete boot bundle without changing any boot selection.
+require 'arg'
+require 'io'
+require 'os'
+require 'src.theseus.graph'
+require 'src.theseus.install_paths'
+
+local Stat: type <cimport 'struct stat', nodecl, cinclude '<sys/stat.h>'> = @record{st_mode: cuint}
+local function c_open(path: cstring, flags: cint): cint <cimport 'open', nodecl, cinclude '<fcntl.h>'> end
+local function c_openat(dir: cint, path: cstring, flags: cint, mode: cuint): cint <cimport 'openat', nodecl, cinclude '<fcntl.h>'> end
+local function c_mkdirat(dir: cint, path: cstring, mode: cuint): cint <cimport 'mkdirat', nodecl, cinclude '<sys/stat.h>'> end
+local function c_unlinkat(dir: cint, path: cstring, flags: cint): cint <cimport 'unlinkat', nodecl, cinclude '<unistd.h>'> end
+local function c_symlinkat(value: cstring, dir: cint, name: cstring): cint <cimport 'symlinkat', nodecl, cinclude '<unistd.h>'> end
+local function c_fstat(fd: cint, info: *Stat): cint <cimport 'fstat', nodecl, cinclude '<sys/stat.h>'> end
+local function c_fsync(fd: cint): cint <cimport 'fsync', nodecl, cinclude '<unistd.h>'> end
+local function c_fchmod(fd: cint, mode: cuint): cint <cimport 'fchmod', nodecl, cinclude '<sys/stat.h>'> end
+local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
+local function c_read(fd: cint, data: pointer, size: csize): clong <cimport 'read', nodecl, cinclude '<unistd.h>'> end
+local function c_write(fd: cint, data: pointer, size: csize): clong <cimport 'write', nodecl, cinclude '<unistd.h>'> end
+local function c_getpid(): cint <cimport 'getpid', nodecl, cinclude '<unistd.h>'> end
+local function c_rename(number: clong, from: cint, oldname: cstring, to: cint, newname: cstring, flags: cuint): clong <cimport 'syscall', nodecl, cinclude '<unistd.h>'> end
+local SYS_renameat2: clong <cimport, nodecl, cinclude '<sys/syscall.h>'>
+local RENAME_NOREPLACE: cuint <cimport, nodecl, cinclude '<linux/fs.h>'>
+local O_RDONLY: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_WRONLY: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_CREAT: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_EXCL: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_DIRECTORY: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_NOFOLLOW: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_CLOEXEC: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_NONBLOCK: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local AT_REMOVEDIR: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local S_IFMT: cuint <cimport, nodecl, cinclude '<sys/stat.h>'>
+local S_IFREG: cuint <cimport, nodecl, cinclude '<sys/stat.h>'>
+local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EEXIST: cint <cimport, nodecl, cinclude '<errno.h>'>
+local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
+
+local Files: [4]cstring = {'theseus-init', 'theseusd', 'theseus', 'graph.tsc'}
+local DirFlags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+
+local function fail(code: integer, message: string): integer
+  io.stderr:write('theseus-install: ', message, '\n')
+  return code
+end
+
+local function copy_file(source: cint, destination: cint, name: cstring, mode: cuint): boolean
+  local input = c_openat(source, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0)
+  if input < 0 then return false end
+  defer c_close(input) end
+  local info: Stat <noinit>
+  if c_fstat(input, &info) ~= 0 or (info.st_mode & S_IFMT) ~= S_IFREG then return false end
+  local output = c_openat(destination, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0x180)
+  if output < 0 then return false end
+  defer c_close(output) end
+  local buffer: [32768]byte <noinit>
+  local nonempty = false
+  while true do
+    local count = c_read(input, &buffer[0], #buffer)
+    if count < 0 and errno == EINTR then continue end
+    if count < 0 then return false end
+    if count == 0 then break end
+    nonempty = true
+    local offset: isize = 0
+    while offset < count do
+      local written = c_write(output, &buffer[offset], (@csize)(count - offset))
+      if written < 0 and errno == EINTR then continue end
+      if written <= 0 then return false end
+      offset = offset + written
+    end
+  end
+  return nonempty and c_fchmod(output, mode) == 0 and c_fsync(output) == 0
+end
+
+local function valid_graph(stage: cint): boolean
+  local path = '/proc/self/fd/' .. tostring(stage) .. '/graph.tsc'
+  local graph: NativeGraph
+  local plan: NativePlan
+  return load_native_graph(path, &graph) and plan_native_target(&graph, 'default', &plan) == 0
+end
+
+local function install(root: cint, source: cint, release: string): integer
+  local temporary = (@cstring)('.' .. release .. '.' .. tostring(c_getpid()))
+  if c_mkdirat(root, temporary, 0x1c0) ~= 0 then return fail(73, 'cannot create staging directory') end
+  local stage = c_openat(root, temporary, DirFlags, 0)
+  local published = false
+  defer
+    if stage >= 0 then
+      if not published then
+        c_fchmod(stage, 0x1c0)
+        for i = 0, 3 do c_unlinkat(stage, Files[i], 0) end
+        c_unlinkat(stage, 'the', 0)
+      end
+      c_close(stage)
+    end
+    if not published then c_unlinkat(root, temporary, AT_REMOVEDIR) end
+  end
+  if stage < 0 then return fail(73, 'cannot open staging directory') end
+  for i = 0, 3 do
+    local mode: cuint = 0x16d -- 0555
+    if i == 3 then mode = 0x124 end -- 0444
+    if not copy_file(source, stage, Files[i], mode) then
+      return fail(74, 'cannot stage ' .. tostring(Files[i]))
+    end
+  end
+  if not valid_graph(stage) then return fail(65, 'invalid compiled default target') end
+  if c_symlinkat('theseus', stage, 'the') ~= 0 or c_fchmod(stage, 0x16d) ~= 0 or c_fsync(stage) ~= 0 then
+    return fail(74, 'cannot finalize the staged bundle')
+  end
+  if c_rename(SYS_renameat2, root, temporary, root, (@cstring)(release), RENAME_NOREPLACE) ~= 0 then
+    if errno == EEXIST then return fail(73, 'release already exists') end
+    return fail(74, 'cannot publish the staged bundle')
+  end
+  published = true
+  if c_fsync(root) ~= 0 then return fail(74, 'release was published but directory sync failed') end
+  print('installed', release)
+  return 0
+end
+
+local function main(): integer
+  if #arg ~= 3 or not valid_theseus_release_id(arg[2]) or
+     string.byte(arg[1], 1) ~= 47 or string.byte(arg[3], 1) ~= 47 then
+    return fail(64, 'usage: theseus-install ABSOLUTE_RELEASE_ROOT RELEASE_ID ABSOLUTE_BUNDLE_DIR')
+  end
+  local root = c_open((@cstring)(arg[1]), DirFlags)
+  if root < 0 then return fail(73, 'cannot open release root') end
+  defer c_close(root) end
+  local source = c_open((@cstring)(arg[3]), DirFlags)
+  if source < 0 then return fail(66, 'cannot open bundle directory') end
+  defer c_close(source) end
+  return install(root, source, arg[2])
+end
+
+os.exit(main())

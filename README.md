@@ -67,7 +67,7 @@ supervisor.
 The [native PID 1 entry point](docs/PID1.md) is available for isolated
 Linux VM qualification. It supervises the native daemon and enters
 console rescue on boot failure. An additional boot option runs the
-installed OpenRC boot and shutdown runlevels.
+installed OpenRC boot and shutdown runlevels.\n[Versioned installation and rollback](docs/INSTALL.md) covers trial boots.
 
 ## Early boot in nebox
 

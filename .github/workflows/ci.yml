@@ -152,6 +152,38 @@ jobs:
           test "$rc" -eq 64
           grep -Fx 'theseus-init requires Linux PID 1' build/pid1-userspace.log
 
+      - name: Publish complete versioned bundles without replacing an installed release
+        run: |
+          set -eux
+          /tmp/nelua-lang/nelua --compile-binary --release -o build/theseus-install src/install.nelua
+          work="$(mktemp -d "$RUNNER_TEMP/release.XXXXXXXX")"
+          mkdir "$work/releases" "$work/input"
+          cp build/theseus-init build/live/theseusd build/live/theseus "$work/input/"
+          cp build/pid1-graph.tsc "$work/input/graph.tsc"
+          build/theseus-install "$work/releases" known "$work/input"
+          cmp "$work/input/theseus-init" "$work/releases/known/theseus-init"
+          cmp "$work/input/graph.tsc" "$work/releases/known/graph.tsc"
+          test "$(readlink "$work/releases/known/the")" = theseus
+          code=0
+          build/theseus-install "$work/releases" known "$work/input" || code=$?
+          test "$code" -eq 73
+          cp "$work/input/graph.tsc" "$work/original.tsc"
+          printf 'malformed\n' >"$work/input/graph.tsc"
+          code=0
+          build/theseus-install "$work/releases" broken "$work/input" || code=$?
+          test "$code" -eq 65
+          cmp "$work/original.tsc" "$work/releases/known/graph.tsc"
+          cp "$work/original.tsc" "$work/input/graph.tsc"
+          mv "$work/input/theseusd" "$work/worker"
+          ln -s "$work/worker" "$work/input/theseusd"
+          code=0
+          build/theseus-install "$work/releases" unsafe "$work/input" || code=$?
+          test "$code" -eq 74
+          code=0
+          build/theseus-install "$work/releases" ../escape "$work/input" || code=$?
+          test "$code" -eq 64
+          test "$(ls -A "$work/releases")" = known
+
       - name: Keep OpenRC arguments explicit and the status grammar read-only
         run: |
           set -eux
