@@ -59,10 +59,11 @@ local function write_all(fd: cint, text: string): boolean
 end
 
 local function read_line(fd: cint): (boolean, string)
-  local buffer: [512]cchar
+  -- A snapshot can carry all 32 services with 63-byte names.
+  local buffer: [4096]cchar
   local used: integer = 0
-  while used < 511 do
-    local got = c_read(fd, &buffer[used], (@csize)(511 - used))
+  while used < #buffer do
+    local got = c_read(fd, &buffer[used], (@csize)(#buffer - used))
     if got <= 0 then return false, '' end
     local end_at = used + got
     for i: integer = used, end_at - 1 do
@@ -155,6 +156,36 @@ local function query_status(name: string, state_only: boolean): integer
   return show_status(response, state_only)
 end
 
+local function print_services(response: string, filter: string): boolean
+  local magic, kind, name, state: string
+  local cursor: isize = 1
+  magic, cursor = next_field(response, cursor)
+  if magic ~= 'TR1' or cursor == 0 then return false end
+  kind, cursor = next_field(response, cursor)
+  if kind ~= 'SERVICES' then return false end
+  while cursor ~= 0 do
+    name, cursor = next_field(response, cursor)
+    if #name == 0 or cursor == 0 then return false end
+    state, cursor = next_field(response, cursor)
+    if #state == 0 then return false end
+    if #filter == 0 or filter == state then print(name, state) end
+  end
+  return true
+end
+
+local function query_services(filter: string): integer
+  local ok, response = exchange('TQ1\tSERVICES\n')
+  if not ok then
+    io.stderr:write('theseus: supervisor socket unavailable\n')
+    return 69
+  end
+  if not print_services(response, filter) then
+    io.stderr:write('theseus: malformed services response\n')
+    return 65
+  end
+  return 0
+end
+
 local function shutdown(): integer
   local ok: boolean
   local response: string
@@ -173,18 +204,24 @@ end
 
 dispatch_openrc(is_the())
 if is_the() then
+  if #arg == 1 and arg[1] == 'services' then os.exit(query_services('')) end
+  if #arg == 2 and arg[2] == 'services' then
+    if arg[1] == 'failed' then os.exit(query_services('FAILED')) end
+    if arg[1] == 'running' then os.exit(query_services('RUNNING')) end
+  end
   if #arg == 3 and arg[2] == 'of' and arg[1] == 'status' then
     os.exit(query_status(arg[3], false))
   end
   if #arg == 3 and arg[2] == 'of' and arg[1] == 'state' then
     os.exit(query_status(arg[3], true))
   end
-  io.stderr:write('usage: the status of SERVICE | the state of SERVICE | the status of openrc SERVICE | the openrc-runlevel\n')
+  io.stderr:write('usage: the [failed | running] services | the status of SERVICE | the state of SERVICE | the status of openrc SERVICE | the openrc-runlevel\n')
   os.exit(64)
 end
 
 if #arg == 2 and arg[1] == 'status' then os.exit(query_status(arg[2], false)) end
 if #arg == 2 and arg[1] == 'state' then os.exit(query_status(arg[2], true)) end
+if #arg == 1 and arg[1] == 'services' then os.exit(query_services('')) end
 if #arg == 1 and arg[1] == 'daemon-stop' then os.exit(shutdown()) end
-io.stderr:write('usage: theseus status SERVICE | theseus state SERVICE | theseus daemon-stop | theseus openrc SERVICE ACTION | theseus openrc-runlevel RUNLEVEL\n')
+io.stderr:write('usage: theseus services | theseus status SERVICE | theseus state SERVICE | theseus daemon-stop | theseus openrc SERVICE ACTION | theseus openrc-runlevel RUNLEVEL\n')
 os.exit(64)

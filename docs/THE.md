@@ -4,7 +4,28 @@
 
 The grammar is intentionally tiny and deterministic. It is not natural-language interpretation.
 
-Current bootstrap forms:
+The installed live client queries the running supervisor. Set
+`THESEUS_SOCKET` to its control socket. Under Theseus PID 1,
+the socket is `/run/theseus-init/control.sock`.
+
+```text
+the services
+the failed services
+the running services
+the status of SERVICE
+the state of SERVICE
+the status of openrc SERVICE
+the openrc-runlevel
+```
+
+The service lists show a snapshot in target plan order with one
+tab-separated service name and state per line. A filter with zero
+matches succeeds with empty output. Use `theseus services` for the
+same full snapshot. OpenRC queries are separate from native service
+lists.
+
+The bootstrap client can inspect compiled configuration and offers
+these forms:
 
 ```text
 the status
@@ -18,7 +39,7 @@ the state of SERVICE
 the restart-policy of SERVICE
 ```
 
-Mutation stays explicit under `theseus`:
+The bootstrap client also accepts these query forms:
 
 ```text
 theseus status SERVICE

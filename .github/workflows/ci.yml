@@ -480,6 +480,10 @@ jobs:
           daemon_pid=$!
           wait_state gate STARTING
           test "$(timeout 2s build/live/the state of app)" = PLANNED
+          printf 'gate\tSTARTING\noptional\tPLANNED\nskipped\tPLANNED\napp\tPLANNED\n' >"$job_dir/list.expected"
+          timeout 2s build/live/the services | cmp "$job_dir/list.expected" -
+          timeout 2s build/live/the failed services >"$job_dir/list.failed"
+          test ! -s "$job_dir/list.failed"
           touch "$job_dir/release"
           for i in $(seq 1 150); do
             if grep -Fq 'probe-failed' build/live/target-demo.log; then break; fi
@@ -492,6 +496,12 @@ jobs:
           touch "$job_dir/probe-release"
           wait_state app RUNNING
           test "$(timeout 2s build/live/the state of skipped)" = FAILED
+          printf 'gate\tRUNNING\noptional\tFAILED\nskipped\tFAILED\napp\tRUNNING\n' >"$job_dir/list.expected"
+          timeout 2s build/live/theseus services | cmp "$job_dir/list.expected" -
+          timeout 2s build/live/the running services >"$job_dir/list.running"
+          printf 'gate\tRUNNING\napp\tRUNNING\n' | cmp "$job_dir/list.running" -
+          timeout 2s build/live/the failed services >"$job_dir/list.failed"
+          printf 'optional\tFAILED\nskipped\tFAILED\n' | cmp "$job_dir/list.failed" -
           timeout 8s build/live/theseus daemon-stop
           wait "$daemon_pid"
           daemon_pid=
@@ -542,6 +552,26 @@ jobs:
           test "$rc" -eq 67
           test ! -e "$THESEUS_SOCKET"
           ! grep -F 'daemon-spawn' build/live/target-invalid.log
+
+          export THESEUS_GRAPH="$job_dir/full-target.tsc"
+          names=
+          : >"$THESEUS_GRAPH"
+          : >"$job_dir/full-list.expected"
+          for i in $(seq 1 32); do
+            name="$(printf 'service-%055d' "$i")"
+            printf 'TSC3\t%s\t/bin/sleep\03730\tnever\t0\tnone\t\t\t\t\n' "$name" >>"$THESEUS_GRAPH"
+            printf '%s\tRUNNING\n' "$name" >>"$job_dir/full-list.expected"
+            names="${names:+$names,}$name"
+          done
+          printf 'TGT1\tfull\t%s\n' "$names" >>"$THESEUS_GRAPH"
+          build/live/theseusd --target full >build/live/target-full.log 2>&1 &
+          daemon_pid=$!
+          wait_state "$name" RUNNING
+          timeout 2s build/live/the services | cmp "$job_dir/full-list.expected" -
+          timeout 8s build/live/theseus daemon-stop
+          wait "$daemon_pid"
+          daemon_pid=
+          check_reaped build/live/target-full.log
           trap - EXIT
 
       - name: Cancel and reap hung application readiness probes

@@ -8,6 +8,7 @@ require 'io'
 require 'math'
 require 'os'
 require 'string'
+require 'stringbuilder'
 require 'src.theseus.readiness'
 require 'src.theseus.graph'
 require 'src.theseus.cgroup'
@@ -826,7 +827,23 @@ local function advance_target(group: *Supervision, child_mask: *Sigset): integer
   return 0
 end
 
-local function reply_status(client: cint, request: string, group: *Supervision)
+local function reply_services(client: cint, group: *Supervision)
+  local response: stringbuilder
+  defer response:destroy() end
+  if not response:write('TR1\tSERVICES') then return end
+  for i: integer = 0, group.count - 1 do
+    local runtime = &group.runtimes[i]
+    if not response:write('\t', runtime.service.name, '\t', state_name(runtime.state)) then return end
+  end
+  if not response:write('\n') then return end
+  write_all(client, response:view())
+end
+
+local function reply_query(client: cint, request: string, group: *Supervision)
+  if request == 'TQ1\tSERVICES\n' then
+    reply_services(client, group)
+    return
+  end
   for i: integer = 0, group.count - 1 do
     local runtime = &group.runtimes[i]
     if request == runtime.status_request then
@@ -979,7 +996,7 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
           break
         end
         if state == RequestState.Complete then
-          reply_status(event.fd, request, group)
+          reply_query(event.fd, request, group)
         elseif state ~= RequestState.Closed then
           write_all(event.fd, 'TR1\tERROR\trequest\n')
         end

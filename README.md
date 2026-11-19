@@ -18,8 +18,8 @@ Theseus is intended to be boring under stress: small, explicit, inspectable, det
 The command surfaces are deliberately split:
 
 ```text
-theseus restart postgresql   # explicit mutation
-the status of postgresql     # observation
+theseus openrc postgresql restart   # explicit mutation
+the status of openrc postgresql     # observation
 ```
 
 `the` is the short read/query interface to the exact same typed state used by `theseus`.
@@ -67,7 +67,8 @@ supervisor.
 The [native PID 1 entry point](docs/PID1.md) is available for isolated
 Linux VM qualification. It supervises the native daemon and enters
 console rescue on boot failure. An additional boot option runs the
-installed OpenRC boot and shutdown runlevels.\n[Verified Linux bundles and versioned installation](docs/INSTALL.md) cover download, trial boots, and rollback.
+installed OpenRC boot and shutdown runlevels.
+[Verified Linux bundles and versioned installation](docs/INSTALL.md) cover download, trial boots, and rollback.
 
 ## Early boot in nebox
 
