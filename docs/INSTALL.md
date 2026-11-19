@@ -17,7 +17,7 @@ repo=Spaceghost/theseus-init
 commit=REVIEWED_FULL_COMMIT_SHA
 name="theseus-init-linux-x86_64-$commit"
 run=$(gh run list --repo "$repo" --workflow release-bundle.yml \
-  --commit "$commit" --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+  --branch main --commit "$commit" --status success --limit 1 --json databaseId --jq '.[0].databaseId')
 gh run download "$run" --repo "$repo" --name "$name"
 gh attestation verify "$name.tar.gz" --repo "$repo" \
   --signer-workflow "$repo/.github/workflows/release-bundle.yml" \
