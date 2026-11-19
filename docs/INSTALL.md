@@ -5,6 +5,39 @@ can select it. Use a bootloader that can select a specific
 init executable in the installed root. A kernel or initramfs
 that mounts the root must pass the selected executable to PID 1.
 
+## Obtain a verified Linux bundle
+
+For x86-64 Linux, use a successful release-bundle workflow run
+for the exact commit you intend to boot. The archive contains
+the static executables, the build input versions, and this guide.
+Site configuration supplies the compiled graph.
+
+~~~sh
+repo=Spaceghost/theseus-init
+commit=REVIEWED_FULL_COMMIT_SHA
+name="theseus-init-linux-x86_64-$commit"
+run=$(gh run list --repo "$repo" --workflow release-bundle.yml \
+  --commit "$commit" --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+gh run download "$run" --repo "$repo" --name "$name"
+gh attestation verify "$name.tar.gz" --repo "$repo" \
+  --signer-workflow "$repo/.github/workflows/release-bundle.yml" \
+  --source-ref refs/heads/main --source-digest "$commit"
+~~~
+
+After verification succeeds, extract the archive and add your
+compiled graph.tsc beside its executables. The workflow artifacts
+are available for 30 days. A fresh workflow run on main can
+rebuild its current commit.
+
+~~~sh
+tar -xzf "$name.tar.gz"
+cp /absolute/path/to/graph.tsc theseus-init/
+install -d -m 0755 /opt/theseus/releases
+./theseus-init/theseus-install /opt/theseus/releases "$commit" "$PWD/theseus-init"
+~~~
+
+## Build from source
+
 1. Build src/install.nelua as theseus-install. Build src/init.nelua,
    src/supervisor.nelua, and src/live_client.nelua as theseus-init,
    theseusd, and theseus. Put the latter three and the compiled

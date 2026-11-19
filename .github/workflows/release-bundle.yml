@@ -1,0 +1,109 @@
+name: release-bundle
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  alpine-x86-64:
+    if: github.repository == 'Spaceghost/theseus-init' && github.ref == 'refs/heads/main'
+    runs-on: incus-spaceghost-theseus-init
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      NELUA_COMMIT: 9ccf28de898a5e1615f1b04f5f28b3447aea0fb8
+      ZIG_VERSION: 0.15.2
+      ZIG_SHA256: 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Build and compare static Linux release bundles
+        id: bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C TZ=UTC
+          work="$(mktemp -d "$RUNNER_TEMP/theseus-bundle.XXXXXXXX")"
+          mkdir "$work/tmp" "$work/replay"
+          export TMPDIR="$work/tmp" TMP="$work/tmp" TEMP="$work/tmp"
+          export ZIG_GLOBAL_CACHE_DIR="$work/zig-global"
+
+          git init "$work/nelua"
+          git -C "$work/nelua" fetch --depth 1 https://github.com/edubart/nelua-lang.git "$NELUA_COMMIT"
+          git -C "$work/nelua" checkout --detach FETCH_HEAD
+          test "$(git -C "$work/nelua" rev-parse HEAD)" = "$NELUA_COMMIT"
+          make -C "$work/nelua" -j2
+          curl --fail --silent --show-error --location --retry 2 \
+            "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" \
+            -o "$work/zig.tar.xz"
+          printf '%s  %s\n' "$ZIG_SHA256" "$work/zig.tar.xz" | sha256sum --check
+          tar -xJf "$work/zig.tar.xz" -C "$work"
+          zig="$work/zig-x86_64-linux-$ZIG_VERSION/zig"
+          test "$("$zig" version)" = "$ZIG_VERSION"
+
+          assemble() (
+            source=$1
+            build=$2
+            mkdir -p "$build/theseus-init"
+            export ZIG_LOCAL_CACHE_DIR="$build/zig-local"
+            cd "$source"
+            for file in init supervisor live_client install; do
+              case "$file" in
+                init) name=theseus-init ;;
+                supervisor) name=theseusd ;;
+                live_client) name=theseus ;;
+                install) name=theseus-install ;;
+              esac
+              binary="$build/theseus-init/$name"
+              "$work/nelua/nelua" --cache-dir "$build/nelua" \
+                --cc "$zig cc -target x86_64-linux-musl" --cflags="-static -g0 -Wl,--build-id=none" \
+                --compile-binary --release -o "$binary" "src/$file.nelua"
+              chmod 0555 "$binary"
+              if readelf -Wl "$binary" | grep -E '^[[:space:]]+INTERP[[:space:]]'; then
+                echo "unexpected ELF interpreter in $name" >&2
+                exit 1
+              fi
+            done
+            test -f LICENSE
+            install -m 0444 LICENSE docs/INSTALL.md "$build/theseus-init/"
+            printf 'source=%s\nnelua=%s\nzig=%s\nzig_sha256=%s\ntarget=x86_64-linux-musl\n' \
+              "$GITHUB_SHA" "$NELUA_COMMIT" "$ZIG_VERSION" "$ZIG_SHA256" >"$build/theseus-init/BUILD-INFO"
+            chmod 0444 "$build/theseus-init/BUILD-INFO"
+            chmod 0755 "$build/theseus-init"
+            tar --format=ustar --sort=name --mtime=@0 --numeric-owner --owner=0 --group=0 \
+              -C "$build" -cf - theseus-init | gzip -n -9 >"$build/bundle.tar.gz"
+          )
+
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git archive "$GITHUB_SHA" | tar -xf - -C "$work/replay"
+          assemble "$PWD" "$work/first"
+          assemble "$work/replay" "$work/second"
+          cmp "$work/first/bundle.tar.gz" "$work/second/bundle.tar.gz"
+          destination="$work/theseus-init-linux-x86_64-$GITHUB_SHA.tar.gz"
+          mv "$work/first/bundle.tar.gz" "$destination"
+          sha256sum "$destination"
+          printf 'archive=%s\n' "$destination" >>"$GITHUB_OUTPUT"
+
+      - name: Attest the reproducible archive
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: '${{ steps.bundle.outputs.archive }}'
+
+      - name: Upload the verified release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: 'theseus-init-linux-x86_64-${{ github.sha }}'
+          path: '${{ steps.bundle.outputs.archive }}'
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
