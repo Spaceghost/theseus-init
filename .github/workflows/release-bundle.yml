@@ -76,6 +76,10 @@ jobs:
             done
             test -f LICENSE
             install -m 0444 LICENSE docs/INSTALL.md "$build/theseus-init/"
+            mkdir -m 0755 "$build/theseus-init/notices"
+            install -m 0444 "$work/nelua/LICENSE" "$build/theseus-init/notices/nelua.txt"
+            install -m 0444 "$(dirname "$zig")/LICENSE" "$build/theseus-init/notices/zig.txt"
+            install -m 0444 "$(dirname "$zig")/lib/libc/musl/COPYRIGHT" "$build/theseus-init/notices/musl.txt"
             printf 'source=%s\nnelua=%s\nzig=%s\nzig_sha256=%s\ntarget=x86_64-linux-musl\n' \
               "$GITHUB_SHA" "$NELUA_COMMIT" "$ZIG_VERSION" "$ZIG_SHA256" >"$build/theseus-init/BUILD-INFO"
             chmod 0444 "$build/theseus-init/BUILD-INFO"

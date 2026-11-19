@@ -9,7 +9,7 @@ that mounts the root must pass the selected executable to PID 1.
 
 For x86-64 Linux, use a successful release-bundle workflow run
 for the exact commit you intend to boot. The archive contains
-the static executables, the build input versions, and this guide.
+the static executables, build input versions, runtime license notices,\nand this guide.
 Site configuration supplies the compiled graph.
 
 ~~~sh
@@ -59,7 +59,9 @@ install -d -m 0755 /opt/theseus/releases
    and directory sync. Run the installer on trusted local filesystems
    from verified build inputs. Use a new ID to stage a corrected bundle.
 3. Add a boot entry selecting that release and keep your previous
-   verified entry as the default. For Linux bootloaders with a root
+   verified entry as the default. In GRUB give the menu entry an ID
+   beginning with a letter, such as theseus-candidate. For a Linux
+   bootloader with a root
    mount or a cooperating initramfs, use this command-line fragment.
 
    ~~~text
