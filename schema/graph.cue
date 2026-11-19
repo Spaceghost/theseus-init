@@ -7,14 +7,18 @@ import "strings"
 #GraphService: {
   service: #Service
   let listSeparator = ","
-  let argvSeparator = "\u001f"
-  let serviceFields = "\(service.name)\t\(strings.Join(service.exec, argvSeparator))\t\(service.restart)\t\(service.maxRestarts)\t\(service.readiness.kind)"
+  let configuration = service
+  _runtime: #CompiledService & {service: configuration}
   let graphFields = "\(strings.Join(service.requires, listSeparator))\t\(strings.Join(service.wants, listSeparator))\t\(strings.Join(service.after, listSeparator))\t\(strings.Join(service.before, listSeparator))"
-  if service.readiness.kind == "unix-socket" {
-    compiled: "TSC5\t\(serviceFields)\t\(service.readiness.path)\t\(service.readiness.timeoutMs)\t\(graphFields)"
+  let magic = strings.SplitN(_runtime.compiled, "\t", 2)[0]
+  if magic == "TSC2" {
+    compiled: "\(strings.Replace(_runtime.compiled, "TSC2", "TSC3", 1))\t\(graphFields)"
   }
-  if service.readiness.kind != "unix-socket" {
-    compiled: "TSC3\t\(serviceFields)\t\(graphFields)"
+  if magic == "TSC4" {
+    compiled: "\(strings.Replace(_runtime.compiled, "TSC4", "TSC5", 1))\t\(graphFields)"
+  }
+  if magic == "TSC6" {
+    compiled: "\(strings.Replace(_runtime.compiled, "TSC6", "TSC7", 1))\t\(graphFields)"
   }
 }
 

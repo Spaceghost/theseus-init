@@ -27,7 +27,7 @@ jobs:
           mkdir -p build
           cue export ./services/postgresql.cue -e compiled --out text > build/services.tsc
           cue export ./tests/services.cue -e compiled --out text >> build/services.tsc
-          test "$(head -n1 build/services.tsc | cut -f1)" = TSC4
+          test "$(head -n1 build/services.tsc | cut -f1)" = TSC6
           test "$(tail -n+2 build/services.tsc | cut -f1 | sort -u)" = TSC2
           test "$(wc -l < build/services.tsc)" -eq 5
 
@@ -58,6 +58,7 @@ jobs:
           build/theseus status postgresql | tee build/status.txt
           grep -F 'PLANNED' build/status.txt
           grep -F 'unix-socket' build/status.txt
+          grep -F /usr/bin/pg_isready build/status.txt
           build/the status of postgresql | grep -F 'PLANNED'
           test "$(build/the state of postgresql)" = PLANNED
           test "$(build/the restart-policy of postgresql)" = on-failure
@@ -333,6 +334,7 @@ jobs:
           grep -Fx "$(printf 'TE1\treadiness\tsocket-timeout\t2\ttimeout')" build/live/ready-timeout.log
           ! grep -E '[[:space:]]ready$' build/live/ready-timeout.log
           kill -0 "$foreign_pid"
+          test ! -e "$job_dir/foreign-probe.pid"
           stop_daemon
 
           build/live/theseusd socket-early-exit >build/live/early-exit.log 2>&1 &
@@ -387,6 +389,15 @@ jobs:
           wait_state gate STARTING
           test "$(timeout 2s build/live/the state of app)" = PLANNED
           touch "$job_dir/release"
+          for i in $(seq 1 150); do
+            if grep -Fq 'probe-failed' build/live/target-demo.log; then break; fi
+            sleep 0.02
+          done
+          grep -F 'probe-failed' build/live/target-demo.log
+          test -S "$job_dir/gate.sock"
+          test "$(timeout 2s build/live/the state of gate)" = STARTING
+          test "$(timeout 2s build/live/the state of app)" = PLANNED
+          touch "$job_dir/probe-release"
           wait_state app RUNNING
           test "$(timeout 2s build/live/the state of skipped)" = FAILED
           timeout 8s build/live/theseus daemon-stop
@@ -439,4 +450,31 @@ jobs:
           test "$rc" -eq 67
           test ! -e "$THESEUS_SOCKET"
           ! grep -F 'daemon-spawn' build/live/target-invalid.log
+          trap - EXIT
+
+      - name: Cancel and reap hung application readiness probes
+        run: |
+          set -eux
+          job_dir="$(mktemp -d "$RUNNER_TEMP/prb.XXXXXXXX")"
+          export THESEUS_SOCKET="$job_dir/control.sock"
+          export THESEUS_RECORDS="$job_dir/services.tsc"
+          cue export ./tests/socket_readiness.cue -e probeTimeoutRecord --out text \
+            -t "testDir=$job_dir" -t "testProgram=$PWD/build/live/control-test" > "$THESEUS_RECORDS"
+          build/live/theseusd probe-timeout >build/live/probe-timeout.log 2>&1 &
+          daemon_pid=$!
+          trap 'kill "$daemon_pid" 2>/dev/null || true; wait "$daemon_pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 150); do
+            if test -S "$THESEUS_SOCKET" &&
+               test "$(timeout 2s build/live/the state of probe-timeout)" = FAILED; then break; fi
+            sleep 0.02
+          done
+          test "$(timeout 2s build/live/the state of probe-timeout)" = FAILED
+          grep -F "$(printf 'TE1\treadiness\tprobe-timeout\t1\tprobe-timeout')" build/live/probe-timeout.log
+          grep -F "$(printf 'TE1\treadiness\tprobe-timeout\t1\ttimeout')" build/live/probe-timeout.log
+          test -z "$(cat "/proc/$daemon_pid/task/$daemon_pid/children")"
+          probe_pid="$(cat "$job_dir/slow-probe.pid")"
+          test "$probe_pid" -gt 0 && test ! -e "/proc/$probe_pid"
+          timeout 4s build/live/theseus daemon-stop
+          wait "$daemon_pid"
+          test ! -e "$THESEUS_SOCKET"
           trap - EXIT

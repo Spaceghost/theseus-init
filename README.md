@@ -55,8 +55,9 @@ Set `THESEUS_CGROUP_ROOT` to a delegated cgroup v2 directory to track
 and clean up each service's descendants. See
 [resource ownership](docs/ARCHITECTURE.md#resource-ownership).
 
-Application-level health checks and broader Alpine package qualification
-are still pending. The rescue entry point below is separate from the service
+Unix socket readiness can also require a successful application probe.
+The PostgreSQL example uses `pg_isready` to wait until the database
+accepts connections. Broader Alpine package qualification remains open. The rescue entry point below is separate from the service
 supervisor.
 
 ## Early boot in nebox

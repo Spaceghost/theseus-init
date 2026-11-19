@@ -69,12 +69,15 @@ local function parse_service(line: string): (boolean, GraphService)
   local cursor: isize = 1
   local field: string
   field, cursor = next_field(line, cursor)
-  if (field ~= 'TSC3' and field ~= 'TSC5') or cursor == 0 then return false, service end
+  if (field ~= 'TSC3' and field ~= 'TSC5' and field ~= 'TSC7') or cursor == 0 then return false, service end
   local runtime_magic = 'TSC2'
   local runtime_fields: integer = 4
   if field == 'TSC5' then
     runtime_magic = 'TSC4'
     runtime_fields = 6
+  elseif field == 'TSC7' then
+    runtime_magic = 'TSC6'
+    runtime_fields = 9
   end
 
   local payload_start = cursor
@@ -134,7 +137,7 @@ global function load_native_graph(path: string, graph: *NativeGraph): boolean
   for line in file:lines() do
     if #line > 0 then
       local prefix = string.sub(line, 1, 5)
-      if prefix == 'TSC3\t' or prefix == 'TSC5\t' then
+      if prefix == 'TSC3\t' or prefix == 'TSC5\t' or prefix == 'TSC7\t' then
         if graph.service_count >= NativeMaxServices then
           io.stderr:write('theseus-graph: service bound exceeded\n')
           file:close()

@@ -7,6 +7,7 @@ require 'arg'
 require 'io'
 require 'os'
 require 'string'
+require 'src.theseus.readiness'
 require 'src.theseus.openrc'
 
 -- Linux/POSIX boundary. These are declarations in maintained Nelua, not
@@ -70,8 +71,7 @@ local Service = @record{
   restart: RestartPolicy,
   max_restarts: integer,
   readiness: ReadinessKind,
-  readiness_path: string,
-  readiness_timeout: integer,
+  readiness_options: ReadinessOptions,
 }
 
 local Query = @record{
@@ -209,7 +209,7 @@ local function parse_service_record(line: string): (boolean, Service)
   local cursor: isize = 1
   local magic: string
   magic, cursor = next_field(line, cursor)
-  if (magic ~= 'TSC2' and magic ~= 'TSC4') or cursor == 0 then return false, service end
+  if (magic ~= 'TSC2' and magic ~= 'TSC4' and magic ~= 'TSC6') or cursor == 0 then return false, service end
 
   service.name, cursor = next_field(line, cursor)
   if #service.name == 0 or cursor == 0 then return false, service end
@@ -236,17 +236,12 @@ local function parse_service_record(line: string): (boolean, Service)
   local readiness_ok: boolean
   readiness_ok, service.readiness = parse_readiness(readiness)
   if not readiness_ok then return false, service end
-  if magic == 'TSC4' then
-    if service.readiness ~= ReadinessKind.UnixSocket or cursor == 0 then return false, service end
-    service.readiness_path, cursor = next_field(line, cursor)
-    if cursor == 0 or #service.readiness_path == 0 or #service.readiness_path > 107 or
-       string.byte(service.readiness_path, 1) ~= 47 or string.find(service.readiness_path, '\0', 1, true) ~= 0 then return false, service end
-    local timeout: string
-    timeout, cursor = next_field(line, cursor)
-    readiness_ok, service.readiness_timeout = parse_bounded_decimal(timeout, 600000)
-    if not readiness_ok or service.readiness_timeout < 1 then return false, service end
+  if magic == 'TSC2' then
+    if cursor ~= 0 then return false, service end
+  elseif service.readiness ~= ReadinessKind.UnixSocket or
+         not parse_readiness_options(line, cursor, magic == 'TSC6', &service.readiness_options) then
+    return false, service
   end
-  if cursor ~= 0 then return false, service end
 
   service.state = ServiceState.Planned
   return true, service
@@ -572,10 +567,17 @@ local function show_service(service: Service)
   print('  max-restarts', service.max_restarts)
   print('  readiness   ', readiness_name(service.readiness))
   print('  argv-record ', service.argv_serialized)
-  if #service.readiness_path > 0 then
-    print('  readiness-path', service.readiness_path)
-    print('  readiness-timeout-ms', service.readiness_timeout)
-    print('  source       CUE -> TSC4')
+  if #service.readiness_options.path > 0 then
+    print('  readiness-path', service.readiness_options.path)
+    print('  readiness-timeout-ms', service.readiness_options.timeout)
+    if #service.readiness_options.probe > 0 then
+      print('  readiness-probe', service.readiness_options.probe)
+      print('  probe-interval-ms', service.readiness_options.interval)
+      print('  probe-timeout-ms', service.readiness_options.probe_timeout)
+      print('  source       CUE -> TSC6')
+    else
+      print('  source       CUE -> TSC4')
+    end
   else
     print('  source       CUE -> TSC2')
   end

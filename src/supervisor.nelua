@@ -8,10 +8,12 @@ require 'io'
 require 'math'
 require 'os'
 require 'string'
+require 'src.theseus.readiness'
 require 'src.theseus.graph'
 require 'src.theseus.cgroup'
 
 local function c_fork(): cint <cimport 'fork', nodecl, cinclude '<unistd.h>'> end
+local function c_execv(file: cstring, argv: *cstring): cint <cimport 'execv', nodecl, cinclude '<unistd.h>'> end
 local function c_execvp(file: cstring, argv: *cstring): cint <cimport 'execvp', nodecl, cinclude '<unistd.h>'> end
 local function c__exit(status: cint): void <cimport '_exit', nodecl, cinclude '<unistd.h>'> end
 local function c_waitpid(pid: cint, status: *cint, options: cint): cint <cimport 'waitpid', nodecl, cinclude '<sys/wait.h>'> end
@@ -90,8 +92,7 @@ local Service = @record{
   restart: RestartPolicy,
   max_restarts: integer,
   readiness: ReadinessKind,
-  readiness_path: string,
-  readiness_timeout: integer,
+  readiness_options: ReadinessOptions,
 }
 
 local ExecArgv = @record{
@@ -107,6 +108,11 @@ local Runtime = @record{
   pid: cint,
   pidfd: cint,
   execfd: cint,
+  probe_args: ExecArgv,
+  probe_pid: cint,
+  probe_fd: cint,
+  probe_by: integer,
+  probe_cancelled: boolean,
   cgroup: ServiceCgroup,
   drain_by: integer,
   exit_state: ServiceState,
@@ -166,7 +172,7 @@ local function parse_service(line: string): (boolean, Service)
   local cursor: isize = 1
   local magic: string
   magic, cursor = next_field(line, cursor)
-  if (magic ~= 'TSC2' and magic ~= 'TSC4') or cursor == 0 then return false, service end
+  if (magic ~= 'TSC2' and magic ~= 'TSC4' and magic ~= 'TSC6') or cursor == 0 then return false, service end
   service.name, cursor = next_field(line, cursor)
   if #service.name == 0 or cursor == 0 then return false, service end
   service.argv_serialized, cursor = next_field(line, cursor)
@@ -190,17 +196,12 @@ local function parse_service(line: string): (boolean, Service)
   elseif readiness == 'pid' then service.readiness = ReadinessKind.Pid
   elseif readiness == 'unix-socket' then service.readiness = ReadinessKind.UnixSocket
   else return false, service end
-  if magic == 'TSC4' then
-    if service.readiness ~= ReadinessKind.UnixSocket or cursor == 0 then return false, service end
-    service.readiness_path, cursor = next_field(line, cursor)
-    if cursor == 0 or #service.readiness_path == 0 or #service.readiness_path > 107 or
-       string.byte(service.readiness_path, 1) ~= 47 or string.find(service.readiness_path, '\0', 1, true) ~= 0 then return false, service end
-    local timeout: string
-    timeout, cursor = next_field(line, cursor)
-    ok, service.readiness_timeout = parse_decimal(timeout, 600000)
-    if not ok or service.readiness_timeout < 1 then return false, service end
+  if magic == 'TSC2' then
+    if cursor ~= 0 then return false, service end
+  elseif service.readiness ~= ReadinessKind.UnixSocket or
+         not parse_readiness_options(line, cursor, magic == 'TSC6', &service.readiness_options) then
+    return false, service
   end
-  if cursor ~= 0 then return false, service end
   return true, service
 end
 
@@ -323,7 +324,7 @@ local function spawn(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset): b
   runtime.pid = pid
   runtime.pidfd = pidfd
   runtime.execfd = handshake[0]
-  local timeout = runtime.service.readiness_timeout
+  local timeout = runtime.service.readiness_options.timeout
   if timeout == 0 then timeout = 30000 end
   runtime.ready_by = monotonic_ms() + timeout
   runtime.action_at = runtime.ready_by
@@ -379,6 +380,14 @@ local function reap(runtime: *Runtime): boolean
   return true
 end
 
+local function cancel_probe(runtime: *Runtime, now: integer): boolean
+  if runtime.probe_fd < 0 or runtime.probe_cancelled then return true end
+  if not pidfd_send_signal(runtime.probe_fd, SIGKILL) and errno ~= ESRCH then return false end
+  runtime.probe_cancelled = true
+  runtime.probe_by = now + 1000
+  return true
+end
+
 local function finish_exit(runtime: *Runtime)
   runtime.state = runtime.exit_state
   runtime.drain_by = 0
@@ -398,23 +407,27 @@ local function record_exit(runtime: *Runtime): boolean
     print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'exited-before-ready')
   end
   print('daemon-exit', runtime.service.name, 'code', runtime.last_exit, 'signal', runtime.last_signal)
+  local now = monotonic_ms()
+  if not cancel_probe(runtime, now) then return false end
   runtime.exit_state = ServiceState.Stopped
   if premature or runtime.last_exit ~= 0 or runtime.last_signal ~= 0 then
     runtime.exit_state = ServiceState.Failed
   end
 
   local ownership = cgroup_state(&runtime.cgroup)
-  if ownership == CgroupState.Empty then
+  if ownership == CgroupState.Empty and runtime.probe_fd < 0 then
     finish_exit(runtime)
     return true
   end
-  if ownership == CgroupState.Error or not cgroup_kill(&runtime.cgroup) then
-    io.stderr:write('theseusd: cannot drain cgroup for ', runtime.service.name, '\n')
-    return false
+  if ownership == CgroupState.Error then return false end
+  if ownership == CgroupState.Populated then
+    if not cgroup_kill(&runtime.cgroup) then
+      io.stderr:write('theseusd: cannot drain cgroup for ', runtime.service.name, '\n')
+      return false
+    end
+    print('TE1', 'ownership', runtime.service.name, runtime.attempts, 'draining')
   end
-  print('TE1', 'ownership', runtime.service.name, runtime.attempts, 'draining')
   runtime.state = ServiceState.Stopping
-  local now = monotonic_ms()
   runtime.drain_by = now + 1000
   runtime.action_at = now + 10
   return true
@@ -457,7 +470,7 @@ end
 local function has_ready_peer(runtime: *Runtime): boolean
   local probe = c_socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)
   if probe < 0 then return false end
-  local path = runtime.service.readiness_path
+  local path = runtime.service.readiness_options.path
   local address: SockaddrUn
   fill_address(&address, path)
   local ready = false
@@ -484,13 +497,79 @@ local function signal_child(runtime: *Runtime, signal: cint): boolean
   return pidfd_send_signal(runtime.pidfd, signal) or errno == ESRCH
 end
 
+local function mark_ready(runtime: *Runtime)
+  runtime.state = ServiceState.Ready
+  print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'ready')
+  runtime.state = ServiceState.Running
+  runtime.action_at = 0
+end
+
+local function start_probe(runtime: *Runtime, child_mask: *Sigset, now: integer): boolean
+  local pid = c_fork()
+  if pid == 0 then
+    if not cgroup_enter(&runtime.cgroup) or
+       c_sigprocmask(SIG_SETMASK, child_mask, nilptr) ~= 0 then c__exit(126) end
+    local argv = &runtime.probe_args.cargs[0]
+    c_execv(runtime.probe_args.cargs[0], argv)
+    c__exit(127)
+  end
+  if pid < 0 then return false end
+  local fd = pidfd_open_for(pid)
+  if fd < 0 then
+    c_kill(pid, SIGKILL)
+    local status: cint
+    wait_for_child(pid, &status)
+    return false
+  end
+  runtime.probe_pid = pid
+  runtime.probe_fd = fd
+  runtime.probe_cancelled = false
+  runtime.probe_by = now + runtime.service.readiness_options.probe_timeout
+  runtime.action_at = math.min(runtime.probe_by, runtime.ready_by)
+  return true
+end
+
+local function reap_probe(runtime: *Runtime, status: *cint): boolean
+  if not wait_for_child(runtime.probe_pid, status) then return false end
+  c_close(runtime.probe_fd)
+  runtime.probe_fd = -1
+  runtime.probe_pid = 0
+  return true
+end
+
+local function record_probe(runtime: *Runtime): boolean
+  local status: cint
+  if not reap_probe(runtime, &status) then return false end
+  if runtime.state ~= ServiceState.Starting then return true end
+  local now = monotonic_ms()
+  if not runtime.probe_cancelled and status == 0 and now < runtime.probe_by and now < runtime.ready_by and
+     has_ready_peer(runtime) then
+    mark_ready(runtime)
+  else
+    if not runtime.probe_cancelled then
+      if now >= runtime.probe_by then
+        print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'probe-timeout')
+      elseif status ~= 0 then
+        print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'probe-failed',
+              (status >> 8) & 0xff, status & 0x7f)
+      elseif now < runtime.ready_by then
+        print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'probe-peer-lost')
+      end
+    end
+    runtime.action_at = math.min(now + runtime.service.readiness_options.interval, runtime.ready_by)
+  end
+  return true
+end
+
 local function advance_service(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset): boolean
   local now = monotonic_ms()
   if runtime.action_at == 0 or now < runtime.action_at then return true end
   if runtime.drain_by ~= 0 then
     local ownership = cgroup_state(&runtime.cgroup)
-    if ownership == CgroupState.Empty then
-      print('TE1', 'ownership', runtime.service.name, runtime.attempts, 'drained')
+    if ownership == CgroupState.Empty and runtime.probe_fd < 0 then
+      if #runtime.cgroup.name > 0 then
+        print('TE1', 'ownership', runtime.service.name, runtime.attempts, 'drained')
+      end
       finish_exit(runtime)
       return true
     end
@@ -508,17 +587,22 @@ local function advance_service(runtime: *Runtime, argv: *ExecArgv, child_mask: *
   end
   if runtime.state == ServiceState.Starting then
     if now >= runtime.ready_by then
+      if not cancel_probe(runtime, now) then return false end
       print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'timeout')
       runtime.state = ServiceState.Stopping
       runtime.kill_sent = false
       runtime.action_at = now + 1000
       return signal_child(runtime, SIGTERM)
     end
-    if runtime.execfd < 0 and runtime.service.readiness == ReadinessKind.UnixSocket and has_ready_peer(runtime) then
-      runtime.state = ServiceState.Ready
-      print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'ready')
-      runtime.state = ServiceState.Running
-      runtime.action_at = 0
+    if runtime.probe_fd >= 0 then
+      if now >= runtime.probe_by then
+        if runtime.probe_cancelled or not cancel_probe(runtime, now) then return false end
+        print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'probe-timeout')
+      end
+      runtime.action_at = math.min(runtime.probe_by, runtime.ready_by)
+    elseif runtime.execfd < 0 and runtime.service.readiness == ReadinessKind.UnixSocket and has_ready_peer(runtime) then
+      if runtime.probe_args.count > 0 then return start_probe(runtime, child_mask, now) end
+      mark_ready(runtime)
     else
       runtime.action_at = math.min(now + 25, runtime.ready_by)
     end
@@ -628,11 +712,19 @@ local function drain_cgroup(runtime: *Runtime): boolean
   return false
 end
 
+local function stop_probe(runtime: *Runtime): boolean
+  if runtime.probe_fd < 0 then return true end
+  if not cancel_probe(runtime, monotonic_ms()) then return false end
+  local status: cint
+  return wait_for_exit(runtime.probe_fd, 1000) > 0 and reap_probe(runtime, &status)
+end
+
 local function stop_child(runtime: *Runtime): boolean
   runtime.state = ServiceState.Stopping
+  local probe_stopped = stop_probe(runtime)
   local leader_stopped = stop_leader(runtime)
   local group_empty = drain_cgroup(runtime)
-  if not leader_stopped or not group_empty then return false end
+  if not probe_stopped or not leader_stopped or not group_empty then return false end
   runtime.state = ServiceState.Stopped
   return true
 end
@@ -704,15 +796,17 @@ end
 
 local function serve(listener: cint, shutdown_fd: cint, group: *Supervision,
                      child_mask: *Sigset): (integer, cint)
-  local fds: [2 + MaxClients + 2 * NativeMaxServices]Pollfd
+  local fds: [2 + MaxClients + 3 * NativeMaxServices]Pollfd
   local first_child = 2 + MaxClients
   local first_exec = first_child + group.count
-  local count = first_exec + group.count
+  local first_probe = first_exec + group.count
+  local count = first_probe + group.count
   fds[0] = {fd = listener, events = POLLIN}
   fds[1] = {fd = shutdown_fd, events = POLLIN}
   for i: integer = 0, group.count - 1 do
     fds[first_child + i].events = POLLIN
     fds[first_exec + i].events = POLLIN
+    fds[first_probe + i].events = POLLIN
   end
   local clients: [MaxClients]ControlClient
   for slot: integer = 0, MaxClients - 1 do
@@ -727,6 +821,7 @@ local function serve(listener: cint, shutdown_fd: cint, group: *Supervision,
       local runtime = &group.runtimes[i]
       fds[first_child + i].fd = runtime.pidfd
       fds[first_exec + i].fd = runtime.execfd
+      fds[first_probe + i].fd = runtime.probe_fd
       local action = runtime.action_at
       if action ~= 0 and (deadline == 0 or action < deadline) then deadline = action end
     end
@@ -764,6 +859,11 @@ local function serve(listener: cint, shutdown_fd: cint, group: *Supervision,
           break
         end
         if event ~= 0 and ((event & POLLIN) == 0 or not record_exit(runtime)) then
+          exit_code = 80
+          break
+        end
+        local probe_event = fds[first_probe + i].revents
+        if probe_event ~= 0 and ((probe_event & POLLIN) == 0 or not record_probe(runtime)) then
           exit_code = 80
           break
         end
@@ -864,10 +964,16 @@ local function prepare(group: *Supervision, path: string): integer
     end
     runtime.pidfd = -1
     runtime.execfd = -1
+    runtime.probe_fd = -1
+    local probe = service.readiness_options.probe
+    if #probe > 0 and (not decode_argv(probe, &runtime.probe_args) or #runtime.probe_args.storage[0] < 2) then
+      io.stderr:write('theseusd: invalid probe argv for ', service.name, '\n')
+      return 65
+    end
     runtime.last_exit = -1
     runtime.status_request = 'TQ1\tSTATUS\t' .. service.name .. '\n'
     if service.readiness == ReadinessKind.UnixSocket then
-      local endpoint = service.readiness_path
+      local endpoint = service.readiness_options.path
       if #endpoint == 0 then
         io.stderr:write('theseusd: recompile the service to supply its unix-socket readiness path\n')
         return 69
@@ -877,7 +983,7 @@ local function prepare(group: *Supervision, path: string): integer
         return 65
       end
       for j: integer = 0, i - 1 do
-        if group.runtimes[j].service.readiness_path == endpoint then
+        if group.runtimes[j].service.readiness_options.path == endpoint then
           io.stderr:write('theseusd: multiple services declare readiness at ', endpoint, '\n')
           return 65
         end

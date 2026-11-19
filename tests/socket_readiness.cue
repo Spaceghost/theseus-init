@@ -31,6 +31,7 @@ _timeout: schema.#CompiledService & {
       kind: "unix-socket"
       path: "\(testDir)/service.sock"
       timeoutMs: 500
+      probe: {exec: [testProgram, "probe-gate", "\(testDir)/unused", "\(testDir)/foreign-probe.pid"]}
     }
   }
 }
@@ -48,3 +49,23 @@ _earlyExit: schema.#CompiledService & {
 }
 
 readinessRecords: strings.Join([_ready.compiled, _timeout.compiled, _earlyExit.compiled], "\n")
+
+_probeTimeout: schema.#CompiledService & {
+  service: {
+    name: "probe-timeout"
+    exec: [testProgram, "listen", "\(testDir)/slow.sock"]
+    restart: "never"
+    readiness: {
+      kind: "unix-socket"
+      path: "\(testDir)/slow.sock"
+      timeoutMs: 600
+      probe: {
+        exec: [testProgram, "probe-wait", "\(testDir)/never", "\(testDir)/slow-probe.pid"]
+        intervalMs: 50
+        timeoutMs: 100
+      }
+    }
+  }
+}
+
+probeTimeoutRecord: _probeTimeout.compiled

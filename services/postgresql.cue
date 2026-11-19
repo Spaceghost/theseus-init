@@ -13,6 +13,7 @@ runtime: schema.#CompiledService & {
     readiness: {
       kind: "unix-socket"
       path: "/run/postgresql/.s.PGSQL.5432"
+      probe: {exec: ["/usr/bin/pg_isready", "-q", "-h", "/run/postgresql", "-p", "5432"]}
     }
   }
 }

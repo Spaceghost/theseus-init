@@ -1,0 +1,55 @@
+-- Additional fields shared by standalone inspection and live supervision.
+require 'string'
+
+global ReadinessOptions = @record{
+  path: string,
+  timeout: integer,
+  probe: string,
+  interval: integer,
+  probe_timeout: integer,
+}
+
+local function next_field(line: string, cursor: isize): (string, isize)
+  local first, last = string.find(line, '\t', cursor, true)
+  if first == 0 then return string.sub(line, cursor), 0 end
+  return string.sub(line, cursor, first - 1), last + 1
+end
+
+local function milliseconds(text: string, minimum: integer, maximum: integer): integer
+  local value: integer = 0
+  for i: isize = 1, #text do
+    local byte = string.byte(text, i)
+    if byte < 48 or byte > 57 then return 0 end
+    value = value * 10 + byte - 48
+    if value > maximum then return 0 end
+  end
+  if value < minimum then return 0 end
+  return value
+end
+
+global function parse_readiness_options(line: string, cursor: isize, probe: boolean,
+                                        options: *ReadinessOptions): boolean
+  if cursor == 0 then return false end
+  options.path, cursor = next_field(line, cursor)
+  if cursor == 0 or #options.path == 0 or #options.path > 107 or
+     string.byte(options.path, 1) ~= 47 or string.find(options.path, '\0', 1, true) ~= 0 then
+    return false
+  end
+  local timeout: string
+  timeout, cursor = next_field(line, cursor)
+  options.timeout = milliseconds(timeout, 1, 600000)
+  if options.timeout == 0 then return false end
+  if not probe then return cursor == 0 end
+
+  if cursor == 0 then return false end
+  options.probe, cursor = next_field(line, cursor)
+  if cursor == 0 or #options.probe < 2 or string.byte(options.probe, 1) ~= 47 or
+     string.find(options.probe, '\0', 1, true) ~= 0 then return false end
+  local interval: string
+  interval, cursor = next_field(line, cursor)
+  if cursor == 0 then return false end
+  options.interval = milliseconds(interval, 10, 60000)
+  timeout, cursor = next_field(line, cursor)
+  options.probe_timeout = milliseconds(timeout, 1, 60000)
+  return cursor == 0 and options.interval > 0 and options.probe_timeout > 0
+end

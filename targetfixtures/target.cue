@@ -14,7 +14,12 @@ _services: [
       name: "gate"
       exec: [testProgram, "listen", "\(testDir)/gate.sock", "\(testDir)/release"]
       restart: "never"
-      readiness: {kind: "unix-socket", path: "\(testDir)/gate.sock", timeoutMs: 10000}
+      readiness: {
+        kind: "unix-socket"
+        path: "\(testDir)/gate.sock"
+        timeoutMs: 10000
+        probe: {exec: [testProgram, "probe-gate", "\(testDir)/probe-release", "\(testDir)/probe-started"]}
+      }
     }
   },
   schema.#GraphService & {

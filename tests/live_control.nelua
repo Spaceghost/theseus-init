@@ -81,6 +81,21 @@ local function wait_for_file(path: string)
   end
 end
 
+if arg[1] == 'probe-gate' or arg[1] == 'probe-wait' then
+  local marker = io.open(arg[3], 'w')
+  assert(marker:isopen(), 'probe fixture cannot create marker')
+  marker:write(tostring(c_getpid()), '\n')
+  marker:close()
+  if arg[1] == 'probe-wait' then
+    wait_for_file(arg[2])
+    os.exit(0)
+  end
+  local gate = io.open(arg[2], 'r')
+  if not gate:isopen() then os.exit(1) end
+  gate:close()
+  os.exit(0)
+end
+
 if arg[1] == 'tree' then
   local dir = arg[2]
   local first = io.open(dir .. '/first.pid', 'r')

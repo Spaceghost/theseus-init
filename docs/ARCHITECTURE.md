@@ -17,7 +17,7 @@ CUE service declarations
         |
         | validate + compile
         v
-TSC2 and TSC4 service records / TSC3 and TSC5 graph records
+TSC2, TSC4, TSC6 services / TSC3, TSC5, TSC7 graph services
         |
         v
 Nelua Theseus core
@@ -64,12 +64,12 @@ TSC2<TAB>name<TAB>argv-with-US-separators<TAB>restart-policy<TAB>max-restarts<TA
 The argv field holds up to 32 arguments. Empty arguments after the executable
 are preserved. Services with Unix socket readiness compile to TSC4,
 which uses the same field layout and appends the absolute socket path
-and startup timeout in milliseconds. Legacy TSC2 records declaring
+and startup timeout in milliseconds. If an application probe is present,\nTSC6 adds the probe argv, interval, and per-probe timeout. Legacy TSC2 records declaring
 Unix socket readiness need recompilation before the daemon starts them.
 
 Graph records append the `requires`, `wants`, `after`, and `before`
 lists to the service fields. TSC3 wraps the TSC2 fields. TSC5 wraps the
-TSC4 fields and preserves Unix readiness settings. TGT1 records supply
+TSC4 fields and preserves Unix readiness settings. TSC7 wraps TSC6. TGT1 records supply
 target membership in the same input.
 
 ## Userspace daemon
@@ -102,6 +102,34 @@ one of `ready`, `timeout`, or `exited-before-ready`.
 The live daemon implements this probe. The one-shot CLI can inspect
 TSC4 service configuration and directs socket-ready services to
 `theseusd` for execution.
+
+### Application readiness
+
+A `unix-socket` readiness definition can also declare a `probe`:
+
+```cue
+readiness: {
+  kind: "unix-socket"
+  path: "/run/postgresql/.s.PGSQL.5432"
+  probe: {
+    exec: ["/usr/bin/pg_isready", "-q", "-h", "/run/postgresql", "-p", "5432"]
+    intervalMs: 100
+    timeoutMs: 1000
+  }
+}
+```
+
+The daemon starts the probe only after it has verified the socket's
+owner. A zero exit and a second successful ownership check admit the
+service. Probe argv is passed directly to exec. Use an absolute path
+and a foreground command that exits without leaving descendants.
+
+A nonzero exit or per-probe timeout repeats the check after the
+configured interval. The outer readiness deadline continues to run.
+Only one probe is active per service. Probes use pidfds and join the
+service's cgroup when delegation is enabled. The daemon cancels and
+reaps a pending probe during leader exit or shutdown. These checks
+apply to startup and restart. They do not continue after readiness.
 
 ## Native targets
 
