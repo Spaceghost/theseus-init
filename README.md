@@ -57,7 +57,7 @@ and clean up each service's descendants. See
 
 Unix socket readiness can also require a successful application probe.
 The PostgreSQL example uses `pg_isready` to wait until the database
-accepts connections. Broader Alpine package qualification remains open. The rescue entry point below is separate from the service
+accepts connections. The [Alpine soak procedure](docs/OPENRC.md#soak-native-targets-alongside-openrc) exercises native targets and live OpenRC packages together. Broader Alpine package qualification remains open. The rescue entry point below is separate from the service
 supervisor.
 
 ## Early boot in nebox

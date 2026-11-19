@@ -30,6 +30,9 @@ jobs:
           test "$(head -n1 build/services.tsc | cut -f1)" = TSC6
           test "$(tail -n+2 build/services.tsc | cut -f1 | sort -u)" = TSC2
           test "$(wc -l < build/services.tsc)" -eq 5
+          cue export ./qualificationfixtures -e compiled --out text > build/qualification.tsc
+          cue export ./qualificationfixtures -e compiled --out text | cmp build/qualification.tsc -
+          test "$(grep -c '^TSC7[[:space:]]' build/qualification.tsc)" -eq 1
 
       - name: Build pinned Nelua compiler
         run: |
@@ -127,6 +130,7 @@ jobs:
           /tmp/nelua-lang/nelua --compile-binary --release -o build/live/theseus src/live_client.nelua
           /tmp/nelua-lang/nelua --compile-binary --release -o build/live/control-test tests/live_control.nelua
           /tmp/nelua-lang/nelua --compile-binary --release -o build/alpine-openrc-test tests/alpine_openrc.nelua
+          /tmp/nelua-lang/nelua --compile-binary --release -o build/alpine-qualification tests/alpine_qualification.nelua
           ln -sf theseus build/live/the
           test -x build/live/theseusd
           test -x build/live/theseus

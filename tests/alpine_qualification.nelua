@@ -1,0 +1,253 @@
+## cflags '-D_GNU_SOURCE'
+
+-- Sustained native and OpenRC qualification in a disposable Alpine guest.
+require 'arg'
+require 'io'
+require 'os'
+require 'string'
+require 'tests.command'
+
+local function c_fork(): cint <cimport 'fork', nodecl, cinclude '<unistd.h>'> end
+local function c_execv(path: cstring, argv: *cstring): cint <cimport 'execv', nodecl, cinclude '<unistd.h>'> end
+local function c_exit(code: cint): void <cimport '_exit', nodecl, cinclude '<unistd.h>'> end
+local function c_waitpid(pid: cint, status: *cint, opts: cint): cint <cimport 'waitpid', nodecl, cinclude '<sys/wait.h>'> end
+local function c_pipe(fds: *cint): cint <cimport 'pipe', nodecl, cinclude '<unistd.h>'> end
+local function c_fcntl(fd: cint, command: cint, value: cint): cint <cimport 'fcntl', nodecl, cinclude '<fcntl.h>'> end
+local function c_ioctl(fd: cint, request: cint, value: *cint): cint <cimport 'ioctl', nodecl, cinclude '<sys/ioctl.h>'> end
+local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
+local function c_dup2(oldfd: cint, fd: cint): cint <cimport 'dup2', nodecl, cinclude '<unistd.h>'> end
+local function c_access(path: cstring, mode: cint): cint <cimport 'access', nodecl, cinclude '<unistd.h>'> end
+local function c_getpid(): cint <cimport 'getpid', nodecl, cinclude '<unistd.h>'> end
+local function c_getppid(): cint <cimport 'getppid', nodecl, cinclude '<unistd.h>'> end
+local function c_kill(pid: cint, sig: cint): cint <cimport 'kill', nodecl, cinclude '<signal.h>'> end
+local function c_prctl(option: cint, arg2: culong, arg3: culong, arg4: culong, arg5: culong): cint <cimport 'prctl', nodecl, cinclude '<sys/prctl.h>'> end
+local function c_poll(fds: pointer, count: culong, timeout: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
+local Timespec: type <cimport 'struct timespec', nodecl, cinclude '<time.h>'> = @record{tv_sec: clong, tv_nsec: clong}
+local function c_clock_gettime(clock: cint, value: *Timespec): cint <cimport 'clock_gettime', nodecl, cinclude '<time.h>'> end
+local FIONREAD: cint <cimport, nodecl, cinclude '<sys/ioctl.h>'>
+local OutputCapacity: cint = 4096
+local F_SETPIPE_SZ: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local FD_CLOEXEC: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local F_SETFD: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local PR_SET_PDEATHSIG: cint <cimport, nodecl, cinclude '<sys/prctl.h>'>
+local SIGTERM: cint <cimport, nodecl, cinclude '<signal.h>'>
+local WNOHANG: cint <cimport, nodecl, cinclude '<sys/wait.h>'>
+local CLOCK_MONOTONIC: cint <cimport, nodecl, cinclude '<time.h>'>
+local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
+
+local function monotonic_ms(): integer
+  local now: Timespec
+  assert(c_clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+  return (@integer)(now.tv_sec) * 1000 + now.tv_nsec // 1000000
+end
+
+local function exists(path: string): boolean
+  return c_access((@cstring)(path), 0) == 0
+end
+
+local function wait_file(path: string)
+  local deadline = monotonic_ms() + 3000
+  while not exists(path) do
+    assert(monotonic_ms() < deadline, 'fixture did not publish ' .. path)
+    c_poll(nilptr, 0, 10)
+  end
+end
+
+local function content(path: string): string
+  local f = io.open(path, 'r')
+  assert(f:isopen(), 'cannot read ' .. path)
+  local data = f:read('*a')
+  f:close()
+  return data
+end
+
+local function start_daemon(program: cstring): (cint, cint)
+  local output: [2]cint
+  assert(c_pipe(&output[0]) == 0, 'cannot create stalled output')
+  assert(c_fcntl(output[0], F_SETPIPE_SZ, OutputCapacity) == OutputCapacity, 'cannot size stalled output')
+  assert(c_fcntl(output[0], F_SETFD, FD_CLOEXEC) == 0, 'cannot protect output reader')
+  local argv: [4]cstring = {program, '--target', 'qualification', nilptr}
+  local parent = c_getpid()
+  local pid = c_fork()
+  assert(pid >= 0, 'cannot fork daemon')
+  if pid == 0 then
+    c_close(output[0])
+    if c_prctl(PR_SET_PDEATHSIG, (@culong)(SIGTERM), 0, 0, 0) ~= 0 or c_getppid() ~= parent then
+      c_exit(126)
+    end
+    if c_dup2(output[1], 1) < 0 or c_dup2(output[1], 2) < 0 then c_exit(126) end
+    c_close(output[1])
+    c_execv(program, &argv[0])
+    c_exit(127)
+  end
+  c_close(output[1])
+  return pid, output[0]
+end
+
+local function wait_daemon(pid: cint): integer
+  local deadline = monotonic_ms() + 8000
+  local status: cint
+  while monotonic_ms() < deadline do
+    local result = c_waitpid(pid, &status, WNOHANG)
+    if result == pid then
+      if (status & 0x7f) ~= 0 then return 128 + (status & 0x7f) end
+      return (status >> 8) & 0xff
+    end
+    assert(result == 0 or errno == EINTR, 'cannot reap qualification daemon')
+    c_poll(nilptr, 0, 10)
+  end
+  error('qualification daemon did not exit after fault')
+end
+
+local function daemon_command(client: cstring, verb: cstring, service: cstring): (integer, string)
+  return execute_test_command({'/bin/busybox', 'timeout', '2', client, verb, service}, true)
+end
+
+local function wait_state(client: cstring, service: cstring, state: string)
+  local deadline = monotonic_ms() + 5000
+  while monotonic_ms() < deadline do
+    local code, value = daemon_command(client, 'state', service)
+    if code == 0 and value == state .. '\n' then return end
+    c_poll(nilptr, 0, 20)
+  end
+  error('service did not reach ' .. state .. ': ' .. tostring(service))
+end
+
+local function pid_of(client: cstring, name: cstring): cint
+  local code, status = daemon_command(client, 'status', name)
+  assert(code == 0, status)
+  local found, fields = string.match(status, '\n%s*pid%s+(%d+)')
+  assert(found, status)
+  local pid = tonumber(fields[1])
+  assert(pid > 1, status)
+  return (@cint)(pid)
+end
+
+local function switch_level(client: cstring, reader: cstring, level: cstring)
+  local code, details = execute_test_command({'/bin/busybox', 'timeout', '10', client, 'openrc-runlevel', level}, true)
+  assert(code == 0, details)
+  local status, value = execute_test_command({reader, 'openrc-runlevel'}, true)
+  assert(status == 0 and value == tostring(level) .. '\n', 'OpenRC reported a different runlevel')
+end
+
+local function expect_stopped(reader: cstring, service: cstring)
+  local status, details = execute_test_command({'/bin/busybox', 'timeout', '2', reader,
+    'status', 'of', 'openrc', service}, true)
+  assert(status == 3, 'OpenRC service did not stop: ' .. tostring(service) .. '\n' .. details)
+end
+
+local function retry_workload(command: TestCommand, expected: string)
+  local details = ''
+  local deadline = monotonic_ms() + 3000
+  while monotonic_ms() < deadline do
+    local code, output = execute_test_command(command, true)
+    if code == 0 and output == expected then return end
+    details = output
+    c_poll(nilptr, 0, 30)
+  end
+  error('package workload did not become ready: ' .. tostring(command[3]) .. '\n' .. details)
+end
+
+local function confirm_cgroup(root: string, daemon: cint, pid: cint): string
+  local membership = content('/proc/' .. tostring(pid) .. '/cgroup')
+  local found, fields = string.match(membership, '^0::([^\n]+)\n')
+  assert(found, membership)
+  local relative = fields[1]
+  local prefix = string.sub(root, #'/sys/fs/cgroup' + 1) .. '/theseus-' .. tostring(daemon) .. '-'
+  assert(string.find(relative, prefix, 1, true) == 1, membership)
+  return '/sys/fs/cgroup' .. relative
+end
+
+local FixtureFiles: [6]string = {'control.sock', 'probe.pid', 'release', 'first.pid', 'churn-done', 'gate.sock'}
+
+local function qualify(bindir: string, work: string, root: string)
+  local client = (@cstring)(bindir .. '/theseus')
+  local reader = (@cstring)(bindir .. '/the')
+  local daemon, output = start_daemon((@cstring)(bindir .. '/theseusd'))
+  local endpoint = os.getenv('THESEUS_SOCKET')
+  wait_file(endpoint)
+  wait_file(work .. '/probe.pid')
+  wait_state(client, 'gate', 'STARTING')
+  wait_state(client, 'anchor', 'PLANNED')
+  local release = io.open(work .. '/release', 'w')
+  assert(release:isopen(), 'cannot release probe')
+  release:close()
+  wait_state(client, 'anchor', 'RUNNING')
+  wait_state(client, 'flap', 'FAILED')
+  wait_file(work .. '/churn-done')
+  wait_file(work .. '/first.pid')
+  local queued: cint
+  assert(c_ioctl(output, FIONREAD, &queued) == 0 and queued >= OutputCapacity - 128,
+         'daemon output did not saturate the pipe: ' .. tostring(queued))
+  local failed, status = daemon_command(client, 'status', 'flap')
+  assert(failed == 0 and string.find(status, '\n%s*restarts%s+8\n') ~= 0, status)
+  local gate = pid_of(client, 'gate')
+  local tree = pid_of(client, 'tree')
+  local churn = pid_of(client, 'churn')
+  local anchor = pid_of(client, 'anchor')
+  local found, pids = string.match(content(work .. '/first.pid'), '^(%d+) (%d+)')
+  assert(found and tonumber(pids[1]) == tree and tonumber(pids[2]) > 1, 'bad descendant fixture')
+  local descendant = (@cint)(tonumber(pids[2]))
+  local gate_leaf = confirm_cgroup(root, daemon, gate)
+  local tree_leaf = confirm_cgroup(root, daemon, tree)
+  assert(confirm_cgroup(root, daemon, descendant) == tree_leaf and gate_leaf ~= tree_leaf)
+  local churn_leaf = confirm_cgroup(root, daemon, churn)
+  local anchor_leaf = confirm_cgroup(root, daemon, anchor)
+
+  switch_level(client, reader, 'theseus-a')
+  local cronie = content('/run/cronie.pid')
+  retry_workload({'/bin/busybox', 'timeout', '2', '/usr/bin/valkey-cli', '-h', '127.0.0.1', 'PING'}, 'PONG\n')
+  retry_workload({'/bin/busybox', 'timeout', '2', '/usr/bin/psql', '-XAtq', '-d',
+    'host=/run/postgresql user=postgres dbname=postgres connect_timeout=1', '-c', 'SELECT 42'}, '42\n')
+  switch_level(client, reader, 'theseus-b')
+  assert(content('/run/cronie.pid') == cronie, 'shared Cronie restarted')
+  expect_stopped(reader, 'valkey')
+  retry_workload({'/bin/busybox', 'timeout', '2', '/usr/bin/psql', '-XAtq', '-d',
+    'host=/run/postgresql user=postgres dbname=postgres connect_timeout=1', '-c', 'SELECT 42'}, '42\n')
+  retry_workload({'/bin/busybox', 'timeout', '2', '/usr/bin/mosquitto_pub', '-h', '127.0.0.1',
+    '-q', '1', '-t', 'theseus/qualification', '-m', 'ready'}, '')
+  assert(pid_of(client, 'anchor') == anchor and pid_of(client, 'tree') == tree,
+         'OpenRC switch disturbed native services')
+  assert(c_kill(gate, SIGTERM) == 0, 'cannot inject required service failure')
+  local result = wait_daemon(daemon)
+  assert(result == 82, 'required service loss returned ' .. tostring(result) .. ' instead of 82')
+  c_close(output)
+  assert(not exists(endpoint), 'control socket survived target rollback')
+  local native_pids: [5]cint = {gate, tree, churn, anchor, descendant}
+  for i = 0, 4 do
+    local pid = tostring(native_pids[i])
+    assert(not exists('/proc/' .. pid), 'native process survived rollback: ' .. pid)
+  end
+  assert(not exists(gate_leaf) and not exists(tree_leaf) and not exists(churn_leaf) and not exists(anchor_leaf),
+         'native cgroup survived rollback')
+  switch_level(client, reader, 'theseus-idle')
+  expect_stopped(reader, 'cronie')
+  expect_stopped(reader, 'postgresql')
+  expect_stopped(reader, 'mosquitto')
+
+  for i = 1, 5 do
+    local name = FixtureFiles[i]
+    local removed = os.remove(work .. '/' .. name)
+    assert(removed, 'cannot remove owned fixture ' .. name)
+  end
+end
+
+assert(#arg == 3, 'usage: alpine-qualification LIVE_BINARY_DIRECTORY WORK_DIRECTORY SECONDS')
+local bindir, work = arg[1], arg[2]
+local seconds = tonumber(arg[3]) or 0
+local root = os.getenv('THESEUS_CGROUP_ROOT')
+assert(seconds >= 1 and seconds <= 7200 and seconds % 1 == 0, 'invalid duration')
+assert(string.sub(root, 1, #'/sys/fs/cgroup/') == '/sys/fs/cgroup/', 'a real delegated cgroup is required')
+assert(os.getenv('THESEUS_SOCKET') == work .. '/control.sock', 'control socket must be in the fixture directory')
+for i = 0, 5 do
+  assert(not exists(work .. '/' .. FixtureFiles[i]), 'work directory contains a previous fixture: ' .. FixtureFiles[i])
+end
+local start = monotonic_ms()
+local cycles: integer = 0
+repeat
+  qualify(bindir, work, root)
+  cycles = cycles + 1
+  print('QUAL1', 'cycle', cycles, monotonic_ms() - start)
+until monotonic_ms() - start >= seconds * 1000
+print('QUAL1', 'pass', cycles, monotonic_ms() - start)

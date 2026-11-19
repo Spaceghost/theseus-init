@@ -86,3 +86,57 @@ covers service commands and ordinary runlevel switches in userspace.
 The `--catalog-status` mode compares status output and exit codes
 for every service listed by the installed OpenRC. Boot behavior
 remains unqualified.
+
+## Soak native targets alongside OpenRC
+
+Reuse the disposable Alpine guest and runlevels from the comparison above.
+Add PostgreSQL to the shared runlevel. Give Theseus an empty, writable
+cgroup v2 directory delegated for the test. The guest needs Linux
+support for pidfds, SO_PEERPIDFD, and cgroup.kill. Keep the guest
+isolated so it owns the loopback ports, OpenRC runlevels, and package state.
+
+1. Compile these sources with the CI-pinned Nelua compiler targeting Alpine.
+   Place the resulting executables in /opt/theseus/bin inside the guest and
+   create the symlink the pointing to theseus in that directory.
+
+   | Source | Executable |
+   | --- | --- |
+   | src/supervisor.nelua | theseusd |
+   | src/live_client.nelua | theseus |
+   | tests/live_control.nelua | control-test |
+   | tests/alpine_qualification.nelua | alpine-qualification |
+
+2. Compile the native target from the repository root. Copy graph.tsc into
+   an otherwise empty /opt/theseus/test in the guest.
+
+   ~~~sh
+   cue export ./qualificationfixtures -e compiled --out text \
+     -t testDir=/opt/theseus/test \
+     -t testProgram=/opt/theseus/bin/control-test > graph.tsc
+   ~~~
+
+3. Run the soak inside the guest. The last argument sets the minimum
+   duration in seconds. Use 1 for a single smoke cycle or 600 for a
+   ten-minute soak.
+
+   ~~~sh
+   rc-update add postgresql theseus-shared
+   THESEUS_GRAPH=/opt/theseus/test/graph.tsc \
+   THESEUS_SOCKET=/opt/theseus/test/control.sock \
+   THESEUS_CGROUP_ROOT=/sys/fs/cgroup/theseus-qualification \
+     /opt/theseus/bin/alpine-qualification /opt/theseus/bin /opt/theseus/test 600
+   ~~~
+
+Each cycle holds an application readiness probe, fills the supervisor's
+output pipe, and checks that a failing optional service exhausts its
+restart budget. Live Valkey, PostgreSQL, and Mosquitto requests exercise
+the OpenRC runlevel transition while the native target stays active.
+The test then kills a required native service and checks target
+rollback, including removal of a detached descendant, the native
+cgroups, and the control socket. The empty OpenRC runlevel must stop
+the remaining packages before the next cycle.
+
+The last tab-separated record is QUAL1, pass, the number of
+complete cycles, and elapsed milliseconds. On failure, keep the guest
+and its test directory for diagnosis. The run uses a separate guest
+PID 1 and qualifies the userspace supervisor.

@@ -1,0 +1,58 @@
+-- Run external commands in the Alpine black-box tests.
+require 'string'
+
+local function c_fork(): cint <cimport 'fork', nodecl, cinclude '<unistd.h>'> end
+local function c_execv(path: cstring, argv: *cstring): cint <cimport 'execv', nodecl, cinclude '<unistd.h>'> end
+local function c_exit(code: cint): void <cimport '_exit', nodecl, cinclude '<unistd.h>'> end
+local function c_waitpid(pid: cint, status: *cint, options: cint): cint <cimport 'waitpid', nodecl, cinclude '<sys/wait.h>'> end
+local function c_pipe(fds: *cint): cint <cimport 'pipe', nodecl, cinclude '<unistd.h>'> end
+local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
+local function c_dup2(oldfd: cint, fd: cint): cint <cimport 'dup2', nodecl, cinclude '<unistd.h>'> end
+local function c_read(fd: cint, data: pointer, length: csize): clong <cimport 'read', nodecl, cinclude '<unistd.h>'> end
+local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
+
+global TestCommand = @[13]cstring
+
+global function execute_test_command(argv: TestCommand, capture: boolean): (integer, string)
+  local channel: [2]cint
+  if capture then assert(c_pipe(&channel[0]) == 0, 'test pipe failed') end
+  local pid = c_fork()
+  assert(pid >= 0, 'test fork failed')
+  if pid == 0 then
+    if capture then
+      c_close(channel[0])
+      if c_dup2(channel[1], 1) < 0 or c_dup2(channel[1], 2) < 0 then c_exit(126) end
+      c_close(channel[1])
+    end
+    c_execv(argv[0], &argv[0])
+    c_exit(127)
+  end
+  local output = ''
+  if capture then
+    c_close(channel[1])
+    local buffer: [4096]byte
+    local used: usize = 0
+    while true do
+      assert(used < #buffer, 'captured output exceeded bounds')
+      local count = c_read(channel[0], &buffer[used], #buffer - used)
+      if count < 0 and errno == EINTR then continue end
+      assert(count >= 0, 'test read failed')
+      if count == 0 then break end
+      used = used + (@usize)(count)
+    end
+    output = string.copy((@string){data = &buffer[0], size = used})
+    c_close(channel[0])
+  end
+  local status: cint
+  local result = c_waitpid(pid, &status, 0)
+  while result < 0 and errno == EINTR do result = c_waitpid(pid, &status, 0) end
+  assert(result == pid, 'test waitpid failed')
+  if (status & 0x7f) ~= 0 then return 128 + (status & 0x7f), output end
+  return (status >> 8) & 0xff, output
+end
+
+global function run_test_command(argv: TestCommand): integer
+  local status = execute_test_command(argv, false)
+  return status
+end
