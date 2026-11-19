@@ -143,7 +143,8 @@ local function pid_of(client: cstring, name: cstring): cint
 end
 
 local function switch_level(client: cstring, reader: cstring, level: cstring)
-  local code, details = execute_test_command({'/bin/busybox', 'timeout', '10', client, 'openrc-runlevel', level}, true)
+  -- The PostgreSQL package alone allows 15 seconds for a normal stop.
+  local code, details = execute_test_command({'/bin/busybox', 'timeout', '30', client, 'openrc-runlevel', level}, true)
   assert(code == 0, details)
   local status, value = execute_test_command({reader, 'openrc-runlevel'}, true)
   assert(status == 0 and value == tostring(level) .. '\n', 'OpenRC reported a different runlevel')
