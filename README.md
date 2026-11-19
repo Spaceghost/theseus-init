@@ -62,6 +62,12 @@ The PostgreSQL example uses `pg_isready` to wait until the database
 accepts connections. The [Alpine soak procedure](docs/OPENRC.md#soak-native-targets-alongside-openrc) exercises native targets and live OpenRC packages together. The [full guest check](docs/OPENRC.md#qualify-complete-alpine-boots-and-shutdowns) covers boot and shutdown under Alpine init. Broader Alpine package qualification remains open. The rescue entry point below is separate from the service
 supervisor.
 
+## Opt-in PID 1
+
+The [native PID 1 entry point](docs/PID1.md) is available for isolated
+Linux VM qualification. It supervises the native daemon and enters
+console rescue on boot failure.
+
 ## Early boot in nebox
 
 The opt-in nebox build uses `src/theseus/earlyboot.nelua` as the initramfs

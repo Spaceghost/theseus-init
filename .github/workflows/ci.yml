@@ -135,6 +135,20 @@ jobs:
           test -x build/live/theseusd
           test -x build/live/theseus
 
+      - name: Build the opt-in PID 1 entry point
+        run: |
+          set -eux
+          /tmp/nelua-lang/nelua --compile-binary --release -o build/theseus-init src/init.nelua
+          /tmp/nelua-lang/nelua --compile-binary --release -o build/pid1-test tests/pid1_guest.nelua
+          cue export ./pid1fixtures -e compiled --out text >build/pid1-graph.tsc
+          cue export ./pid1fixtures -e compiled --out text | cmp build/pid1-graph.tsc -
+          test "$(grep -c '^TSC3[[:space:]]' build/pid1-graph.tsc)" -eq 2
+          test "$(tail -n1 build/pid1-graph.tsc | cut -f1-2)" = "$(printf 'TGT1\tdefault')"
+          rc=0
+          build/theseus-init >build/pid1-userspace.log 2>&1 || rc=$?
+          test "$rc" -eq 64
+          grep -Fx 'theseus-init requires Linux PID 1' build/pid1-userspace.log
+
       - name: Keep OpenRC arguments explicit and the status grammar read-only
         run: |
           set -eux

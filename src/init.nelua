@@ -1,0 +1,327 @@
+## cflags '-D_GNU_SOURCE'
+
+-- Explicitly selected Linux PID 1 entry point. The service supervisor is a child.
+require 'io'
+require 'os'
+require 'string'
+require 'src.theseus.recovery'
+
+local Sigset: type <cimport 'sigset_t', nodecl, cinclude '<signal.h>'> = @record{}
+local Statfs: type <cimport 'struct statfs', nodecl, cinclude '<sys/statfs.h>'> = @record{f_type: clong}
+local Timespec: type <cimport 'struct timespec', nodecl, cinclude '<time.h>'> = @record{tv_sec: clong, tv_nsec: clong}
+local Pollfd = @record{fd: cint, events: cshort, revents: cshort}
+local SignalHandler = @function(cint): void
+local function c_getpid(): cint <cimport 'getpid', nodecl, cinclude '<unistd.h>'> end
+local function c_fork(): cint <cimport 'fork', nodecl, cinclude '<unistd.h>'> end
+local function c_execv(path: cstring, argv: *cstring): cint <cimport 'execv', nodecl, cinclude '<unistd.h>'> end
+local function c_exit(status: cint): void <cimport '_exit', nodecl, cinclude '<unistd.h>'> end
+local function c_open(path: cstring, flags: cint): cint <cimport 'open', nodecl, cinclude '<fcntl.h>'> end
+local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
+local function c_read(fd: cint, data: pointer, count: csize): clong <cimport 'read', nodecl, cinclude '<unistd.h>'> end
+local function c_write(fd: cint, data: pointer, count: csize): clong <cimport 'write', nodecl, cinclude '<unistd.h>'> end
+local function c_dup2(source: cint, dest: cint): cint <cimport 'dup2', nodecl, cinclude '<unistd.h>'> end
+local function c_setsid(): cint <cimport 'setsid', nodecl, cinclude '<unistd.h>'> end
+local function c_ioctl(fd: cint, command: culong, value: cint): cint <cimport 'ioctl', nodecl, cinclude '<sys/ioctl.h>'> end
+local function c_statfs(path: cstring, data: *Statfs): cint <cimport 'statfs', nodecl, cinclude '<sys/statfs.h>'> end
+local function c_mount(source: cstring, target: cstring, kind: cstring, flags: culong, data: pointer): cint <cimport 'mount', nodecl, cinclude '<sys/mount.h>'> end
+local function c_mkdir(path: cstring, mode: cuint): cint <cimport 'mkdir', nodecl, cinclude '<sys/stat.h>'> end
+local function c_access(path: cstring, mode: cint): cint <cimport 'access', nodecl, cinclude '<unistd.h>'> end
+local function c_setenv(name: cstring, value: cstring, replace: cint): cint <cimport 'setenv', nodecl, cinclude '<stdlib.h>'> end
+local function c_kill(pid: cint, signal: cint): cint <cimport 'kill', nodecl, cinclude '<signal.h>'> end
+local function c_waitpid(pid: cint, status: *cint, flags: cint): cint <cimport 'waitpid', nodecl, cinclude '<sys/wait.h>'> end
+local function c_signal(sig: cint, action: SignalHandler): SignalHandler <cimport 'signal', nodecl, cinclude '<signal.h>'> end
+local function c_sigemptyset(set: *Sigset): cint <cimport 'sigemptyset', nodecl, cinclude '<signal.h>'> end
+local function c_sigaddset(set: *Sigset, sig: cint): cint <cimport 'sigaddset', nodecl, cinclude '<signal.h>'> end
+local function c_sigprocmask(how: cint, set: *Sigset, previous: *Sigset): cint <cimport 'sigprocmask', nodecl, cinclude '<signal.h>'> end
+local function c_signalfd(fd: cint, set: *Sigset, flags: cint): cint <cimport 'signalfd', nodecl, cinclude '<sys/signalfd.h>'> end
+local function c_poll(fds: *Pollfd, count: culong, timeout: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
+local function c_clock_gettime(clock: cint, now: *Timespec): cint <cimport 'clock_gettime', nodecl, cinclude '<time.h>'> end
+local function c_sync(): void <cimport 'sync', nodecl, cinclude '<unistd.h>'> end
+local function c_reboot(command: cint): cint <cimport 'reboot', nodecl, cinclude '<sys/reboot.h>'> end
+
+local O_CLOEXEC: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_NONBLOCK: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_NOCTTY: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_WRONLY: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_RDWR: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local TIOCSCTTY: culong <cimport, nodecl, cinclude '<sys/ioctl.h>'>
+local MS_NOSUID: culong <cimport, nodecl, cinclude '<sys/mount.h>'>
+local MS_NODEV: culong <cimport, nodecl, cinclude '<sys/mount.h>'>
+local MS_NOEXEC: culong <cimport, nodecl, cinclude '<sys/mount.h>'>
+local MS_REMOUNT: culong <cimport, nodecl, cinclude '<sys/mount.h>'>
+local MS_RDONLY: culong <cimport, nodecl, cinclude '<sys/mount.h>'>
+local PROC_SUPER_MAGIC: clong <cimport, nodecl, cinclude '<linux/magic.h>'>
+local SYSFS_MAGIC: clong <cimport, nodecl, cinclude '<linux/magic.h>'>
+local TMPFS_MAGIC: clong <cimport, nodecl, cinclude '<linux/magic.h>'>
+local CGROUP2_SUPER_MAGIC: clong <cimport, nodecl, cinclude '<linux/magic.h>'>
+local SIGCHLD: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SIGTERM: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SIGINT: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SIGUSR1: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SIGUSR2: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SIGKILL: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SIG_DFL: SignalHandler <cimport, nodecl, cinclude '<signal.h>'>
+local SIG_ERR: SignalHandler <cimport, nodecl, cinclude '<signal.h>'>
+local SIG_SETMASK: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SFD_CLOEXEC: cint <cimport, nodecl, cinclude '<sys/signalfd.h>'>
+local SFD_NONBLOCK: cint <cimport, nodecl, cinclude '<sys/signalfd.h>'>
+local POLLIN: cshort <cimport, nodecl, cinclude '<poll.h>'>
+local WNOHANG: cint <cimport, nodecl, cinclude '<sys/wait.h>'>
+local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
+local ECHILD: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EEXIST: cint <cimport, nodecl, cinclude '<errno.h>'>
+local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
+local CLOCK_MONOTONIC: cint <cimport, nodecl, cinclude '<time.h>'>
+local RB_DISABLE_CAD: cint <cimport, nodecl, cinclude '<sys/reboot.h>'>
+local RB_HALT_SYSTEM: cint <cimport, nodecl, cinclude '<sys/reboot.h>'>
+local RB_AUTOBOOT: cint <cimport, nodecl, cinclude '<sys/reboot.h>'>
+local RB_POWER_OFF: cint <cimport, nodecl, cinclude '<sys/reboot.h>'>
+
+local Console: cstring = '/dev/console'
+local RuntimeDir = '/run/theseus-init'
+local SocketPath = RuntimeDir .. '/control.sock'
+local Delegation = '/sys/fs/cgroup/theseus-init'
+local Worker: cstring = '/sbin/theseusd'
+local Rescue: cstring = '/bin/sh'
+-- 32 services each get up to four seconds for probe, leader, and cgroup cleanup.
+local WorkerGrace <comptime> = 135000
+
+local Action = @enum{None = 0, Poweroff, Reboot, Halt}
+local Session = @record{worker: cint, rescue: cint, rescue_at: integer}
+local console: cint = -1
+
+local function report(event: string)
+  local line = 'TI1\t' .. event .. '\n'
+  if console >= 0 then c_write(console, line.data, #line) end
+end
+
+local function now_ms(): integer
+  local now: Timespec
+  c_clock_gettime(CLOCK_MONOTONIC, &now)
+  return (@integer)(now.tv_sec) * 1000 + now.tv_nsec // 1000000
+end
+
+local function directory(path: cstring, mode: cuint): boolean
+  return c_mkdir(path, mode) == 0 or errno == EEXIST
+end
+
+local function mount_type(kind: cstring, path: cstring, flags: culong, magic: clong): boolean
+  local info: Statfs <noinit>
+  if c_statfs(path, &info) == 0 and info.f_type == magic then return true end
+  return c_mount(kind, path, kind, flags, nilptr) == 0
+end
+
+local function command_line(): (boolean, boolean)
+  local file = io.open('/proc/cmdline', 'r')
+  if not file:isopen() then return false, false end
+  local line = file:read('*a')
+  file:close()
+  local enabled, rescue: boolean, boolean
+  for option in string.gmatch(line, '%S+') do
+    if option == 'theseus.pid1=1' then enabled = true end
+    if option == 'theseus.rescue=1' then rescue = true end
+  end
+  return enabled, rescue
+end
+
+local function provision(): boolean
+  local flags = MS_NOSUID | MS_NODEV | MS_NOEXEC
+  return directory('/run', 0x1ed) and mount_type('tmpfs', '/run', MS_NOSUID | MS_NODEV, TMPFS_MAGIC) and
+    mount_type('sysfs', '/sys', flags, SYSFS_MAGIC) and
+    mount_type('cgroup2', '/sys/fs/cgroup', flags, CGROUP2_SUPER_MAGIC) and
+    directory((@cstring)(RuntimeDir), 0x1c0) and directory((@cstring)(Delegation), 0x1c0)
+end
+
+local function signal_queue(): cint
+  local set: Sigset
+  if c_sigemptyset(&set) ~= 0 or
+     c_sigaddset(&set, SIGCHLD) ~= 0 or c_sigaddset(&set, SIGTERM) ~= 0 or
+     c_sigaddset(&set, SIGINT) ~= 0 or c_sigaddset(&set, SIGUSR1) ~= 0 or
+     c_sigaddset(&set, SIGUSR2) ~= 0 or c_sigprocmask(SIG_SETMASK, &set, nilptr) ~= 0 then return -1 end
+  if c_signal(SIGCHLD, SIG_DFL) == SIG_ERR or c_signal(SIGINT, SIG_DFL) == SIG_ERR or
+     c_signal(SIGTERM, SIG_DFL) == SIG_ERR or c_signal(SIGUSR1, SIG_DFL) == SIG_ERR or
+     c_signal(SIGUSR2, SIG_DFL) == SIG_ERR then return -1 end
+  return c_signalfd(-1, &set, SFD_CLOEXEC | SFD_NONBLOCK)
+end
+
+local function notification(fd: cint, timeout: cint): (boolean, Action)
+  local p: Pollfd = {fd = fd, events = POLLIN}
+  local ready = c_poll(&p, 1, timeout)
+  if ready <= 0 then return ready == 0 or errno == EINTR, Action.None end
+  -- The Linux signalfd record is 128 bytes and starts with a native uint32.
+  local info: [32]uint32 <noinit>
+  local size = #info * #uint32
+  if c_read(fd, &info[0], size) ~= size then return false, Action.None end
+  if info[0] == (@cuint)(SIGUSR1) then return true, Action.Halt end
+  if info[0] == (@cuint)(SIGUSR2) then return true, Action.Poweroff end
+  if info[0] == (@cuint)(SIGTERM) or info[0] == (@cuint)(SIGINT) then return true, Action.Reboot end
+  return true, Action.None
+end
+
+local function launch(rescue: boolean): cint
+  local pid = c_fork()
+  if pid ~= 0 then return pid end
+  local unblocked: Sigset
+  if c_sigemptyset(&unblocked) ~= 0 or c_sigprocmask(SIG_SETMASK, &unblocked, nilptr) ~= 0 then c_exit(126) end
+  if rescue then
+    c_setsid()
+    local fd = c_open(Console, O_RDWR | O_NOCTTY)
+    if fd < 0 then c_exit(126) end
+    c_ioctl(fd, TIOCSCTTY, 0)
+    for side = 0, 2 do
+      if c_dup2(fd, (@cint)(side)) < 0 then c_exit(126) end
+    end
+    if fd > 2 then c_close(fd) end
+    local argv: [3]cstring = {Rescue, '-i', nilptr}
+    c_execv(Rescue, &argv[0])
+  else
+    if c_setenv('THESEUS_GRAPH', '/etc/theseus/graph.tsc', 1) ~= 0 or
+       c_setenv('THESEUS_CGROUP_ROOT', (@cstring)(Delegation), 1) ~= 0 or
+       c_setenv('THESEUS_RECOVERY_DIR', (@cstring)(RuntimeDir), 1) ~= 0 or
+       c_setenv('THESEUS_SOCKET', (@cstring)(SocketPath), 1) ~= 0 then c_exit(126) end
+    local argv: [4]cstring = {Worker, '--target', 'default', nilptr}
+    c_execv(Worker, &argv[0])
+  end
+  c_exit(127)
+  return -1
+end
+
+local function reclaim(): boolean
+  local root = cgroup_open_root(Delegation)
+  if root < 0 then return false end
+  defer c_close(root) end
+  local instance: RecoverableInstance = {dir = -1, scope = -1}
+  defer recovery_close(&instance) end
+  return recovery_reclaim(&instance, SocketPath, RuntimeDir, root) == 0
+end
+
+-- Return whether any child may remain. Batching avoids starving the signal queue.
+local function reap(session: *Session): boolean
+  local status: cint
+  for _ = 1, 64 do
+    local pid = c_waitpid(-1, &status, WNOHANG)
+    if pid <= 0 then return pid == 0 or errno ~= ECHILD end
+    if pid == session.worker then
+      session.worker = 0
+      report('supervisor-exit\t' .. tostring((status >> 8) & 0xff) .. '\t' .. tostring(status & 0x7f))
+    elseif pid == session.rescue then
+      session.rescue = 0
+      session.rescue_at = now_ms() + 1000
+      report('rescue-exit')
+    else
+      report('adopted-exit\t' .. tostring(pid) .. '\t' .. tostring((status >> 8) & 0xff) .. '\t' .. tostring(status & 0x7f))
+    end
+  end
+  return true
+end
+
+local function await_cleanup(fd: cint, session: *Session, worker_only: boolean, grace: integer): boolean
+  local deadline = now_ms() + grace
+  while true do
+    local remaining = reap(session)
+    if (worker_only and session.worker == 0) or not remaining then return true end
+    local left = deadline - now_ms()
+    if left <= 0 then return false end
+    local timeout = 50
+    if left < timeout then timeout = left end
+    notification(fd, (@cint)(timeout))
+  end
+  return false
+end
+
+local function shutdown(fd: cint, session: *Session, action: Action, had_worker: boolean)
+  local cmd = RB_POWER_OFF
+  if action == Action.Reboot then
+    cmd = RB_AUTOBOOT
+    report('shutdown\treboot')
+  elseif action == Action.Halt then
+    cmd = RB_HALT_SYSTEM
+    report('shutdown\thalt')
+  else
+    report('shutdown\tpoweroff')
+  end
+  if session.worker > 0 then
+    c_kill(session.worker, SIGTERM)
+    if not await_cleanup(fd, session, true, WorkerGrace) then
+      report('supervisor-timeout')
+      c_kill(session.worker, SIGKILL)
+      await_cleanup(fd, session, true, 1000)
+    end
+  end
+  if had_worker and not reclaim() then report('supervisor-reclaim-failed') end
+  -- The service supervisor gets its graceful, ordered stop first.
+  -- Sweep children and session processes outside its managed cgroups last.
+  c_kill(-1, SIGTERM)
+  if not await_cleanup(fd, session, false, 2000) then
+    c_kill(-1, SIGKILL)
+    if not await_cleanup(fd, session, false, 1000) then report('remaining-processes') end
+  end
+  c_sync()
+  if c_mount(nilptr, '/', nilptr, MS_REMOUNT | MS_RDONLY, nilptr) ~= 0 then report('root-remount-failed') end
+  report('shutdown-ready')
+  c_reboot(cmd)
+  report('reboot-syscall-failed\t' .. tostring(errno))
+end
+
+local function run()
+  directory('/dev', 0x1ed)
+  directory('/proc', 0x1ed)
+  directory('/sys', 0x1ed)
+  if c_access(Console, 0) ~= 0 then c_mount('devtmpfs', '/dev', 'devtmpfs', MS_NOSUID, nilptr) end
+  console = c_open(Console, O_WRONLY | O_NONBLOCK | O_CLOEXEC | O_NOCTTY)
+  local boot, preferred_rescue = false, false
+  if mount_type('proc', '/proc', MS_NOSUID | MS_NODEV | MS_NOEXEC, PROC_SUPER_MAGIC) then
+    boot, preferred_rescue = command_line()
+  end
+  c_setenv('PATH', '/usr/sbin:/usr/bin:/sbin:/bin', 1)
+  local fd = signal_queue()
+  if fd >= 0 and c_reboot(RB_DISABLE_CAD) ~= 0 then report('ctrl-alt-del-config-failed') end
+  local session: Session
+  local reason: string
+  if fd < 0 then
+    reason = 'signal-queue'
+  elseif not boot then
+    reason = 'missing-opt-in'
+  elseif preferred_rescue then
+    reason = 'requested'
+  elseif not provision() then
+    reason = 'boot-filesystems'
+  else
+    session.worker = launch(false)
+    if session.worker <= 0 then reason = 'supervisor-fork' end
+  end
+  local had_worker = session.worker > 0
+  local in_rescue = not had_worker
+  if had_worker then report('supervisor-start\t' .. tostring(session.worker))
+  else report('rescue\t' .. reason) end
+  while true do
+    local timeout: cint = 100
+    if fd < 0 then timeout = 1000 end
+    local ok, action = notification(fd, timeout)
+    reap(&session)
+    if action ~= Action.None then
+      shutdown(fd, &session, action, had_worker)
+      in_rescue = true
+      report('rescue\tshutdown-failed')
+    elseif fd < 0 or not ok then
+      if fd >= 0 then c_close(fd) end
+      fd = signal_queue()
+      if fd < 0 then report('signal-queue-failed') end
+    end
+    if not in_rescue and session.worker == 0 then
+      if not reclaim() then report('supervisor-reclaim-failed') end
+      in_rescue = true
+      report('rescue\tsupervisor')
+    end
+    if in_rescue and session.rescue <= 0 and now_ms() >= session.rescue_at then
+      session.rescue = launch(true)
+      if session.rescue < 0 then session.rescue_at = now_ms() + 1000 end
+    end
+  end
+end
+
+if c_getpid() ~= 1 then
+  io.stderr:write('theseus-init requires Linux PID 1\n')
+  os.exit(64)
+end
+run()

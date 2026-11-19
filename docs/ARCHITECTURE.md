@@ -279,4 +279,6 @@ The userspace supervisor must prove, in order:
 5. OpenRC compatibility on Alpine package scripts;
 6. only then PID 1 signal/reaping/reboot responsibilities.
 
-The machine should not become unbootable merely because we became enthusiastic.
+The [opt-in PID 1 entry point](PID1.md) starts the native supervisor
+as a child. It keeps init alive if the supervisor fails, reaps
+adopted processes, and owns the system shutdown request.

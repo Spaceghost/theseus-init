@@ -1,0 +1,51 @@
+-- Verify a native target is running under the opt-in PID 1 boot fixture.
+require 'io'
+require 'string'
+require 'tests.command'
+
+local function c_getppid(): cint <cimport 'getppid', nodecl, cinclude '<unistd.h>'> end
+local function c_pause(): cint <cimport 'pause', nodecl, cinclude '<unistd.h>'> end
+local function c_kill(pid: cint, signal: cint): cint <cimport 'kill', nodecl, cinclude '<signal.h>'> end
+local function c_poll(fds: pointer, count: culong, timeout: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
+local SIGSTOP: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SIGKILL: cint <cimport, nodecl, cinclude '<signal.h>'>
+
+local function content(path: string): string
+  local file = io.open(path, 'r')
+  if not file:isopen() then return '' end
+  local data = file:read('*a')
+  file:close()
+  return data
+end
+
+assert(content('/proc/1/comm') == 'theseus-init\n', 'fixture requires real Theseus PID 1')
+local worker = c_getppid()
+assert(worker > 1 and content('/proc/' .. tostring(worker) .. '/comm') == 'theseusd\n')
+local status, state = execute_test_command({'/bin/busybox', 'timeout', '2', '/opt/theseus/bin/the', 'state', 'of', 'tree'}, true)
+assert(status == 0 and state == 'RUNNING\n', state)
+
+local pids = ''
+for _ = 1, 100 do
+  pids = content('/run/theseus-init/first.pid')
+  if string.find(pids, '^%d+ %d+\n$') == 1 then break end
+  c_poll(nilptr, 0, 20)
+end
+local matched, fields = string.match(pids, '^(%d+) (%d+)\n$')
+assert(matched, 'native tree did not publish its process IDs')
+local leader, detached = fields[1], fields[2]
+local cgroup = content('/proc/' .. leader .. '/cgroup')
+assert(string.find(cgroup, '0::/theseus-init/theseus-instance-', 1, true) == 1)
+assert(content('/proc/' .. detached .. '/cgroup') == cgroup)
+local boot = content('/proc/cmdline')
+print('VM_PID1_TARGET_READY', worker, leader, detached)
+io.stdout:flush()
+if string.find(boot, 'test.action=worker-crash', 1, true) ~= 0 then
+  assert(c_kill(worker, SIGKILL) == 0)
+else
+  if string.find(boot, 'test.action=worker-wedged', 1, true) ~= 0 then assert(c_kill(worker, SIGSTOP) == 0) end
+  local command: cstring = 'poweroff'
+  if string.find(boot, 'test.action=reboot', 1, true) ~= 0 then command = 'reboot' end
+  if string.find(boot, 'test.action=halt', 1, true) ~= 0 then command = 'halt' end
+  assert(run_test_command({'/bin/busybox', command}) == 0)
+end
+while true do c_pause() end
