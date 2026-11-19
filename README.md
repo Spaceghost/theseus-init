@@ -42,3 +42,15 @@ Generated C from Nelua is a build artifact, never maintained source. Shell scrip
 ## Current status
 
 Bootstrap implementation in progress. The first executable milestone intentionally runs as an ordinary process rather than PID 1.
+
+## Early boot in nebox
+
+The opt-in nebox build uses `src/theseus/earlyboot.nelua` as the initramfs
+entry point. It mounts procfs and sysfs, starts an interactive nebox shell
+on the boot console, reaps children, and restarts the shell after exit.
+The module uses the Spaceghost Nelua fork's control flow, compound
+assignment, conditional expressions, and string interpolation extensions.
+
+This entry point is for bring-up and rescue. The CUE service model and
+long-lived userspace supervisor are separate from this boot path.
+See the nebox README for the build and QEMU smoke commands.

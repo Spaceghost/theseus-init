@@ -1,0 +1,108 @@
+#syntax 'syntax.control'
+#syntax 'syntax.compound'
+#syntax 'syntax.choose'
+#syntax 'syntax.interp'
+
+require 'string'
+require 'sequence'
+
+local function mount_fs(source: cstring, target: cstring, kind: cstring, flags: culong,
+    data: pointer): cint <cimport 'mount', nodecl, cinclude '<sys/mount.h>'> end
+local function getpid(): cint <cimport, nodecl, cinclude '<unistd.h>'> end
+local function fork(): cint <cimport, nodecl, cinclude '<unistd.h>'> end
+local function execv(path: cstring, argv: *[0]cstring): cint <cimport, nodecl, cinclude '<unistd.h>'> end
+local function exit_child(status: cint): void <cimport '_exit', nodecl, cinclude '<unistd.h>'> end
+local function waitpid(pid: cint, status: *cint, options: cint): cint <cimport, nodecl, cinclude '<sys/wait.h>'> end
+local function sleep(seconds: cuint): cuint <cimport, nodecl, cinclude '<unistd.h>'> end
+local function setsid(): cint <cimport, nodecl, cinclude '<unistd.h>'> end
+local function setenv(name: cstring, value: cstring, overwrite: cint): cint <cimport, nodecl, cinclude '<stdlib.h>'> end
+local function strerror(code: cint): cstring <cimport, nodecl, cinclude '<string.h>'> end
+local function write(fd: cint, data: cstring, size: csize): isize <cimport, nodecl, cinclude '<unistd.h>'> end
+local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
+local MS_RDONLY: culong <cimport, nodecl, cinclude '<sys/mount.h>'>
+local MS_NODEV: culong <cimport, nodecl, cinclude '<sys/mount.h>'>
+local MS_NOEXEC: culong <cimport, nodecl, cinclude '<sys/mount.h>'>
+local MS_NOSUID: culong <cimport, nodecl, cinclude '<sys/mount.h>'>
+
+local function report(message: string)
+  write(2, message, #message)
+  write(2, '\n', 1)
+end
+
+local function mount_one(source: string, target: string, kind: string, flags: culong): boolean
+  guard mount_fs(source, target, kind, flags, nilptr) == 0 else
+    local reason: string = (@string)(strerror(errno))
+    report($"mount: {target}: {reason}")
+    return false
+  end
+  return true
+end
+
+global theseus_boot = @record{}
+
+local function mount_usage(): integer
+  report('usage: mount [-r] -t TYPE [--] SOURCE TARGET')
+  return 2
+end
+
+function theseus_boot.mount(args: sequence(string)): integer
+  local kind: string
+  local flags: culong = 0
+  local i = 1
+  while i <= #args do
+    if args[i] == '-r' then
+      flags |= MS_RDONLY
+    elseif args[i] == '-t' and i < #args then
+      i += 1
+      kind = args[i]
+    elseif args[i] == '--' then
+      i += 1
+      break
+    elseif #args[i] > 0 and args[i]:sub(1, 1) ~= '-' then
+      break
+    else
+      return mount_usage()
+    end
+    i += 1
+  end
+  guard #kind > 0 and #args - i == 1 and #args[i] > 0 and #args[i + 1] > 0 else
+    return mount_usage()
+  end
+  return choose mount_one(args[i], args[i + 1], kind, flags) then 0 else 1 end
+end
+
+function theseus_boot.init(args: sequence(string)): integer
+  guard #args == 0 and getpid() == 1 else
+    report('theseus: init requires PID 1 and takes no arguments')
+    return 2
+  end
+
+  local flags = MS_NODEV | MS_NOEXEC | MS_NOSUID
+  mount_one('proc', '/proc', 'proc', flags)
+  mount_one('sysfs', '/sys', 'sysfs', flags)
+  setenv('PATH', '/bin:/sbin', 1)
+  report('theseus: starting console shell')
+
+  loop do
+    local child = fork()
+    if child == 0 then
+      setsid()
+      local argv: [4]cstring = {'/bin/nebox', 'sh', '-i', nilptr}
+      execv(argv[0], (@*[0]cstring)(&argv))
+      report('theseus: cannot exec /bin/nebox sh')
+      exit_child(127)
+    elseif child > 0 then
+      -- PID 1 also adopts orphaned descendants. Reap any child while
+      -- waiting for the specific shell that controls the console.
+      loop do
+        local status: cint
+        local reaped = waitpid(-1, &status, 0)
+        if reaped == child or (reaped < 0 and errno ~= EINTR) then break end
+      end
+    else
+      report('theseus: cannot fork console shell')
+    end
+    sleep(1)
+  end
+end
