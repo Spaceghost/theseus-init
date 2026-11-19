@@ -17,7 +17,7 @@ CUE service declarations
         |
         | validate + compile
         v
-TSC2 service records / TSC3 graph records
+TSC2 and TSC4 service records / TSC3 graph records
         |
         v
 Nelua Theseus core
@@ -55,14 +55,17 @@ Illegal transitions are rejected rather than silently coerced.
 
 ## Runtime records
 
-The one-shot and live supervisors consume records in this TSC2 format.
+Services with no readiness probe or PID readiness compile to TSC2.
 
 ```text
 TSC2<TAB>name<TAB>argv-with-US-separators<TAB>restart-policy<TAB>max-restarts<TAB>readiness-kind
 ```
 
 The argv field holds up to 32 arguments. Empty arguments after the executable
-are preserved.
+are preserved. Services with Unix socket readiness compile to TSC4,
+which uses the same field layout and appends the absolute socket path
+and startup timeout in milliseconds. Legacy TSC2 records declaring
+Unix socket readiness need recompilation before the daemon starts them.
 
 The graph planner consumes TSC3 service records, which append the
 `requires`, `wants`, `after`, and `before` lists to the service fields. It
@@ -81,6 +84,23 @@ signals its direct child through the pidfd and gives it one second to
 exit. If that expires, it sends SIGKILL and waits up to one more second
 for exit. The daemon acknowledges a successful control shutdown after
 the child has been reaped and the socket removed.
+
+For CUE readiness kind `unix-socket`, the child starts in `STARTING`
+and the daemon attempts nonblocking connections until the configured
+deadline. `SO_PEERCRED` and `SO_PEERPIDFD` establish that the listener
+belongs to the live foreground child. This probe measures socket
+availability at startup. The service owns its socket file.
+
+`timeoutMs` defaults to 30000. On timeout the daemon begins pidfd
+shutdown while continuing to answer status queries. A timeout or exit
+before readiness counts as a failure for restart policy, even if the
+child exits with code zero. The daemon records the outcome in tab-separated
+events with fields `TE1`, `readiness`, service name, attempt number, and
+one of `ready`, `timeout`, or `exited-before-ready`.
+
+The live daemon implements this probe. The one-shot CLI can inspect
+TSC4 service configuration and directs socket-ready services to
+`theseusd` for execution.
 
 ## PID 1 boundary
 

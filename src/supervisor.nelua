@@ -5,6 +5,7 @@
 
 require 'arg'
 require 'io'
+require 'math'
 require 'os'
 require 'string'
 
@@ -17,6 +18,9 @@ local function c_kill(pid: cint, signal: cint): cint <cimport 'kill', nodecl, ci
 local function c_syscall2(number: clong, a1: clong, a2: clong): clong <cimport 'syscall', nodecl, cinclude '<unistd.h>'> end
 local function c_syscall4(number: clong, a1: clong, a2: clong, a3: pointer, a4: clong): clong <cimport 'syscall', nodecl, cinclude '<unistd.h>'> end
 local function c_socket(domain: cint, kind: cint, protocol: cint): cint <cimport 'socket', nodecl, cinclude '<sys/socket.h>'> end
+local function c_connect(fd: cint, address: pointer, length: cuint): cint <cimport 'connect', nodecl, cinclude '<sys/socket.h>'> end
+local function c_socketpair(domain: cint, kind: cint, protocol: cint, fds: *cint): cint <cimport 'socketpair', nodecl, cinclude '<sys/socket.h>'> end
+local function c_getsockopt(fd: cint, level: cint, option: cint, value: pointer, length: *cuint): cint <cimport 'getsockopt', nodecl, cinclude '<sys/socket.h>'> end
 local function c_bind(fd: cint, address: pointer, length: cuint): cint <cimport 'bind', nodecl, cinclude '<sys/socket.h>'> end
 local function c_listen(fd: cint, backlog: cint): cint <cimport 'listen', nodecl, cinclude '<sys/socket.h>'> end
 local function c_accept4(fd: cint, address: pointer, length: pointer, flags: cint): cint <cimport 'accept4', nodecl, cinclude '<sys/socket.h>'> end
@@ -39,6 +43,13 @@ local function c_clock_gettime(clock: cint, value: *Timespec): cint <cimport 'cl
 local Pollfd = @record{fd: cint, events: cshort, revents: cshort}
 local function c_poll(fds: *Pollfd, count: culong, timeout_ms: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
 
+local Credentials: type <cimport 'struct ucred', nodecl, cinclude '<sys/socket.h>'> = @record{
+  pid: cint, uid: cuint, gid: cuint,
+}
+local SOL_SOCKET: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local SO_PEERCRED: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+-- Linux's generic UAPI value also works with libc headers predating the option.
+local PeerPidfdOption <comptime> = 77
 local AF_UNIX: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
 local SOCK_STREAM: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
 local SOCK_CLOEXEC: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
@@ -73,6 +84,8 @@ local Service = @record{
   restart: RestartPolicy,
   max_restarts: integer,
   readiness: ReadinessKind,
+  readiness_path: string,
+  readiness_timeout: integer,
 }
 
 local ExecArgv = @record{
@@ -88,7 +101,9 @@ local Runtime = @record{
   pidfd: cint,
   attempts: integer,
   restarts: integer,
-  restart_at: integer,
+  action_at: integer,
+  ready_by: integer,
+  kill_sent: boolean,
   last_exit: integer,
   last_signal: integer,
 }
@@ -128,7 +143,7 @@ local function parse_service(line: string): (boolean, Service)
   local cursor: isize = 1
   local magic: string
   magic, cursor = next_field(line, cursor)
-  if magic ~= 'TSC2' or cursor == 0 then return false, service end
+  if (magic ~= 'TSC2' and magic ~= 'TSC4') or cursor == 0 then return false, service end
   service.name, cursor = next_field(line, cursor)
   if #service.name == 0 or cursor == 0 then return false, service end
   service.argv_serialized, cursor = next_field(line, cursor)
@@ -148,11 +163,21 @@ local function parse_service(line: string): (boolean, Service)
   if not ok then return false, service end
   local readiness: string
   readiness, cursor = next_field(line, cursor)
-  if cursor ~= 0 then return false, service end
   if readiness == 'none' then service.readiness = ReadinessKind.None
   elseif readiness == 'pid' then service.readiness = ReadinessKind.Pid
   elseif readiness == 'unix-socket' then service.readiness = ReadinessKind.UnixSocket
   else return false, service end
+  if magic == 'TSC4' then
+    if service.readiness ~= ReadinessKind.UnixSocket or cursor == 0 then return false, service end
+    service.readiness_path, cursor = next_field(line, cursor)
+    if cursor == 0 or #service.readiness_path == 0 or #service.readiness_path > 107 or
+       string.byte(service.readiness_path, 1) ~= 47 or string.find(service.readiness_path, '\0', 1, true) ~= 0 then return false, service end
+    local timeout: string
+    timeout, cursor = next_field(line, cursor)
+    ok, service.readiness_timeout = parse_decimal(timeout, 600000)
+    if not ok or service.readiness_timeout < 1 then return false, service end
+  end
+  if cursor ~= 0 then return false, service end
   return true, service
 end
 
@@ -257,8 +282,13 @@ local function spawn(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset): b
   end
   runtime.pid = pid
   runtime.pidfd = pidfd
-  if runtime.service.readiness == ReadinessKind.Pid then runtime.state = ServiceState.Ready end
-  runtime.state = ServiceState.Running
+  if runtime.service.readiness == ReadinessKind.UnixSocket then
+    runtime.action_at = monotonic_ms()
+    runtime.ready_by = runtime.action_at + runtime.service.readiness_timeout
+  else
+    if runtime.service.readiness == ReadinessKind.Pid then runtime.state = ServiceState.Ready end
+    runtime.state = ServiceState.Running
+  end
   print('daemon-spawn', runtime.service.name, 'pid', pid, 'pidfd', pidfd, 'attempt', runtime.attempts)
   return true
 end
@@ -266,7 +296,7 @@ end
 local function should_restart(runtime: *Runtime): boolean
   if runtime.service.restart == RestartPolicy.Always then return true end
   if runtime.service.restart == RestartPolicy.OnFailure then
-    return runtime.last_exit ~= 0 or runtime.last_signal ~= 0
+    return runtime.state == ServiceState.Failed
   end
   return false
 end
@@ -282,14 +312,22 @@ local function reap(runtime: *Runtime): boolean
 end
 
 local function record_exit(runtime: *Runtime): boolean
+  local premature = runtime.state == ServiceState.Starting or runtime.state == ServiceState.Stopping
   if not reap(runtime) then return false end
+  if runtime.state == ServiceState.Starting then
+    print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'exited-before-ready')
+  end
+  runtime.action_at = 0
   print('daemon-exit', runtime.service.name, 'code', runtime.last_exit, 'signal', runtime.last_signal)
-  if runtime.last_exit == 0 and runtime.last_signal == 0 then runtime.state = ServiceState.Stopped
-  else runtime.state = ServiceState.Failed end
+  if premature or runtime.last_exit ~= 0 or runtime.last_signal ~= 0 then
+    runtime.state = ServiceState.Failed
+  else
+    runtime.state = ServiceState.Stopped
+  end
   if should_restart(runtime) and runtime.restarts < runtime.service.max_restarts then
     local delay = (runtime.restarts + 1) * 10
     if delay > 1000 then delay = 1000 end
-    runtime.restart_at = monotonic_ms() + delay
+    runtime.action_at = monotonic_ms() + delay
     runtime.state = ServiceState.Backoff
   end
   return true
@@ -309,6 +347,90 @@ local function fill_address(address: *SockaddrUn, path: string)
   address.sun_family = (@cushort)(AF_UNIX)
   for i: integer = 0, 107 do address.sun_path[i] = 0 end
   for i: isize = 1, #path do address.sun_path[i - 1] = (@cchar)(string.byte(path, i)) end
+end
+
+local function peer_pidfd(socket: cint): cint
+  local fd: cint = -1
+  local size = (@cuint)(#cint)
+  if c_getsockopt(socket, SOL_SOCKET, PeerPidfdOption, &fd, &size) ~= 0 then return -1 end
+  return fd
+end
+
+local function peer_pidfd_available(): boolean
+  local pair: [2]cint
+  if c_socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, &pair[0]) ~= 0 then return false end
+  local peer = peer_pidfd(pair[0])
+  c_close(pair[0])
+  c_close(pair[1])
+  if peer < 0 then return false end
+  c_close(peer)
+  return true
+end
+
+local function has_ready_peer(runtime: *Runtime): boolean
+  local probe = c_socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)
+  if probe < 0 then return false end
+  local path = runtime.service.readiness_path
+  local address: SockaddrUn
+  fill_address(&address, path)
+  local ready = false
+  if c_connect(probe, &address, (@cuint)(2 + #path + 1)) == 0 then
+    local credentials: Credentials
+    local size = (@cuint)(#Credentials)
+    if c_getsockopt(probe, SOL_SOCKET, SO_PEERCRED, &credentials, &size) == 0 and
+       credentials.pid == runtime.pid then
+      local peer = peer_pidfd(probe)
+      if peer >= 0 then
+        -- A dead listener's credentials can retain a recycled numeric PID.
+        -- The peer must be alive while our own child still owns that PID.
+        local event: Pollfd = {fd = peer, events = POLLIN}
+        ready = c_poll(&event, 1, 0) == 0
+        c_close(peer)
+      end
+    end
+  end
+  c_close(probe)
+  return ready
+end
+
+local function signal_child(runtime: *Runtime, signal: cint): boolean
+  return pidfd_send_signal(runtime.pidfd, signal) or errno == ESRCH
+end
+
+local function advance_service(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset): boolean
+  local now = monotonic_ms()
+  if runtime.action_at == 0 or now < runtime.action_at then return true end
+  if runtime.state == ServiceState.Backoff then
+    runtime.action_at = 0
+    runtime.restarts = runtime.restarts + 1
+    return spawn(runtime, argv, child_mask)
+  end
+  if runtime.state == ServiceState.Starting then
+    if now >= runtime.ready_by then
+      print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'timeout')
+      runtime.state = ServiceState.Stopping
+      runtime.kill_sent = false
+      runtime.action_at = now + 1000
+      return signal_child(runtime, SIGTERM)
+    end
+    if has_ready_peer(runtime) then
+      runtime.state = ServiceState.Ready
+      print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'ready')
+      runtime.state = ServiceState.Running
+      runtime.action_at = 0
+    else
+      runtime.action_at = math.min(now + 25, runtime.ready_by)
+    end
+    return true
+  end
+  -- The startup timed out. Keep serving control requests while the child stops.
+  if runtime.state == ServiceState.Stopping and not runtime.kill_sent then
+    runtime.kill_sent = true
+    runtime.action_at = now + 1000
+    return signal_child(runtime, SIGKILL)
+  end
+  io.stderr:write('theseusd: could not stop child after readiness timeout\n')
+  return false
 end
 
 local function write_all(fd: cint, text: string): boolean
@@ -380,10 +502,10 @@ local function stop_child(runtime: *Runtime): boolean
   if runtime.pidfd < 0 then return true end
   runtime.state = ServiceState.Stopping
   -- ESRCH is expected if the child exits before the signal is sent.
-  if not pidfd_send_signal(runtime.pidfd, SIGTERM) and errno ~= ESRCH then return false end
+  if not signal_child(runtime, SIGTERM) then return false end
   local ready = wait_for_exit(runtime.pidfd, 1000)
   if ready == 0 then
-    if not pidfd_send_signal(runtime.pidfd, SIGKILL) and errno ~= ESRCH then return false end
+    if not signal_child(runtime, SIGKILL) then return false end
     ready = wait_for_exit(runtime.pidfd, 1000)
   end
   if ready <= 0 or not reap(runtime) then return false end
@@ -407,8 +529,7 @@ local function serve(listener: cint, shutdown_fd: cint, runtime: *Runtime, argv:
   local status_request = 'TQ1\tSTATUS\t' .. runtime.service.name .. '\n'
   while true do
     fds[2].fd = runtime.pidfd
-    local deadline: integer = 0
-    if runtime.state == ServiceState.Backoff then deadline = runtime.restart_at end
+    local deadline = runtime.action_at
     local now = monotonic_ms()
     local free_slot: integer = -1
     for slot: integer = 0, MaxClients - 1 do
@@ -465,10 +586,7 @@ local function serve(listener: cint, shutdown_fd: cint, runtime: *Runtime, argv:
         elseif errno ~= EAGAIN and errno ~= EINTR then exit_code = 79; break end
       elseif fds[0].revents ~= 0 then exit_code = 79; break end
 
-      if runtime.state == ServiceState.Backoff and monotonic_ms() >= runtime.restart_at then
-        runtime.restarts = runtime.restarts + 1
-        if not spawn(runtime, argv, child_mask) then exit_code = 80; break end
-      end
+      if not advance_service(runtime, argv, child_mask) then exit_code = 80; break end
     end
   end
 
@@ -488,13 +606,23 @@ local function main(): integer
   ok, service = load_service(records, arg[1])
   if not ok then io.stderr:write('theseusd: unknown service: ', arg[1], '\n'); return 3 end
   if service.readiness == ReadinessKind.UnixSocket then
-    io.stderr:write('theseusd: unix-socket readiness is not implemented yet\n')
-    return 69
+    if #service.readiness_path == 0 then
+      io.stderr:write('theseusd: recompile the service to supply its unix-socket readiness path\n')
+      return 69
+    end
+    if not peer_pidfd_available() then
+      io.stderr:write('theseusd: unix-socket readiness requires kernel SO_PEERPIDFD support\n')
+      return 69
+    end
   end
   local argv: ExecArgv
   if not decode_argv(service.argv_serialized, &argv) then return 65 end
 
   local path = socket_path()
+  if service.readiness_path == path then
+    io.stderr:write('theseusd: readiness and control sockets need distinct paths\n')
+    return 65
+  end
   if c_access((@cstring)(path), 0) == 0 then
     io.stderr:write('theseusd: refusing pre-existing control socket path: ', path, '\n')
     return 73

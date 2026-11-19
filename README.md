@@ -43,12 +43,13 @@ Generated C from Nelua is a build artifact, never maintained source. Shell scrip
 
 The userspace daemon supervises one foreground child per invocation. It
 tracks the child with a Linux pidfd, applies bounded restart policy, and
-serves status and shutdown requests over a local Unix socket. The native
+serves status and shutdown requests over a local Unix socket. For
+services with Unix socket readiness, the daemon waits for a listener
+owned by the supervised process. The native
 target planner validates dependencies and produces an execution order.
 
-Target execution, Unix socket readiness for services, descendant
-ownership, and compatibility with the Alpine OpenRC corpus are still
-pending. The rescue entry point below is separate from the service
+Target execution, descendant ownership, and compatibility with the
+Alpine OpenRC corpus are still pending. The rescue entry point below is separate from the service
 supervisor.
 
 ## Early boot in nebox

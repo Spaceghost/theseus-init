@@ -1,3 +1,5 @@
+## cflags '-D_GNU_SOURCE'
+
 -- Black-box control socket regression tests and a SIGTERM-resistant child.
 
 require 'arg'
@@ -6,6 +8,10 @@ require 'os'
 require 'string'
 
 local function c_socket(domain: cint, kind: cint, protocol: cint): cint <cimport 'socket', nodecl, cinclude '<sys/socket.h>'> end
+local function c_bind(fd: cint, address: pointer, length: cuint): cint <cimport 'bind', nodecl, cinclude '<sys/socket.h>'> end
+local function c_listen(fd: cint, backlog: cint): cint <cimport 'listen', nodecl, cinclude '<sys/socket.h>'> end
+local function c_accept(fd: cint, address: pointer, length: pointer): cint <cimport 'accept', nodecl, cinclude '<sys/socket.h>'> end
+local function c_usleep(delay: cuint): cint <cimport 'usleep', nodecl, cinclude '<unistd.h>'> end
 local function c_connect(fd: cint, address: pointer, length: cuint): cint <cimport 'connect', nodecl, cinclude '<sys/socket.h>'> end
 local function c_shutdown(fd: cint, how: cint): cint <cimport 'shutdown', nodecl, cinclude '<sys/socket.h>'> end
 local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
@@ -25,11 +31,16 @@ local Pollfd = @record{fd: cint, events: cshort, revents: cshort}
 local function c_poll(fds: *Pollfd, count: culong, timeout_ms: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
 local SockaddrUn = @record{sun_family: cushort, sun_path: [108]cchar}
 
-local function connect(): cint
-  local path = os.getenv('THESEUS_SOCKET')
-  assert(#path > 0 and #path <= 100, 'test requires THESEUS_SOCKET')
+local function endpoint(path: string): SockaddrUn
+  assert(#path > 0 and #path <= 107, 'test socket path length out of range')
   local address: SockaddrUn = {sun_family = (@cushort)(AF_UNIX)}
   for i: isize = 1, #path do address.sun_path[i - 1] = (@cchar)(string.byte(path, i)) end
+  return address
+end
+
+local function connect(): cint
+  local path = os.getenv('THESEUS_SOCKET')
+  local address = endpoint(path)
   local fd = c_socket(AF_UNIX, SOCK_STREAM, 0)
   assert(fd >= 0, 'socket failed')
   assert(c_connect(fd, &address, (@cuint)(2 + #path + 1)) == 0, 'connect failed')
@@ -65,6 +76,27 @@ if arg[1] == 'ignore-term' then
   assert(marker:isopen(), 'failed to create readiness marker')
   marker:close()
   while true do c_pause() end
+end
+
+if arg[1] == 'listen' then
+  local path = arg[2]
+  if #arg >= 3 then
+    while true do
+      local gate = io.open(arg[3], 'r')
+      if gate:isopen() then gate:close(); break end
+      c_usleep(10000)
+    end
+  end
+  local address = endpoint(path)
+  local fd = c_socket(AF_UNIX, SOCK_STREAM, 0)
+  assert(fd >= 0, 'readiness fixture socket failed')
+  assert(c_bind(fd, &address, (@cuint)(2 + #path + 1)) == 0, 'readiness fixture bind failed')
+  assert(c_listen(fd, 4) == 0, 'readiness fixture listen failed')
+  while true do
+    local connection = c_accept(fd, nilptr, nilptr)
+    assert(connection >= 0, 'readiness fixture accept failed')
+    c_close(connection)
+  end
 end
 
 local request = 'TQ1\tSTATUS\tsleep-stop\n'

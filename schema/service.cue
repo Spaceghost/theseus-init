@@ -29,6 +29,8 @@ import (
   } | {
     kind: "unix-socket"
     path: #SafeText & =~"^/"
+    _pathBytes: len(path) & <=107
+    timeoutMs: *30000 | int & >=1 & <=600000
   }
 }
 
@@ -37,5 +39,11 @@ import (
 #CompiledService: {
   service: #Service
   let argvSeparator = "\u001f"
-  compiled: "TSC2\t\(service.name)\t\(strings.Join(service.exec, argvSeparator))\t\(service.restart)\t\(service.maxRestarts)\t\(service.readiness.kind)"
+  let fields = "\(service.name)\t\(strings.Join(service.exec, argvSeparator))\t\(service.restart)\t\(service.maxRestarts)\t\(service.readiness.kind)"
+  if service.readiness.kind == "unix-socket" {
+    compiled: "TSC4\t\(fields)\t\(service.readiness.path)\t\(service.readiness.timeoutMs)"
+  }
+  if service.readiness.kind != "unix-socket" {
+    compiled: "TSC2\t\(fields)"
+  }
 }
