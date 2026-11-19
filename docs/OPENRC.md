@@ -166,3 +166,35 @@ with SIGKILL while its log output is blocked. The log writer must
 exit with the daemon. The next launch must bring the service up again
 after clearing the previous processes, then shut down without
 leaving an instance cgroup or runtime files.
+
+## Qualify complete Alpine boots and shutdowns
+
+1. Use an isolated, disk-backed Alpine VM with its normal BusyBox init
+   and OpenRC boot and shutdown runlevels. Install the same signed
+   packages and prepare the test runlevels, binaries, and target graph
+   described above. Configure OpenRC's unified cgroup mode. Keep the
+   test paths and network isolated from host services.
+2. Run the mixed soak from the VM console after the default runlevel
+   completes. Use a writable cgroup v2 subtree dedicated to the test.
+
+   ~~~sh
+   mkdir /sys/fs/cgroup/theseus-boot
+   THESEUS_GRAPH=/opt/theseus/test/graph.tsc \
+   THESEUS_SOCKET=/opt/theseus/test/control.sock \
+   THESEUS_CGROUP_ROOT=/sys/fs/cgroup/theseus-boot \
+     /opt/theseus/bin/alpine-qualification /opt/theseus/bin /opt/theseus/test 45 --boot
+   ~~~
+
+   The boot check requires Linux PID 1 to be init, OpenRC to have
+   completed bootmisc and localmount, and the active runlevel to be
+   default. The QUAL1 boot record reports the kernel's boot identifier.
+   Run the crash-recovery test separately before shutdown to exercise
+   abrupt supervisor failure in the same VM.
+3. Leave PostgreSQL, Cronie, and Mosquitto active in theseus-b, write a
+   test transaction to PostgreSQL, and ask the guest to reboot or
+   power off normally. Capture the VM's serial output through shutdown.
+   Boot the same disk again, verify a new kernel boot identifier, check
+   that pg_controldata reports a clean shutdown before starting
+   PostgreSQL, then query the previous transaction.
+
+This gate exercises the service supervisor as a userspace process.

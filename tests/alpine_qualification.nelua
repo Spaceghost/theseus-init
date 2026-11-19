@@ -312,14 +312,27 @@ local function qualify_recovery(bindir: string, work: string, root: string)
   assert(removed_first and removed_second, 'cannot reset tree fixture')
 end
 
-assert(#arg == 3 or (#arg == 4 and arg[4] == '--recovery'),
-       'usage: alpine-qualification LIVE_BINARY_DIRECTORY WORK_DIRECTORY SECONDS [--recovery]')
+local function verify_alpine_boot(bindir: string)
+  assert(content('/proc/1/comm') == 'init\n', 'an Alpine system boot must be managed by init')
+  assert(exists('/run/openrc/started/bootmisc') and exists('/run/openrc/started/localmount'),
+         'OpenRC boot services did not complete')
+  local reader = (@cstring)(bindir .. '/the')
+  local status, level = execute_test_command({'/bin/busybox', 'timeout', '2', reader, 'openrc-runlevel'}, true)
+  assert(status == 0 and level == 'default\n', 'expected OpenRC default at the start of qualification')
+  local id = content('/proc/sys/kernel/random/boot_id')
+  assert(#id == 37 and string.sub(id, -1) == '\n', 'invalid Linux boot identifier')
+  print('QUAL1', 'boot', string.sub(id, 1, 36), 'init')
+end
+
+assert(#arg == 3 or (#arg == 4 and (arg[4] == '--recovery' or arg[4] == '--boot')),
+       'usage: alpine-qualification LIVE_BINARY_DIRECTORY WORK_DIRECTORY SECONDS [--recovery|--boot]')
 local bindir, work = arg[1], arg[2]
 local seconds = tonumber(arg[3]) or 0
 local root = os.getenv('THESEUS_CGROUP_ROOT')
 assert(seconds >= 1 and seconds <= 7200 and seconds % 1 == 0, 'invalid duration')
 assert(string.sub(root, 1, #'/sys/fs/cgroup/') == '/sys/fs/cgroup/', 'a real delegated cgroup is required')
-local recovery = #arg == 4
+local recovery = #arg == 4 and arg[4] == '--recovery'
+if #arg == 4 and arg[4] == '--boot' then verify_alpine_boot(bindir) end
 if recovery then
   assert(os.getenv('THESEUS_RECOVERY_DIR') == work .. '/instance', 'a private instance directory is required')
   assert(os.getenv('THESEUS_SOCKET') == work .. '/instance/control.sock', 'control socket must be in the instance directory')
