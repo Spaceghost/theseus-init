@@ -9,7 +9,8 @@ that mounts the root must pass the selected executable to PID 1.
 
 For x86-64 Linux, use a successful release-bundle workflow run
 for the exact commit you intend to boot. The archive contains
-the static executables, build input versions, runtime license notices,\nand this guide.
+the static executables, build input versions, runtime license notices,
+and this guide.
 Site configuration supplies the compiled graph.
 
 ~~~sh
@@ -53,8 +54,11 @@ install -d -m 0755 /opt/theseus/releases
    ~~~
 
    The installer copies the files into a private sibling directory,
-   validates the compiled target, and publishes the complete directory
-   under the release ID. It refuses to overwrite a published release.
+   validates the default target and its runtime records, then publishes
+   the complete directory under the release ID. It checks command and
+   probe arguments and detects readiness socket conflicts before publishing.
+   The supervisor checks kernel support and starts the services at boot.
+   It refuses to overwrite a published release.
    The target filesystem must support atomic rename with no replacement
    and directory sync. Run the installer on trusted local filesystems
    from verified build inputs. Use a new ID to stage a corrected bundle.
@@ -71,7 +75,8 @@ install -d -m 0755 /opt/theseus/releases
    On Alpine add theseus.openrc=1 for OpenRC. The init executable uses
    theseusd and graph.tsc from its own directory. The matching client
    and the symlink live there too. A release ID and its directory
-   must remain stable while an entry refers to them. Select the\n   installed executable by its actual path.
+   must remain stable while an entry refers to them. Select the
+   installed executable by its actual path.
 4. Trial the candidate using the boot menu or a boot-once mechanism.
    Keep the console open, verify the target and real application
    readiness, and test a normal reboot. Only then select the candidate

@@ -172,6 +172,35 @@ jobs:
           code=0
           build/theseus-install "$work/releases" broken "$work/input" || code=$?
           test "$code" -eq 65
+
+          reject_runtime_graph() {
+            code=0
+            build/theseus-install "$work/releases" broken-runtime "$work/input" 2>"$work/rejection.log" || code=$?
+            test "$code" -eq 65
+            grep -F "$1" "$work/rejection.log"
+          }
+          printf 'TSC3\tapp\t/bin/true\tbogus\t0\tnone\t\t\t\t\nTGT1\tdefault\tapp\n' >"$work/input/graph.tsc"
+          reject_runtime_graph 'invalid runtime fields for app'
+
+          argv=/bin/true
+          for i in $(seq 1 32); do argv="$argv$(printf '\037x')"; done
+          printf 'TSC3\tapp\t%s\tnever\t0\tnone\t\t\t\t\nTGT1\tdefault\tapp\n' "$argv" >"$work/input/graph.tsc"
+          reject_runtime_graph 'invalid argv for app'
+          printf 'TSC7\tapp\t/bin/true\tnever\t0\tunix-socket\t/run/app.sock\t1000\t%s\t100\t500\t\t\t\t\nTGT1\tdefault\tapp\n' "$argv" >"$work/input/graph.tsc"
+          reject_runtime_graph 'invalid probe argv for app'
+
+          printf 'TSC3\tapp\t/bin/true\tnever\t0\tunix-socket\t\t\t\t\nTGT1\tdefault\tapp\n' >"$work/input/graph.tsc"
+          reject_runtime_graph 'recompile the service to supply its unix-socket readiness path'
+          printf 'TSC5\tapp\t/bin/true\tnever\t0\tunix-socket\t/run/theseus-init/control.sock\t1000\t\t\t\t\nTGT1\tdefault\tapp\n' >"$work/input/graph.tsc"
+          reject_runtime_graph 'readiness and control sockets need distinct paths'
+          {
+            for name in app sidecar; do
+              printf 'TSC5\t%s\t/bin/true\tnever\t0\tunix-socket\t/run/shared.sock\t1000\t\t\t\t\n' "$name"
+            done
+            printf 'TGT1\tdefault\tapp,sidecar\n'
+          } >"$work/input/graph.tsc"
+          reject_runtime_graph 'multiple services declare readiness at /run/shared.sock'
+
           cmp "$work/original.tsc" "$work/releases/known/graph.tsc"
           cp "$work/original.tsc" "$work/input/graph.tsc"
           mv "$work/input/theseusd" "$work/worker"

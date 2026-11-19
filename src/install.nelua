@@ -6,6 +6,7 @@ require 'io'
 require 'os'
 require 'src.theseus.graph'
 require 'src.theseus.install_paths'
+require 'src.theseus.runtime_service'
 
 local Stat: type <cimport 'struct stat', nodecl, cinclude '<sys/stat.h>'> = @record{st_mode: cuint}
 local function c_open(path: cstring, flags: cint): cint <cimport 'open', nodecl, cinclude '<fcntl.h>'> end
@@ -74,11 +75,25 @@ local function copy_file(source: cint, destination: cint, name: cstring, mode: c
   return nonempty and c_fchmod(output, mode) == 0 and c_fsync(output) == 0
 end
 
-local function valid_graph(stage: cint): boolean
+local function graph_error(stage: cint): string
   local path = '/proc/self/fd/' .. tostring(stage) .. '/graph.tsc'
   local graph: NativeGraph
   local plan: NativePlan
-  return load_native_graph(path, &graph) and plan_native_target(&graph, 'default', &plan) == 0
+  if not load_native_graph(path, &graph) or plan_native_target(&graph, 'default', &plan) ~= 0 then
+    return 'invalid compiled default target'
+  end
+  local readiness_paths: RuntimeReadinessPaths
+  for i: integer = 0, plan.count - 1 do
+    local record = &graph.services[plan.order[i]]
+    local ok, service = parse_runtime_service(record.runtime_record)
+    if not ok then return 'invalid runtime fields for ' .. record.name end
+    local argv: ExecArgv
+    local probe: ExecArgv
+    local code, message = prepare_runtime_service(&service, &argv, &probe,
+                                                  TheseusControlSocket, &readiness_paths)
+    if code ~= 0 then return message end
+  end
+  return ''
 end
 
 local function install(root: cint, source: cint, release: string): integer
@@ -105,7 +120,8 @@ local function install(root: cint, source: cint, release: string): integer
       return fail(74, 'cannot stage ' .. tostring(Files[i]))
     end
   end
-  if not valid_graph(stage) then return fail(65, 'invalid compiled default target') end
+  local problem = graph_error(stage)
+  if #problem > 0 then return fail(65, problem) end
   if c_symlinkat('theseus', stage, 'the') ~= 0 or c_fchmod(stage, 0x16d) ~= 0 or c_fsync(stage) ~= 0 then
     return fail(74, 'cannot finalize the staged bundle')
   end

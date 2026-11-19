@@ -1,6 +1,8 @@
 require 'string'
 
 global TheseusReleaseRoot <comptime> = '/opt/theseus/releases'
+global TheseusRuntimeDir <comptime> = '/run/theseus-init'
+global TheseusControlSocket <comptime> = '/run/theseus-init/control.sock'
 
 global function valid_theseus_release_id(id: string): boolean
   return #id <= 64 and string.find(id, '^[a-zA-Z0-9][a-zA-Z0-9._-]*$') == 1

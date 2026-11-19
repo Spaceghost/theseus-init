@@ -1,0 +1,128 @@
+-- Runtime record decoding and boot-independent validation.
+require 'string'
+require 'src.theseus.graph'
+require 'src.theseus.readiness'
+
+global RestartPolicy = @enum{Never = 0, OnFailure, Always}
+global ReadinessKind = @enum{None = 0, Pid, UnixSocket}
+
+global RuntimeService = @record{
+  name: string,
+  argv_serialized: string,
+  restart: RestartPolicy,
+  max_restarts: integer,
+  readiness: ReadinessKind,
+  readiness_options: ReadinessOptions,
+}
+
+global ExecArgv = @record{
+  storage: [32]string,
+  cargs: [33]cstring,
+  count: integer,
+}
+
+global RuntimeReadinessPaths = @record{
+  paths: [NativeMaxServices]string,
+  count: integer,
+}
+
+local function next_field(line: string, cursor: isize): (string, isize)
+  local first, last = string.find(line, '\t', cursor, true)
+  if first == 0 then return string.sub(line, cursor), 0 end
+  return string.sub(line, cursor, first - 1), last + 1
+end
+
+local function parse_decimal(text: string, maximum: integer): (boolean, integer)
+  if #text == 0 then return false, 0 end
+  local value: integer = 0
+  for i: isize = 1, #text do
+    local byte = string.byte(text, i)
+    if byte < 48 or byte > 57 then return false, 0 end
+    value = value * 10 + byte - 48
+    if value > maximum then return false, 0 end
+  end
+  return true, value
+end
+
+global function parse_runtime_service(line: string): (boolean, RuntimeService)
+  local service: RuntimeService
+  local cursor: isize = 1
+  local magic: string
+  magic, cursor = next_field(line, cursor)
+  if (magic ~= 'TSC2' and magic ~= 'TSC4' and magic ~= 'TSC6') or cursor == 0 then return false, service end
+  service.name, cursor = next_field(line, cursor)
+  if #service.name == 0 or cursor == 0 then return false, service end
+  service.argv_serialized, cursor = next_field(line, cursor)
+  if #service.argv_serialized == 0 or cursor == 0 then return false, service end
+  local restart: string
+  restart, cursor = next_field(line, cursor)
+  if restart == 'never' then service.restart = RestartPolicy.Never
+  elseif restart == 'on-failure' then service.restart = RestartPolicy.OnFailure
+  elseif restart == 'always' then service.restart = RestartPolicy.Always
+  else return false, service end
+  if cursor == 0 then return false, service end
+  local maximum: string
+  maximum, cursor = next_field(line, cursor)
+  if cursor == 0 then return false, service end
+  local ok: boolean
+  ok, service.max_restarts = parse_decimal(maximum, 1000000)
+  if not ok then return false, service end
+  local readiness: string
+  readiness, cursor = next_field(line, cursor)
+  if readiness == 'none' then service.readiness = ReadinessKind.None
+  elseif readiness == 'pid' then service.readiness = ReadinessKind.Pid
+  elseif readiness == 'unix-socket' then service.readiness = ReadinessKind.UnixSocket
+  else return false, service end
+  if magic == 'TSC2' then
+    if cursor ~= 0 then return false, service end
+  elseif service.readiness ~= ReadinessKind.UnixSocket or
+         not parse_readiness_options(line, cursor, magic == 'TSC6', &service.readiness_options) then
+    return false, service
+  end
+  return true, service
+end
+
+local function decode_argv(serialized: string, out: *ExecArgv): boolean
+  local cursor: isize = 1
+  local count: integer = 0
+  while cursor ~= 0 do
+    if count >= 32 then return false end
+    local first, last = string.find(serialized, '\31', cursor, true)
+    local item: string
+    if first == 0 then item = string.sub(serialized, cursor); cursor = 0
+    else item = string.sub(serialized, cursor, first - 1); cursor = last + 1 end
+    if (count == 0 and #item == 0) or string.find(item, '\0', 1, true) ~= 0 then
+      return false
+    end
+    out.storage[count] = item
+    out.cargs[count] = (@cstring)(out.storage[count])
+    count = count + 1
+  end
+  if count == 0 then return false end
+  out.cargs[count] = nilptr
+  out.count = count
+  return true
+end
+
+global function prepare_runtime_service(service: *RuntimeService, argv: *ExecArgv, probe: *ExecArgv,
+                                        control_path: string, readiness_paths: *RuntimeReadinessPaths): (integer, string)
+  if not decode_argv(service.argv_serialized, argv) then
+    return 65, 'invalid argv for ' .. service.name
+  end
+  local command = service.readiness_options.probe
+  if #command > 0 and (not decode_argv(command, probe) or #probe.storage[0] < 2) then
+    return 65, 'invalid probe argv for ' .. service.name
+  end
+  if service.readiness ~= ReadinessKind.UnixSocket then return 0, '' end
+  local endpoint = service.readiness_options.path
+  if #endpoint == 0 then return 69, 'recompile the service to supply its unix-socket readiness path' end
+  if endpoint == control_path then return 65, 'readiness and control sockets need distinct paths' end
+  for i: integer = 0, readiness_paths.count - 1 do
+    if readiness_paths.paths[i] == endpoint then
+      return 65, 'multiple services declare readiness at ' .. endpoint
+    end
+  end
+  readiness_paths.paths[readiness_paths.count] = endpoint
+  readiness_paths.count = readiness_paths.count + 1
+  return 0, ''
+end

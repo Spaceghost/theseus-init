@@ -84,8 +84,6 @@ local RB_AUTOBOOT: cint <cimport, nodecl, cinclude '<sys/reboot.h>'>
 local RB_POWER_OFF: cint <cimport, nodecl, cinclude '<sys/reboot.h>'>
 
 local Console: cstring = '/dev/console'
-local RuntimeDir = '/run/theseus-init'
-local SocketPath = RuntimeDir .. '/control.sock'
 local Delegation = '/sys/fs/cgroup/theseus-init'
 local worker_path = '/sbin/theseusd'
 local graph_path = '/etc/theseus/graph.tsc'
@@ -165,7 +163,7 @@ local function provision(openrc: boolean): boolean
   elseif not mount_type('cgroup2', '/sys/fs/cgroup', flags, CGROUP2_SUPER_MAGIC) then
     return false
   end
-  return directory((@cstring)(RuntimeDir), 0x1c0) and directory((@cstring)(Delegation), 0x1c0)
+  return directory((@cstring)(TheseusRuntimeDir), 0x1c0) and directory((@cstring)(Delegation), 0x1c0)
 end
 
 local function signal_queue(): cint
@@ -235,8 +233,8 @@ local function launch(rescue: boolean): cint
   else
     if c_setenv('THESEUS_GRAPH', (@cstring)(graph_path), 1) ~= 0 or
        c_setenv('THESEUS_CGROUP_ROOT', (@cstring)(Delegation), 1) ~= 0 or
-       c_setenv('THESEUS_RECOVERY_DIR', (@cstring)(RuntimeDir), 1) ~= 0 or
-       c_setenv('THESEUS_SOCKET', (@cstring)(SocketPath), 1) ~= 0 then c_exit(126) end
+       c_setenv('THESEUS_RECOVERY_DIR', (@cstring)(TheseusRuntimeDir), 1) ~= 0 or
+       c_setenv('THESEUS_SOCKET', (@cstring)(TheseusControlSocket), 1) ~= 0 then c_exit(126) end
     local worker = (@cstring)(worker_path)
     local argv: [4]cstring = {worker, '--target', 'default', nilptr}
     c_execv(worker, &argv[0])
@@ -251,7 +249,7 @@ local function reclaim(): boolean
   defer c_close(root) end
   local instance: RecoverableInstance = {dir = -1, scope = -1}
   defer recovery_close(&instance) end
-  return recovery_reclaim(&instance, SocketPath, RuntimeDir, root) == 0
+  return recovery_reclaim(&instance, TheseusControlSocket, TheseusRuntimeDir, root) == 0
 end
 
 -- Return whether any child may remain. Batching avoids starving the signal queue.

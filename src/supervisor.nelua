@@ -9,7 +9,7 @@ require 'math'
 require 'os'
 require 'string'
 require 'stringbuilder'
-require 'src.theseus.readiness'
+require 'src.theseus.runtime_service'
 require 'src.theseus.graph'
 require 'src.theseus.cgroup'
 require 'src.theseus.recovery'
@@ -97,26 +97,9 @@ local SIGKILL: cint <cimport, nodecl, cinclude '<signal.h>'>
 
 local SockaddrUn = @record{sun_family: cushort, sun_path: [108]cchar}
 local ServiceState = @enum{Planned = 0, Starting, Ready, Running, Stopped, Failed, Backoff, Stopping}
-local RestartPolicy = @enum{Never = 0, OnFailure, Always}
-local ReadinessKind = @enum{None = 0, Pid, UnixSocket}
-
-local Service = @record{
-  name: string,
-  argv_serialized: string,
-  restart: RestartPolicy,
-  max_restarts: integer,
-  readiness: ReadinessKind,
-  readiness_options: ReadinessOptions,
-}
-
-local ExecArgv = @record{
-  storage: [32]string,
-  cargs: [33]cstring,
-  count: integer,
-}
 
 local Runtime = @record{
-  service: Service,
+  service: RuntimeService,
   status_request: string,
   state: ServiceState,
   pid: cint,
@@ -170,95 +153,17 @@ local function transition(runtime: *Runtime, state: ServiceState, reason: string
   runtime.state = state
 end
 
-local function next_field(line: string, cursor: isize): (string, isize)
-  local first, last = string.find(line, '\t', cursor, true)
-  if first == 0 then return string.sub(line, cursor), 0 end
-  return string.sub(line, cursor, first - 1), last + 1
-end
-
-local function parse_decimal(text: string, maximum: integer): (boolean, integer)
-  if #text == 0 then return false, 0 end
-  local value: integer = 0
-  for i: isize = 1, #text do
-    local byte = string.byte(text, i)
-    if byte < 48 or byte > 57 then return false, 0 end
-    value = value * 10 + byte - 48
-    if value > maximum then return false, 0 end
-  end
-  return true, value
-end
-
-local function parse_service(line: string): (boolean, Service)
-  local service: Service
-  local cursor: isize = 1
-  local magic: string
-  magic, cursor = next_field(line, cursor)
-  if (magic ~= 'TSC2' and magic ~= 'TSC4' and magic ~= 'TSC6') or cursor == 0 then return false, service end
-  service.name, cursor = next_field(line, cursor)
-  if #service.name == 0 or cursor == 0 then return false, service end
-  service.argv_serialized, cursor = next_field(line, cursor)
-  if #service.argv_serialized == 0 or cursor == 0 then return false, service end
-  local restart: string
-  restart, cursor = next_field(line, cursor)
-  if restart == 'never' then service.restart = RestartPolicy.Never
-  elseif restart == 'on-failure' then service.restart = RestartPolicy.OnFailure
-  elseif restart == 'always' then service.restart = RestartPolicy.Always
-  else return false, service end
-  if cursor == 0 then return false, service end
-  local maximum: string
-  maximum, cursor = next_field(line, cursor)
-  if cursor == 0 then return false, service end
-  local ok: boolean
-  ok, service.max_restarts = parse_decimal(maximum, 1000000)
-  if not ok then return false, service end
-  local readiness: string
-  readiness, cursor = next_field(line, cursor)
-  if readiness == 'none' then service.readiness = ReadinessKind.None
-  elseif readiness == 'pid' then service.readiness = ReadinessKind.Pid
-  elseif readiness == 'unix-socket' then service.readiness = ReadinessKind.UnixSocket
-  else return false, service end
-  if magic == 'TSC2' then
-    if cursor ~= 0 then return false, service end
-  elseif service.readiness ~= ReadinessKind.UnixSocket or
-         not parse_readiness_options(line, cursor, magic == 'TSC6', &service.readiness_options) then
-    return false, service
-  end
-  return true, service
-end
-
-local function decode_argv(serialized: string, out: *ExecArgv): boolean
-  local cursor: isize = 1
-  local count: integer = 0
-  while cursor ~= 0 do
-    if count >= 32 then return false end
-    local first, last = string.find(serialized, '\31', cursor, true)
-    local item: string
-    if first == 0 then item = string.sub(serialized, cursor); cursor = 0
-    else item = string.sub(serialized, cursor, first - 1); cursor = last + 1 end
-    if (count == 0 and #item == 0) or string.find(item, '\0', 1, true) ~= 0 then
-      return false
-    end
-    out.storage[count] = item
-    out.cargs[count] = (@cstring)(out.storage[count])
-    count = count + 1
-  end
-  if count == 0 then return false end
-  out.cargs[count] = nilptr
-  out.count = count
-  return true
-end
-
-local function load_service(path: string, wanted: string): (boolean, Service)
+local function load_service(path: string, wanted: string): (boolean, RuntimeService)
   local file = io.open(path, 'r')
-  if not file:isopen() then local empty: Service; return false, empty end
+  if not file:isopen() then local empty: RuntimeService; return false, empty end
   for line in file:lines() do
     local ok: boolean
-    local service: Service
-    ok, service = parse_service(line)
+    local service: RuntimeService
+    ok, service = parse_runtime_service(line)
     if ok and service.name == wanted then file:close(); return true, service end
   end
   file:close()
-  local empty: Service
+  local empty: RuntimeService
   return false, empty
 end
 
@@ -1052,7 +957,7 @@ local function load_target(name: string, group: *Supervision): integer
   group.needs = plan.needs
   for i: integer = 0, plan.count - 1 do
     local member = plan.order[i]
-    local ok, service = parse_service(graph.services[member].runtime_record)
+    local ok, service = parse_runtime_service(graph.services[member].runtime_record)
     if not ok then
       daemon_log_error('theseusd: invalid runtime fields for ', graph.services[member].name, '\n')
       return 65
@@ -1074,44 +979,19 @@ local function load_single(name: string, group: *Supervision): integer
 end
 
 local function prepare(group: *Supervision, path: string): integer
-  local socket_probes = false
+  local readiness_paths: RuntimeReadinessPaths
   for i: integer = 0, group.count - 1 do
     local runtime = &group.runtimes[i]
-    local service = &runtime.service
-    if not decode_argv(service.argv_serialized, &group.arguments[i]) then
-      daemon_log_error('theseusd: invalid argv for ', service.name, '\n')
-      return 65
-    end
+    local code, message = prepare_runtime_service(&runtime.service, &group.arguments[i],
+                                                  &runtime.probe_args, path, &readiness_paths)
+    if code ~= 0 then daemon_log_error('theseusd: ', message, '\n'); return code end
     runtime.pidfd = -1
     runtime.execfd = -1
     runtime.probe_fd = -1
-    local probe = service.readiness_options.probe
-    if #probe > 0 and (not decode_argv(probe, &runtime.probe_args) or #runtime.probe_args.storage[0] < 2) then
-      daemon_log_error('theseusd: invalid probe argv for ', service.name, '\n')
-      return 65
-    end
     runtime.last_exit = -1
-    runtime.status_request = 'TQ1\tSTATUS\t' .. service.name .. '\n'
-    if service.readiness == ReadinessKind.UnixSocket then
-      local endpoint = service.readiness_options.path
-      if #endpoint == 0 then
-        daemon_log_error('theseusd: recompile the service to supply its unix-socket readiness path\n')
-        return 69
-      end
-      if endpoint == path then
-        daemon_log_error('theseusd: readiness and control sockets need distinct paths\n')
-        return 65
-      end
-      for j: integer = 0, i - 1 do
-        if group.runtimes[j].service.readiness_options.path == endpoint then
-          daemon_log_error('theseusd: multiple services declare readiness at ', endpoint, '\n')
-          return 65
-        end
-      end
-      socket_probes = true
-    end
+    runtime.status_request = 'TQ1\tSTATUS\t' .. runtime.service.name .. '\n'
   end
-  if socket_probes and not peer_pidfd_available() then
+  if readiness_paths.count > 0 and not peer_pidfd_available() then
     daemon_log_error('theseusd: unix-socket readiness requires kernel SO_PEERPIDFD support\n')
     return 69
   end
