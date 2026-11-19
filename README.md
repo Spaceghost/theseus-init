@@ -47,7 +47,7 @@ Generated C from Nelua is a build artifact, never maintained source. Shell scrip
 The userspace daemon supervises an individual foreground service or a
 native target. It tracks direct children with Linux pidfds, applies
 bounded restart policy, and serves status and shutdown requests over
-a local Unix socket. A target uses the validated dependency order and
+a local Unix socket. It reaps adopted descendants while running. A target uses the validated dependency order and
 waits for the configured service readiness before admitting subsequent
 services. Run it with `theseusd --target TARGET`.
 

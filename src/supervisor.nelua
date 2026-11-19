@@ -17,6 +17,9 @@ local function c_execv(file: cstring, argv: *cstring): cint <cimport 'execv', no
 local function c_execvp(file: cstring, argv: *cstring): cint <cimport 'execvp', nodecl, cinclude '<unistd.h>'> end
 local function c__exit(status: cint): void <cimport '_exit', nodecl, cinclude '<unistd.h>'> end
 local function c_waitpid(pid: cint, status: *cint, options: cint): cint <cimport 'waitpid', nodecl, cinclude '<sys/wait.h>'> end
+local ChildInfo: type <cimport 'siginfo_t', nodecl, cinclude '<signal.h>'> = @record{si_pid: cint}
+local function c_waitid(kind: cint, id: cuint, info: *ChildInfo, options: cint): cint <cimport 'waitid', nodecl, cinclude '<sys/wait.h>'> end
+local function c_prctl(option: cint, arg2: culong, arg3: culong, arg4: culong, arg5: culong): cint <cimport 'prctl', nodecl, cinclude '<sys/prctl.h>'> end
 local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
 local function c_kill(pid: cint, signal: cint): cint <cimport 'kill', nodecl, cinclude '<signal.h>'> end
 local function c_syscall2(number: clong, a1: clong, a2: clong): clong <cimport 'syscall', nodecl, cinclude '<unistd.h>'> end
@@ -67,6 +70,13 @@ local SIGCHLD: cint <cimport, nodecl, cinclude '<signal.h>'>
 local SIG_DFL: SignalHandler <cimport, nodecl, cinclude '<signal.h>'>
 local SIG_ERR: SignalHandler <cimport, nodecl, cinclude '<signal.h>'>
 local SIGINT: cint <cimport, nodecl, cinclude '<signal.h>'>
+local PR_SET_CHILD_SUBREAPER: cint <cimport, nodecl, cinclude '<sys/prctl.h>'>
+local P_ALL: cint <cimport, nodecl, cinclude '<sys/wait.h>'>
+local WEXITED: cint <cimport, nodecl, cinclude '<sys/wait.h>'>
+local WNOHANG: cint <cimport, nodecl, cinclude '<sys/wait.h>'>
+local WNOWAIT: cint <cimport, nodecl, cinclude '<sys/wait.h>'>
+local ECHILD: cint <cimport, nodecl, cinclude '<errno.h>'>
+local SFD_NONBLOCK: cint <cimport, nodecl, cinclude '<sys/signalfd.h>'>
 local SFD_CLOEXEC: cint <cimport, nodecl, cinclude '<sys/signalfd.h>'>
 local CLOCK_MONOTONIC: cint <cimport, nodecl, cinclude '<time.h>'>
 local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
@@ -147,6 +157,13 @@ local function state_name(state: ServiceState): string
   if state == ServiceState.Backoff then return 'BACKOFF' end
   if state == ServiceState.Stopping then return 'STOPPING' end
   return 'UNKNOWN'
+end
+
+local function transition(runtime: *Runtime, state: ServiceState, reason: string)
+  if runtime.state == state then return end
+  print('TE1', 'state', runtime.service.name, runtime.attempts,
+        state_name(runtime.state), state_name(state), reason)
+  runtime.state = state
 end
 
 local function next_field(line: string, cursor: isize): (string, isize)
@@ -277,6 +294,22 @@ local function open_shutdown_fd(child_mask: *Sigset): cint
   return c_signalfd(-1, &mask, SFD_CLOEXEC)
 end
 
+local function open_reap_fd(): cint
+  if c_prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) ~= 0 then return -1 end
+  local mask: Sigset
+  if c_sigemptyset(&mask) ~= 0 or c_sigaddset(&mask, SIGCHLD) ~= 0 or
+     c_sigprocmask(SIG_BLOCK, &mask, nilptr) ~= 0 then return -1 end
+  return c_signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK)
+end
+
+local function read_child_signal(fd: cint): boolean
+  -- The Linux signalfd ABI uses a 128-byte notification record.
+  local notification: [128]byte
+  local got = c_read(fd, &notification[0], #notification)
+  while got < 0 and errno == EINTR do got = c_read(fd, &notification[0], #notification) end
+  return got == #notification or (got < 0 and errno == EAGAIN)
+end
+
 local function wait_for_child(pid: cint, status: *cint): boolean
   local waited = c_waitpid(pid, status, 0)
   while waited < 0 and errno == EINTR do
@@ -286,11 +319,11 @@ local function wait_for_child(pid: cint, status: *cint): boolean
 end
 
 local function spawn(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset): boolean
-  runtime.state = ServiceState.Starting
   runtime.attempts = runtime.attempts + 1
+  transition(runtime, ServiceState.Starting, 'start')
   local handshake: [2]cint
   if c_pipe2(&handshake[0], O_CLOEXEC | O_NONBLOCK) ~= 0 then
-    runtime.state = ServiceState.Failed
+    transition(runtime, ServiceState.Failed, 'exec-pipe')
     return false
   end
   local pid = c_fork()
@@ -309,7 +342,7 @@ local function spawn(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset): b
   c_close(handshake[1])
   if pid < 0 then
     c_close(handshake[0])
-    runtime.state = ServiceState.Failed
+    transition(runtime, ServiceState.Failed, 'fork')
     return false
   end
   local pidfd = pidfd_open_for(pid)
@@ -318,7 +351,7 @@ local function spawn(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset): b
     c_kill(pid, SIGKILL)
     local status: cint = 0
     wait_for_child(pid, &status)
-    runtime.state = ServiceState.Failed
+    transition(runtime, ServiceState.Failed, 'pidfd')
     return false
   end
   runtime.pid = pid
@@ -354,8 +387,10 @@ local function record_exec(runtime: *Runtime): boolean
   elseif runtime.service.readiness == ReadinessKind.UnixSocket then
     runtime.action_at = monotonic_ms()
   else
-    if runtime.service.readiness == ReadinessKind.Pid then runtime.state = ServiceState.Ready end
-    runtime.state = ServiceState.Running
+    if runtime.service.readiness == ReadinessKind.Pid then
+      transition(runtime, ServiceState.Ready, 'pid-ready')
+    end
+    transition(runtime, ServiceState.Running, 'startup-complete')
     runtime.action_at = 0
   end
   return true
@@ -377,6 +412,7 @@ local function reap(runtime: *Runtime): boolean
   runtime.pidfd = -1
   runtime.pid = 0
   decode_wait(status, runtime)
+  print('TE1', 'service', runtime.service.name, runtime.attempts, 'exited', runtime.last_exit, runtime.last_signal)
   return true
 end
 
@@ -389,14 +425,14 @@ local function cancel_probe(runtime: *Runtime, now: integer): boolean
 end
 
 local function finish_exit(runtime: *Runtime)
-  runtime.state = runtime.exit_state
+  transition(runtime, runtime.exit_state, 'child-exit')
   runtime.drain_by = 0
   runtime.action_at = 0
   if should_restart(runtime) and runtime.restarts < runtime.service.max_restarts then
     local delay = (runtime.restarts + 1) * 10
     if delay > 1000 then delay = 1000 end
     runtime.action_at = monotonic_ms() + delay
-    runtime.state = ServiceState.Backoff
+    transition(runtime, ServiceState.Backoff, 'retry')
   end
 end
 
@@ -427,7 +463,7 @@ local function record_exit(runtime: *Runtime): boolean
     end
     print('TE1', 'ownership', runtime.service.name, runtime.attempts, 'draining')
   end
-  runtime.state = ServiceState.Stopping
+  transition(runtime, ServiceState.Stopping, 'drain')
   runtime.drain_by = now + 1000
   runtime.action_at = now + 10
   return true
@@ -498,9 +534,9 @@ local function signal_child(runtime: *Runtime, signal: cint): boolean
 end
 
 local function mark_ready(runtime: *Runtime)
-  runtime.state = ServiceState.Ready
+  transition(runtime, ServiceState.Ready, 'readiness-passed')
   print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'ready')
-  runtime.state = ServiceState.Running
+  transition(runtime, ServiceState.Running, 'startup-complete')
   runtime.action_at = 0
 end
 
@@ -589,7 +625,7 @@ local function advance_service(runtime: *Runtime, argv: *ExecArgv, child_mask: *
     if now >= runtime.ready_by then
       if not cancel_probe(runtime, now) then return false end
       print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'timeout')
-      runtime.state = ServiceState.Stopping
+      transition(runtime, ServiceState.Stopping, 'readiness-timeout')
       runtime.kill_sent = false
       runtime.action_at = now + 1000
       return signal_child(runtime, SIGTERM)
@@ -720,12 +756,16 @@ local function stop_probe(runtime: *Runtime): boolean
 end
 
 local function stop_child(runtime: *Runtime): boolean
-  runtime.state = ServiceState.Stopping
+  if runtime.pidfd < 0 and runtime.probe_fd < 0 and
+     runtime.state ~= ServiceState.Backoff and cgroup_state(&runtime.cgroup) == CgroupState.Empty then
+    return true
+  end
+  transition(runtime, ServiceState.Stopping, 'shutdown')
   local probe_stopped = stop_probe(runtime)
   local leader_stopped = stop_leader(runtime)
   local group_empty = drain_cgroup(runtime)
   if not probe_stopped or not leader_stopped or not group_empty then return false end
-  runtime.state = ServiceState.Stopped
+  transition(runtime, ServiceState.Stopped, 'shutdown-complete')
   return true
 end
 
@@ -761,7 +801,7 @@ local function advance_target(group: *Supervision, child_mask: *Sigset): integer
       end
     end
     if unavailable >= 0 then
-      runtime.state = ServiceState.Failed
+      transition(runtime, ServiceState.Failed, 'dependency-failed')
       print('TE1', 'target', group.name, 'skipped', runtime.service.name,
             group.runtimes[unavailable].service.name)
     elseif not spawn(runtime, &group.arguments[i], child_mask) then
@@ -794,15 +834,54 @@ local function reply_status(client: cint, request: string, group: *Supervision)
   write_all(client, 'TR1\tERROR\trequest\n')
 end
 
-local function serve(listener: cint, shutdown_fd: cint, group: *Supervision,
+local function reap_notified_child(group: *Supervision, pid: cint): boolean
+  for i: integer = 0, group.count - 1 do
+    local runtime = &group.runtimes[i]
+    if runtime.pid == pid then
+      if runtime.execfd >= 0 and not record_exec(runtime) then return false end
+      return record_exit(runtime)
+    end
+    if runtime.probe_pid == pid then return record_probe(runtime) end
+  end
+
+  local status: cint
+  if not wait_for_child(pid, &status) then return false end
+  local signal = status & 0x7f
+  local code: integer = -1
+  if signal == 0 then code = (status >> 8) & 0xff end
+  print('TE1', 'process', pid, 'adopted-exit', code, signal)
+  return true
+end
+
+local function reap_pending_children(group: *Supervision): (boolean, boolean)
+  -- SIGCHLD can coalesce. Drain waitable children in batches so the
+  -- control socket and startup deadlines also make progress under churn.
+  for _: integer = 1, 64 do
+    local info: ChildInfo <noinit>
+    info.si_pid = 0
+    local result = c_waitid(P_ALL, 0, &info, WEXITED | WNOHANG | WNOWAIT)
+    while result < 0 and errno == EINTR do
+      result = c_waitid(P_ALL, 0, &info, WEXITED | WNOHANG | WNOWAIT)
+    end
+    if result < 0 then return errno == ECHILD, false end
+    if info.si_pid == 0 then return true, false end
+    -- The exited child is still waitable, so this PID cannot be reused
+    -- between peeking at it and routing its status.
+    if not reap_notified_child(group, info.si_pid) then return false, false end
+  end
+  return true, true
+end
+
+local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *Supervision,
                      child_mask: *Sigset): (integer, cint)
-  local fds: [2 + MaxClients + 3 * NativeMaxServices]Pollfd
-  local first_child = 2 + MaxClients
+  local fds: [3 + MaxClients + 3 * NativeMaxServices]Pollfd
+  local first_child = 3 + MaxClients
   local first_exec = first_child + group.count
   local first_probe = first_exec + group.count
   local count = first_probe + group.count
   fds[0] = {fd = listener, events = POLLIN}
   fds[1] = {fd = shutdown_fd, events = POLLIN}
+  fds[2] = {fd = reap_fd, events = POLLIN}
   for i: integer = 0, group.count - 1 do
     fds[first_child + i].events = POLLIN
     fds[first_exec + i].events = POLLIN
@@ -810,11 +889,12 @@ local function serve(listener: cint, shutdown_fd: cint, group: *Supervision,
   end
   local clients: [MaxClients]ControlClient
   for slot: integer = 0, MaxClients - 1 do
-    fds[slot + 2] = {fd = -1, events = POLLIN}
+    fds[slot + 3] = {fd = -1, events = POLLIN}
   end
 
   local exit_code: integer = 0
   local shutdown_client: cint = -1
+  local more_exits = false
   while true do
     local deadline: integer = 0
     for i: integer = 0, group.count - 1 do
@@ -828,7 +908,7 @@ local function serve(listener: cint, shutdown_fd: cint, group: *Supervision,
     local now = monotonic_ms()
     local free_slot: integer = -1
     for slot: integer = 0, MaxClients - 1 do
-      local event = &fds[slot + 2]
+      local event = &fds[slot + 3]
       local expires = clients[slot].deadline
       if event.fd >= 0 and expires <= now then
         c_close(event.fd)
@@ -843,6 +923,7 @@ local function serve(listener: cint, shutdown_fd: cint, group: *Supervision,
     local timeout: cint = -1
     if deadline > now then timeout = (@cint)(deadline - now)
     elseif deadline ~= 0 then timeout = 0 end
+    if more_exits then timeout = 0 end
     local ready = c_poll(&fds[0], (@culong)(count), timeout)
     if ready < 0 then
       if errno ~= EINTR then exit_code = 79; break end
@@ -870,8 +951,18 @@ local function serve(listener: cint, shutdown_fd: cint, group: *Supervision,
       end
       if exit_code ~= 0 then break end
 
+      if fds[2].revents ~= 0 then
+        if (fds[2].revents & POLLIN) == 0 or not read_child_signal(reap_fd) then exit_code = 80; break end
+        more_exits = true
+      end
+      if more_exits then
+        local ok: boolean
+        ok, more_exits = reap_pending_children(group)
+        if not ok then exit_code = 80; break end
+      end
+
       for slot: integer = 0, MaxClients - 1 do
-        local event = &fds[slot + 2]
+        local event = &fds[slot + 3]
         if event.revents == 0 then continue end
         local state, request = read_request(event.fd, &clients[slot])
         if state == RequestState.Pending then continue end
@@ -893,7 +984,7 @@ local function serve(listener: cint, shutdown_fd: cint, group: *Supervision,
       if (fds[0].revents & POLLIN) ~= 0 then
         local fd = c_accept4(listener, nilptr, nilptr, SOCK_CLOEXEC | SOCK_NONBLOCK)
         if fd >= 0 then
-          fds[free_slot + 2].fd = fd
+          fds[free_slot + 3].fd = fd
           clients[free_slot].used = 0
           clients[free_slot].deadline = monotonic_ms() + ControlTimeout
         elseif errno ~= EAGAIN and errno ~= EINTR then exit_code = 79; break end
@@ -914,7 +1005,7 @@ local function serve(listener: cint, shutdown_fd: cint, group: *Supervision,
   end
 
   for slot: integer = 0, MaxClients - 1 do
-    local fd = fds[slot + 2].fd
+    local fd = fds[slot + 3].fd
     if fd >= 0 then c_close(fd) end
   end
   return exit_code, shutdown_client
@@ -1033,6 +1124,11 @@ local function main(): integer
   local child_mask: Sigset
   local shutdown_fd = open_shutdown_fd(&child_mask)
   if shutdown_fd < 0 then return 74 end
+  local reap_fd = open_reap_fd()
+  if reap_fd < 0 then
+    io.stderr:write('theseusd: cannot enable child subreaping\n')
+    return 84
+  end
   local listener = c_socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)
   if listener < 0 then return 74 end
   local address: SockaddrUn
@@ -1066,7 +1162,7 @@ local function main(): integer
       exit_code = 0
     end
     if exit_code == 0 then
-      exit_code, shutdown_client = serve(listener, shutdown_fd, &group, &child_mask)
+      exit_code, shutdown_client = serve(listener, shutdown_fd, reap_fd, &group, &child_mask)
     end
   end
 
@@ -1084,6 +1180,14 @@ local function main(): integer
     end
   end
   if root >= 0 then c_close(root) end
+  c_close(reap_fd)
+  local more = true
+  local reap_deadline = monotonic_ms() + 1000
+  while more do
+    local ok: boolean
+    ok, more = reap_pending_children(&group)
+    if not ok or (more and monotonic_ms() >= reap_deadline) then stopped = false; break end
+  end
   c_unlink((@cstring)(path))
   c_close(shutdown_fd)
   if shutdown_client >= 0 then
@@ -1092,9 +1196,10 @@ local function main(): integer
     c_close(shutdown_client)
   end
   if not stopped then
-    io.stderr:write('theseusd: failed to stop owned child\n')
+    io.stderr:write('theseusd: failed to complete child cleanup\n')
     return 81
   end
+  if group.target then print('TE1', 'target', group.name, 'stopped', exit_code) end
   print('daemon-stopped', group.name)
   return exit_code
 end

@@ -176,9 +176,8 @@ removes only the cgroups it created. Active work in sibling cgroups is
 outside the cleanup.
 
 The daemon reports assignments, placement failures, and drain progress
-as `TE1 ownership` events. The OS's reaper handles orphaned descendants
-after they exit. The daemon reaps its own leaders and confirms kernel
-cgroup emptiness before declaring cleanup successful.
+as `TE1 ownership` events. It confirms kernel cgroup emptiness before
+declaring resource cleanup successful.
 
 The delegation is for trusted services operating under the same
 process-management account. Use file permissions or credentials to
@@ -186,6 +185,33 @@ prevent services from moving themselves into other cgroups if that
 matters to their deployment. Leave the variable unset for direct-child
 pidfd supervision without a cgroup delegation. The one-shot runner
 and the OpenRC adapter keep their own process-management contracts.
+
+## Child reaping and lifecycle events
+
+The userspace daemon is a Linux child subreaper. Orphaned descendants
+are adopted by the daemon while it is running. It drains waitable
+children in bounded batches on SIGCHLD while preserving the pidfd
+handling for known service leaders and probes. A delegated cgroup
+owns process-tree termination. Without it, the daemon still reaps
+adopted descendants when they exit. Live unmanaged orphans can
+outlast a daemon shutdown and pass to the system reaper.
+
+The live daemon writes tab-separated lifecycle records to stdout.
+Each begins with `TE1` and a category. The following records give the
+ordered fields for state and exit events.
+
+| Category | Remaining fields |
+| --- | --- |
+| `state` | Service, attempt, previous state, next state, reason |
+| `service` | Service, attempt, `exited`, exit code, signal |
+| `process` | PID, `adopted-exit`, exit code, signal |
+
+A signal exit uses code `-1`. An ordinary exit uses signal `0`.
+Adopted exit records report a PID without assigning a service when
+the original parentage no longer identifies one. The daemon also
+emits the readiness, ownership and target records described above.
+The attempt increases on each service start. The legacy daemon log
+lines and control status reply remain available.
 
 ## PID 1 boundary
 

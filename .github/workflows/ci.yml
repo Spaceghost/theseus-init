@@ -206,6 +206,12 @@ jobs:
             exit 1
           fi
           grep -E '^daemon-stopped[[:space:]]+sleep-stop$' build/live/daemon.log
+          awk '$1 == "TE1" && $2 == "state" && $3 == "sleep-stop" && $4 == 1 {print $5, $6, $7}' \
+            build/live/daemon.log >build/live/transitions.txt
+          printf '%s\n' 'PLANNED STARTING start' 'STARTING READY pid-ready' \
+            'READY RUNNING startup-complete' 'RUNNING STOPPING shutdown' \
+            'STOPPING STOPPED shutdown-complete' | cmp - build/live/transitions.txt
+          grep -Fx "$(printf 'TE1\tservice\tsleep-stop\t1\texited\t-1\t15')" build/live/daemon.log
           trap - EXIT
 
       - name: Handle SIGTERM and reap a SIGTERM-resistant child
@@ -474,6 +480,44 @@ jobs:
           test -z "$(cat "/proc/$daemon_pid/task/$daemon_pid/children")"
           probe_pid="$(cat "$job_dir/slow-probe.pid")"
           test "$probe_pid" -gt 0 && test ! -e "/proc/$probe_pid"
+          timeout 4s build/live/theseus daemon-stop
+          wait "$daemon_pid"
+          test ! -e "$THESEUS_SOCKET"
+          trap - EXIT
+
+      - name: Reap adopted descendants while their service stays running
+        run: |
+          set -eux
+          job_dir="$(mktemp -d "$RUNNER_TEMP/orp.XXXXXXXX")"
+          export THESEUS_SOCKET="$job_dir/control.sock"
+          export THESEUS_RECORDS="$job_dir/services.tsc"
+          unset THESEUS_CGROUP_ROOT
+          printf 'TSC2\torphans\t%s\037orphan-burst\037%s\tnever\t0\tnone\n' \
+            "$PWD/build/live/control-test" "$job_dir" > "$THESEUS_RECORDS"
+          build/live/theseusd orphans >build/live/orphans.log 2>&1 &
+          daemon_pid=$!
+          trap 'touch "$job_dir/exit"; kill "$daemon_pid" 2>/dev/null || true; wait "$daemon_pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 100); do
+            if test -f "$job_dir/adopted"; then break; fi
+            kill -0 "$daemon_pid"
+            sleep 0.02
+          done
+          test -f "$job_dir/adopted"
+          test "$(wc -l < "$job_dir/pids")" -eq 80
+          for pid in $(cat "$job_dir/pids"); do
+            test "$(awk '$1 == "PPid:" {print $2}' "/proc/$pid/status")" -eq "$daemon_pid"
+          done
+          test "$(timeout 2s build/live/the state of orphans)" = RUNNING
+          touch "$job_dir/exit"
+          for i in $(seq 1 150); do
+            if test "$(grep -c 'adopted-exit' build/live/orphans.log || true)" -eq 80; then break; fi
+            sleep 0.02
+          done
+          awk '$1 == "TE1" && $2 == "process" && $4 == "adopted-exit" && $5 == 17 && $6 == 0 {print $3}' \
+            build/live/orphans.log | sort -n > "$job_dir/reaped"
+          sort -n "$job_dir/pids" | cmp - "$job_dir/reaped"
+          for pid in $(cat "$job_dir/pids"); do test ! -e "/proc/$pid"; done
+          test "$(timeout 2s build/live/the state of orphans)" = RUNNING
           timeout 4s build/live/theseus daemon-stop
           wait "$daemon_pid"
           test ! -e "$THESEUS_SOCKET"

@@ -19,6 +19,8 @@ local function c_read(fd: cint, buffer: pointer, count: csize): clong <cimport '
 local function c_write(fd: cint, buffer: pointer, count: csize): clong <cimport 'write', nodecl, cinclude '<unistd.h>'> end
 local function c_pause(): cint <cimport 'pause', nodecl, cinclude '<unistd.h>'> end
 local function c_fork(): cint <cimport 'fork', nodecl, cinclude '<unistd.h>'> end
+local function c_waitpid(pid: cint, status: *cint, options: cint): cint <cimport 'waitpid', nodecl, cinclude '<sys/wait.h>'> end
+local function c_exit(status: cint): void <cimport '_exit', nodecl, cinclude '<unistd.h>'> end
 local function c_setsid(): cint <cimport 'setsid', nodecl, cinclude '<unistd.h>'> end
 local function c_getpid(): cint <cimport 'getpid', nodecl, cinclude '<unistd.h>'> end
 local SignalHandler = @function(cint): void
@@ -94,6 +96,38 @@ if arg[1] == 'probe-gate' or arg[1] == 'probe-wait' then
   if not gate:isopen() then os.exit(1) end
   gate:close()
   os.exit(0)
+end
+
+if arg[1] == 'orphan-burst' then
+  local dir = arg[2]
+  local intermediate = c_fork()
+  assert(intermediate >= 0, 'orphan fixture fork failed')
+  if intermediate == 0 then
+    local list = io.open(dir .. '/pids', 'w')
+    assert(list:isopen(), 'orphan fixture cannot create pid list')
+    for _: integer = 1, 80 do
+      local pid = c_fork()
+      assert(pid >= 0, 'orphan fixture could not create descendant')
+      if pid == 0 then
+        for _: integer = 1, 600 do
+          local gate = io.open(dir .. '/exit', 'r')
+          if gate:isopen() then gate:close(); c_exit(17) end
+          c_usleep(25000)
+        end
+        c_exit(18)
+      end
+      list:write(tostring(pid), '\n')
+    end
+    list:close()
+    c_exit(0)
+  end
+  local status: cint
+  assert(c_waitpid(intermediate, &status, 0) == intermediate and status == 0,
+         'orphan fixture intermediate failed')
+  local ready = io.open(dir .. '/adopted', 'w')
+  assert(ready:isopen(), 'orphan fixture cannot publish readiness')
+  ready:close()
+  while true do c_pause() end
 end
 
 if arg[1] == 'tree' then
