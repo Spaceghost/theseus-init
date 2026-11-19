@@ -36,24 +36,49 @@ jobs:
           work="$(mktemp -d "$RUNNER_TEMP/theseus-bundle.XXXXXXXX")"
           mkdir "$work/tmp" "$work/replay"
           export TMPDIR="$work/tmp" TMP="$work/tmp" TEMP="$work/tmp"
-          export ZIG_GLOBAL_CACHE_DIR="$work/zig-global"
 
           git init "$work/nelua"
           git -C "$work/nelua" fetch --depth 1 https://github.com/edubart/nelua-lang.git "$NELUA_COMMIT"
           git -C "$work/nelua" checkout --detach FETCH_HEAD
           test "$(git -C "$work/nelua" rev-parse HEAD)" = "$NELUA_COMMIT"
+          # Normalize assertion locations before Nelua emits their string lengths.
+          git -C "$work/nelua" apply <<'PATCH'
+          diff --git a/lualib/nelua/cbuiltins.lua b/lualib/nelua/cbuiltins.lua
+          --- a/lualib/nelua/cbuiltins.lua
+          +++ b/lualib/nelua/cbuiltins.lua
+          @@ -750,6 +750,13 @@ function cbuiltins.calls.assert(context, node)
+             local rettype = builtintype.rettypes[1] or primtypes.void
+             local wherenode = nargs > 0 and node[1][1] or node
+             local where = wherenode:format_message('runtime error', assertmsg)
+          +  local library = assert(os.getenv('RELEASE_NELUA_LIB')) .. '/'
+          +  local source = assert(os.getenv('RELEASE_SOURCE')) .. '/'
+          +  if where:sub(1, #library) == library then
+          +    where = 'nelua/lib/' .. where:sub(#library + 1)
+          +  elseif where:sub(1, #source) == source then
+          +    where = where:sub(#source + 1)
+          +  end
+             emitter:add_ln('{')
+             if nargs == 2 then
+               local pos = where:find(assertmsg)
+          PATCH
           make -C "$work/nelua" -j2
+          cp -a "$work/nelua" "$work/replay-nelua"
           curl --fail --silent --show-error --location --retry 2 \
             "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" \
             -o "$work/zig.tar.xz"
           printf '%s  %s\n' "$ZIG_SHA256" "$work/zig.tar.xz" | sha256sum --check
           tar -xJf "$work/zig.tar.xz" -C "$work"
-          zig="$work/zig-x86_64-linux-$ZIG_VERSION/zig"
-          test "$("$zig" version)" = "$ZIG_VERSION"
+          mkdir "$work/replay-toolchain"
+          tar -xJf "$work/zig.tar.xz" -C "$work/replay-toolchain"
 
           assemble() (
             source=$1
             build=$2
+            nelua=$3
+            zig="$4/zig-x86_64-linux-$ZIG_VERSION/zig"
+            test "$("$zig" version)" = "$ZIG_VERSION"
+            export RELEASE_NELUA_LIB="$nelua/lib" RELEASE_SOURCE="$source"
+            export ZIG_GLOBAL_CACHE_DIR="$build/zig-global"
             mkdir -p "$build/theseus-init"
             export ZIG_LOCAL_CACHE_DIR="$build/zig-local"
             cd "$source"
@@ -65,10 +90,14 @@ jobs:
                 install) name=theseus-install ;;
               esac
               binary="$build/theseus-init/$name"
-              "$work/nelua/nelua" --cache-dir "$build/nelua" \
-                --cc "$zig cc -target x86_64-linux-musl" --cflags="-static -g0 -Wl,--build-id=none" \
+              "$nelua/nelua" --cache-dir "$build/nelua" \
+                --cc "$zig cc -target x86_64-linux-musl" --cflags="-static -g0 -Wl,--build-id=none,-s" \
                 --compile-binary --release -o "$binary" "src/$file.nelua"
               chmod 0555 "$binary"
+              if env LC_ALL=C grep -aFq -e "$work/" -e "$source/" "$binary"; then
+                echo "absolute build path in $name" >&2
+                exit 1
+              fi
               if readelf -Wl "$binary" | grep -E '^[[:space:]]+INTERP[[:space:]]'; then
                 echo "unexpected ELF interpreter in $name" >&2
                 exit 1
@@ -77,7 +106,7 @@ jobs:
             test -f LICENSE
             install -m 0444 LICENSE docs/INSTALL.md "$build/theseus-init/"
             mkdir -m 0755 "$build/theseus-init/notices"
-            install -m 0444 "$work/nelua/LICENSE" "$build/theseus-init/notices/nelua.txt"
+            install -m 0444 "$nelua/LICENSE" "$build/theseus-init/notices/nelua.txt"
             install -m 0444 "$(dirname "$zig")/LICENSE" "$build/theseus-init/notices/zig.txt"
             install -m 0444 "$(dirname "$zig")/lib/libc/musl/COPYRIGHT" "$build/theseus-init/notices/musl.txt"
             printf 'source=%s\nnelua=%s\nzig=%s\nzig_sha256=%s\ntarget=x86_64-linux-musl\n' \
@@ -90,8 +119,8 @@ jobs:
 
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git archive "$GITHUB_SHA" | tar -xf - -C "$work/replay"
-          assemble "$PWD" "$work/first"
-          assemble "$work/replay" "$work/second"
+          assemble "$PWD" "$work/first" "$work/nelua" "$work"
+          assemble "$work/replay" "$work/second" "$work/replay-nelua" "$work/replay-toolchain"
           cmp "$work/first/bundle.tar.gz" "$work/second/bundle.tar.gz"
           destination="$work/theseus-init-linux-x86_64-$GITHUB_SHA.tar.gz"
           mv "$work/first/bundle.tar.gz" "$destination"
