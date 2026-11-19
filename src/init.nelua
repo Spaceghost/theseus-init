@@ -314,7 +314,9 @@ local function openrc_phase(fd: cint, session: *Session, level: cstring, interru
   local interrupted = false
   while session.openrc > 0 do
     local ok, received = notification(fd, 100)
-    reap(session)
+    -- A cancelled leader may already be waitable while its group remains
+    -- alive. Keep its PID reserved until the final signal to the group.
+    if not interrupted then reap(session) end
     if interruptible and action == Action.None and received ~= Action.None then action = received end
     if session.openrc <= 0 then break end
     local now = now_ms()

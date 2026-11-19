@@ -56,9 +56,11 @@ remain available in rescue. Use the kernel option theseus.rescue=1
 to enter the console before either service manager starts.
 
 Each OpenRC invocation has a two-minute deadline. A shutdown
-request can interrupt a boot runlevel. PID 1 signals the active
-runlevel process group and then attempts the shutdown runlevel.
-A runlevel failure or timeout is reported on the console.
+request can interrupt a boot runlevel. PID 1 sends SIGTERM to the
+active process group and gives it two seconds before sending
+SIGKILL, even if the leader exits during that interval. PID 1
+retains the leader's PID until the final group signal. A runlevel
+failure or timeout is reported on the console.
 
 ## VM checks
 
