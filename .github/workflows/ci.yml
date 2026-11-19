@@ -173,6 +173,21 @@ jobs:
           grep -F 'invalid cgroup v2 delegation' build/live/invalid-cgroup.log
           ! grep -F 'daemon-spawn' build/live/invalid-cgroup.log
 
+      - name: Require delegated ownership for crash recovery
+        run: |
+          set -eux
+          job_dir="$(mktemp -d "$RUNNER_TEMP/reco.XXXXXXXX")"
+          chmod 700 "$job_dir"
+          export THESEUS_RECOVERY_DIR="$job_dir"
+          export THESEUS_SOCKET="$job_dir/control.sock"
+          export THESEUS_RECORDS="$PWD/build/services.tsc"
+          unset THESEUS_CGROUP_ROOT
+          rc=0
+          build/live/theseusd sleep-stop >build/live/recovery-no-cgroup.txt 2>&1 || rc=$?
+          test "$rc" -eq 64
+          test -z "$(ls -A "$job_dir")"
+          grep -F 'cannot claim recovery directory' build/live/recovery-no-cgroup.txt
+
       - name: Query live state and shut down without orphans
         run: |
           set -eux

@@ -186,6 +186,42 @@ matters to their deployment. Leave the variable unset for direct-child
 pidfd supervision without a cgroup delegation. The one-shot runner
 and the OpenRC adapter keep their own process-management contracts.
 
+### Recovery after an unclean daemon exit
+
+For an automatically restarted deployment, provision an empty, local
+runtime directory with mode 0700 owned by the daemon account. Keep the
+directory and the delegated cgroup stable across restarts. For example,
+a launcher can set these variables before starting theseusd.
+
+~~~sh
+export THESEUS_RECOVERY_DIR=/run/theseus/instance
+export THESEUS_SOCKET="$THESEUS_RECOVERY_DIR/control.sock"
+export THESEUS_CGROUP_ROOT=/sys/fs/cgroup/theseus-services
+theseusd --target default
+~~~
+
+Recovery mode takes an exclusive lock on the runtime directory. A
+competing daemon exits with status 73. A new daemon with the same
+directory verifies the previous ownership records, kills processes
+in the recorded instance cgroup, waits for it to become empty, and
+reclaims the old control socket before starting services. An instance
+owns its subtree of the delegation. Sibling cgroups can be used by
+other instances or managed independently.
+
+The runtime directory reserves owner, scope, bound.sock, and
+control.sock for Theseus. Clients use control.sock through
+THESEUS_SOCKET. Keep the directory and its parent under trusted
+administration, and leave those paths and the instance's cgroup
+subtree to Theseus while the instance exists. A mismatched delegation
+or replaced control socket causes startup to fail. Leave the
+ownership records intact while investigating a failed recovery.
+
+The runtime directory and its settings are opt-in. A launcher that
+uses a standalone control socket must provide its own cleanup after
+a crash. Recovery manages the supervisor's control socket and cgroups.
+Services remain responsible for persistent state and any sockets
+they create themselves.
+
 ## Child reaping and lifecycle events
 
 The userspace daemon is a Linux child subreaper. Orphaned descendants

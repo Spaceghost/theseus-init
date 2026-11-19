@@ -1,0 +1,168 @@
+-- Crash recovery for an explicitly provisioned private runtime directory.
+require 'string'
+require 'src.theseus.cgroup'
+require 'src.theseus.graph'
+
+local Stat: type <cimport 'struct stat', nodecl, cinclude '<sys/stat.h>'> =
+  @record{st_dev: culong, st_ino: culong, st_mode: cuint, st_uid: cuint}
+local function c_open(path: cstring, flags: cint): cint <cimport 'open', nodecl, cinclude '<fcntl.h>'> end
+local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
+local function c_fstat(fd: cint, info: *Stat): cint <cimport 'fstat', nodecl, cinclude '<sys/stat.h>'> end
+local function c_fstatat(fd: cint, name: cstring, info: *Stat, flags: cint): cint <cimport 'fstatat', nodecl, cinclude '<sys/stat.h>'> end
+local function c_flock(fd: cint, op: cint): cint <cimport 'flock', nodecl, cinclude '<sys/file.h>'> end
+local function c_geteuid(): cuint <cimport 'geteuid', nodecl, cinclude '<unistd.h>'> end
+local function c_symlinkat(data: cstring, dir: cint, name: cstring): cint <cimport 'symlinkat', nodecl, cinclude '<unistd.h>'> end
+local function c_readlinkat(dir: cint, name: cstring, data: pointer, size: csize): clong <cimport 'readlinkat', nodecl, cinclude '<unistd.h>'> end
+local function c_linkat(from: cint, oldname: cstring, to: cint, newname: cstring, flags: cint): cint <cimport 'linkat', nodecl, cinclude '<unistd.h>'> end
+local function c_unlinkat(dir: cint, name: cstring, flags: cint): cint <cimport 'unlinkat', nodecl, cinclude '<unistd.h>'> end
+local AT_SYMLINK_NOFOLLOW: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_RDONLY: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_CLOEXEC: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_DIRECTORY: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_NOFOLLOW: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local LOCK_EX: cint <cimport, nodecl, cinclude '<sys/file.h>'>
+local LOCK_NB: cint <cimport, nodecl, cinclude '<sys/file.h>'>
+local S_IFMT: cuint <cimport, nodecl, cinclude '<sys/stat.h>'>
+local S_IFSOCK: cuint <cimport, nodecl, cinclude '<sys/stat.h>'>
+local ENOENT: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EWOULDBLOCK: cint <cimport, nodecl, cinclude '<errno.h>'>
+local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
+
+local Owner: cstring = 'owner'
+local Scope: cstring = 'scope'
+local Control: cstring = 'control.sock'
+local Bound: cstring = 'bound.sock'
+
+global RecoverableInstance = @record{
+  dir: cint,
+  scope: cint,
+  name: string,
+  recovered: boolean,
+}
+
+local function identity(device: culong, inode: culong): string
+  return tostring(device) .. '-' .. tostring(inode)
+end
+
+local function absent(dir: cint, name: cstring): boolean
+  local info: Stat <noinit>
+  return c_fstatat(dir, name, &info, AT_SYMLINK_NOFOLLOW) < 0 and errno == ENOENT
+end
+
+-- The second link is the published name. The original link pins its inode
+-- across crashes so a replaced control pathname fails the ownership check.
+local SocketFiles = @enum{Foreign = 0, Absent, BoundOnly, Published}
+
+local function socket_files(dir: cint): SocketFiles
+  local bound: Stat <noinit>
+  local control: Stat <noinit>
+  if c_fstatat(dir, Bound, &bound, AT_SYMLINK_NOFOLLOW) < 0 then
+    if errno == ENOENT and absent(dir, Control) then return SocketFiles.Absent end
+    return SocketFiles.Foreign
+  end
+  if (bound.st_mode & S_IFMT) ~= S_IFSOCK then return SocketFiles.Foreign end
+  if c_fstatat(dir, Control, &control, AT_SYMLINK_NOFOLLOW) < 0 then
+    if errno == ENOENT then return SocketFiles.BoundOnly end
+    return SocketFiles.Foreign
+  end
+  if control.st_dev ~= bound.st_dev or control.st_ino ~= bound.st_ino then return SocketFiles.Foreign end
+  return SocketFiles.Published
+end
+
+local function remove_socket(dir: cint): boolean
+  local files = socket_files(dir)
+  if files == SocketFiles.Absent then return true end
+  if files == SocketFiles.Foreign then return false end
+  if files == SocketFiles.Published and c_unlinkat(dir, Control, 0) ~= 0 then return false end
+  return c_unlinkat(dir, Bound, 0) == 0
+end
+
+local function scope_identity(scope: cint): string
+  local info: Stat <noinit>
+  if c_fstat(scope, &info) ~= 0 then return '' end
+  return identity(info.st_dev, info.st_ino)
+end
+
+local function marker(dir: cint, name: cstring): (boolean, string)
+  local buffer: [128]byte
+  local size = c_readlinkat(dir, name, &buffer[0], #buffer)
+  if size < 0 then return errno == ENOENT, '' end
+  if size == 0 or size == #buffer then return false, '' end
+  return true, string.copy((@string){data = &buffer[0], size = (@usize)(size)})
+end
+
+local function remove_marker(dir: cint, name: cstring): boolean
+  return c_unlinkat(dir, name, 0) == 0 or errno == ENOENT
+end
+
+local function recover_scope(instance: *RecoverableInstance, delegation: cint, name: cstring): boolean
+  local valid, recorded = marker(instance.dir, Scope)
+  if not valid then return false end
+  local scope = cgroup_scope_open(delegation, name)
+  if scope < 0 then
+    if errno ~= ENOENT then return false end
+  else
+    -- A crash before the inode was recorded could leave an empty directory.
+    -- Work starts only after recording, so an unrecorded scope is never killed.
+    defer c_close(scope) end
+    if #recorded > 0 and (scope_identity(scope) ~= recorded or
+       not cgroup_scope_drain(scope, NativeMaxServices)) then return false end
+    if not cgroup_scope_remove(delegation, name) then return false end
+  end
+  return remove_marker(instance.dir, Scope)
+end
+
+global function recovery_begin(instance: *RecoverableInstance, path: string, dir: string, delegation: cint): integer
+  if delegation < 0 or string.byte(dir, 1) ~= 47 or path ~= dir .. '/control.sock' then return 64 end
+  instance.dir = c_open((@cstring)(dir), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+  if instance.dir < 0 then return 73 end
+  local runtime: Stat <noinit>
+  local grouping: Stat <noinit>
+  if c_fstat(instance.dir, &runtime) ~= 0 or runtime.st_uid ~= c_geteuid() or
+     (runtime.st_mode & 0xfff) ~= 0x1c0 then return 73 end -- 0700
+  if c_flock(instance.dir, LOCK_EX | LOCK_NB) ~= 0 then
+    if errno == EWOULDBLOCK then return 73 end
+    return 74
+  end
+  if c_fstat(delegation, &grouping) ~= 0 then return 83 end
+  instance.name = 'theseus-instance-' .. identity(runtime.st_dev, runtime.st_ino)
+  local owner = 'theseus-v1:' .. identity(grouping.st_dev, grouping.st_ino)
+  local name = (@cstring)(instance.name)
+  local valid, recorded = marker(instance.dir, Owner)
+  if not valid then return 73 end
+  if #recorded == 0 then
+    if not absent(instance.dir, Bound) or not absent(instance.dir, Control) or
+       not absent(instance.dir, Scope) or not absent(delegation, name) then return 73 end
+    -- An atomic marker precedes creation of either recoverable resource.
+    if c_symlinkat((@cstring)(owner), instance.dir, Owner) ~= 0 then return 73 end
+  else
+    if recorded ~= owner or socket_files(instance.dir) == SocketFiles.Foreign then return 73 end
+    if not recover_scope(instance, delegation, name) then return 83 end
+    if not remove_socket(instance.dir) then return 73 end
+    instance.recovered = true
+  end
+  instance.scope = cgroup_scope_create(delegation, name)
+  if instance.scope < 0 then return 83 end
+  local id = scope_identity(instance.scope)
+  if #id == 0 or c_symlinkat((@cstring)(id), instance.dir, Scope) ~= 0 then return 83 end
+  return 0
+end
+
+global function recovery_bind_path(instance: *RecoverableInstance): string
+  return '/proc/self/fd/' .. tostring(instance.dir) .. '/' .. tostring(Bound)
+end
+
+global function recovery_publish(instance: *RecoverableInstance): boolean
+  return c_linkat(instance.dir, Bound, instance.dir, Control, 0) == 0
+end
+
+global function recovery_finish(instance: *RecoverableInstance, delegation: cint): boolean
+  if not cgroup_scope_remove(delegation, (@cstring)(instance.name)) or
+     not remove_marker(instance.dir, Scope) or not remove_socket(instance.dir) then return false end
+  return c_unlinkat(instance.dir, Owner, 0) == 0
+end
+
+global function recovery_close(instance: *RecoverableInstance)
+  if instance.scope >= 0 then c_close(instance.scope) end
+  if instance.dir >= 0 then c_close(instance.dir) end
+end

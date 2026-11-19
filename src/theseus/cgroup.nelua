@@ -9,6 +9,7 @@ local function c_mkdirat(dir: cint, name: cstring, mode: cuint): cint <cimport '
 local function c_unlinkat(dir: cint, name: cstring, flags: cint): cint <cimport 'unlinkat', nodecl, cinclude '<unistd.h>'> end
 local function c_pread(fd: cint, buffer: pointer, count: csize, offset: clong): clong <cimport 'pread', nodecl, cinclude '<unistd.h>'> end
 local function c_write(fd: cint, data: pointer, count: csize): clong <cimport 'write', nodecl, cinclude '<unistd.h>'> end
+local function c_poll(fds: pointer, count: culong, timeout_ms: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
 local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
 local function c_getpid(): cint <cimport 'getpid', nodecl, cinclude '<unistd.h>'> end
 local O_CLOEXEC: cint <cimport, nodecl, cinclude '<fcntl.h>'>
@@ -18,6 +19,7 @@ local O_RDONLY: cint <cimport, nodecl, cinclude '<fcntl.h>'>
 local O_WRONLY: cint <cimport, nodecl, cinclude '<fcntl.h>'>
 local AT_REMOVEDIR: cint <cimport, nodecl, cinclude '<fcntl.h>'>
 local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
+local ENOENT: cint <cimport, nodecl, cinclude '<errno.h>'>
 local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
 local CGROUP2_SUPER_MAGIC: clong <cimport, nodecl, cinclude '<linux/magic.h>'>
 
@@ -38,8 +40,13 @@ global function cgroup_open_root(path: string): cint
   return -1
 end
 
-global function cgroup_create(root: cint, slot: integer, group: *ServiceCgroup): boolean
-  local name = 'theseus-' .. tostring(c_getpid()) .. '-' .. tostring(slot)
+local function service_leaf(slot: integer): string
+  return 'service-' .. tostring(slot)
+end
+
+global function cgroup_create(root: cint, slot: integer, group: *ServiceCgroup, scoped: boolean): boolean
+  local name = service_leaf(slot)
+  if not scoped then name = 'theseus-' .. tostring(c_getpid()) .. '-' .. tostring(slot) end
   if c_mkdirat(root, (@cstring)(name), 0x1c0) ~= 0 then return false end -- 0700
   group.name = name
   group.procs = -1
@@ -93,4 +100,43 @@ global function cgroup_state(group: *ServiceCgroup): CgroupState
     return CgroupState.Populated
   end
   return CgroupState.Error
+end
+
+-- A recoverable instance owns this subtree beneath the common delegation.
+global function cgroup_scope_open(root: cint, name: cstring): cint
+  return c_openat(root, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+end
+
+global function cgroup_scope_create(root: cint, name: cstring): cint
+  if c_mkdirat(root, name, 0x1c0) ~= 0 then return -1 end
+  return cgroup_scope_open(root, name)
+end
+
+global function cgroup_scope_remove(root: cint, name: cstring): boolean
+  return c_unlinkat(root, name, AT_REMOVEDIR) == 0 or errno == ENOENT
+end
+
+global function cgroup_scope_drain(dir: cint, slots: integer): boolean
+  local group: ServiceCgroup = {name = 'scope'}
+  group.kill = c_openat(dir, 'cgroup.kill', O_WRONLY | O_CLOEXEC | O_NOFOLLOW)
+  group.events = c_openat(dir, 'cgroup.events', O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+  local clean = group.kill >= 0 and group.events >= 0
+  if clean then
+    local state = cgroup_state(&group)
+    if state == CgroupState.Populated and cgroup_kill(&group) then
+      for _ = 1, 200 do
+        if cgroup_state(&group) ~= CgroupState.Populated then break end
+        c_poll(nilptr, 0, 10)
+      end
+    end
+    clean = cgroup_state(&group) == CgroupState.Empty
+  end
+  if group.events >= 0 then c_close(group.events) end
+  if group.kill >= 0 then c_close(group.kill) end
+  if clean then
+    for slot = 0, slots - 1 do
+      if not cgroup_scope_remove(dir, (@cstring)(service_leaf(slot))) then clean = false end
+    end
+  end
+  return clean
 end

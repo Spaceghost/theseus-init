@@ -54,6 +54,8 @@ services. Run it with `theseusd --target TARGET`.
 Set `THESEUS_CGROUP_ROOT` to a delegated cgroup v2 directory to track
 and clean up each service's descendants. See
 [resource ownership](docs/ARCHITECTURE.md#resource-ownership).
+A [private runtime directory](docs/ARCHITECTURE.md#recovery-after-an-unclean-daemon-exit)
+enables automatic cleanup on restart after a daemon crash.
 
 Unix socket readiness can also require a successful application probe.
 The PostgreSQL example uses `pg_isready` to wait until the database

@@ -17,6 +17,7 @@ local function c_ioctl(fd: cint, request: cint, value: *cint): cint <cimport 'io
 local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
 local function c_dup2(oldfd: cint, fd: cint): cint <cimport 'dup2', nodecl, cinclude '<unistd.h>'> end
 local function c_access(path: cstring, mode: cint): cint <cimport 'access', nodecl, cinclude '<unistd.h>'> end
+local function c_readlink(path: cstring, output: pointer, count: csize): clong <cimport 'readlink', nodecl, cinclude '<unistd.h>'> end
 local function c_getpid(): cint <cimport 'getpid', nodecl, cinclude '<unistd.h>'> end
 local function c_getppid(): cint <cimport 'getppid', nodecl, cinclude '<unistd.h>'> end
 local function c_kill(pid: cint, sig: cint): cint <cimport 'kill', nodecl, cinclude '<signal.h>'> end
@@ -30,10 +31,12 @@ local F_SETPIPE_SZ: cint <cimport, nodecl, cinclude '<fcntl.h>'>
 local FD_CLOEXEC: cint <cimport, nodecl, cinclude '<fcntl.h>'>
 local F_SETFD: cint <cimport, nodecl, cinclude '<fcntl.h>'>
 local PR_SET_PDEATHSIG: cint <cimport, nodecl, cinclude '<sys/prctl.h>'>
+local SIGKILL: cint <cimport, nodecl, cinclude '<signal.h>'>
 local SIGTERM: cint <cimport, nodecl, cinclude '<signal.h>'>
 local WNOHANG: cint <cimport, nodecl, cinclude '<sys/wait.h>'>
 local CLOCK_MONOTONIC: cint <cimport, nodecl, cinclude '<time.h>'>
 local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
+local ENOENT: cint <cimport, nodecl, cinclude '<errno.h>'>
 local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
 
 local function monotonic_ms(): integer
@@ -62,12 +65,12 @@ local function content(path: string): string
   return data
 end
 
-local function start_daemon(program: cstring): (cint, cint)
+local function start_daemon(program: cstring, selection: cstring, target: cstring): (cint, cint)
   local output: [2]cint
   assert(c_pipe(&output[0]) == 0, 'cannot create stalled output')
   assert(c_fcntl(output[0], F_SETPIPE_SZ, OutputCapacity) == OutputCapacity, 'cannot size stalled output')
   assert(c_fcntl(output[0], F_SETFD, FD_CLOEXEC) == 0, 'cannot protect output reader')
-  local argv: [4]cstring = {program, '--target', 'qualification', nilptr}
+  local argv: [4]cstring = {program, selection, target, nilptr}
   local parent = c_getpid()
   local pid = c_fork()
   assert(pid >= 0, 'cannot fork daemon')
@@ -112,6 +115,14 @@ local function wait_state(client: cstring, service: cstring, state: string)
     c_poll(nilptr, 0, 20)
   end
   error('service did not reach ' .. state .. ': ' .. tostring(service))
+end
+
+local function wait_not_present(path: string)
+  local deadline = monotonic_ms() + 3000
+  while exists(path) do
+    assert(monotonic_ms() < deadline, 'path survived cleanup: ' .. path)
+    c_poll(nilptr, 0, 10)
+  end
 end
 
 local function pid_of(client: cstring, name: cstring): cint
@@ -164,7 +175,7 @@ local FixtureFiles: [6]string = {'control.sock', 'probe.pid', 'release', 'first.
 local function qualify(bindir: string, work: string, root: string)
   local client = (@cstring)(bindir .. '/theseus')
   local reader = (@cstring)(bindir .. '/the')
-  local daemon, output = start_daemon((@cstring)(bindir .. '/theseusd'))
+  local daemon, output = start_daemon((@cstring)(bindir .. '/theseusd'), '--target', 'qualification')
   local endpoint = os.getenv('THESEUS_SOCKET')
   wait_file(endpoint)
   wait_file(work .. '/probe.pid')
@@ -233,20 +244,80 @@ local function qualify(bindir: string, work: string, root: string)
   end
 end
 
-assert(#arg == 3, 'usage: alpine-qualification LIVE_BINARY_DIRECTORY WORK_DIRECTORY SECONDS')
+-- The service uses an external fixture file to distinguish its second launch.
+-- Leave it in place across the crash and clear it only after both runs exit.
+local function qualify_recovery(bindir: string, work: string, root: string)
+  local program = (@cstring)(bindir .. '/theseusd')
+  local client = (@cstring)(bindir .. '/theseus')
+  local recovery = work .. '/instance'
+  local first_marker, second_marker = work .. '/first.pid', work .. '/second.pid'
+  assert(not exists(first_marker) and not exists(second_marker), 'stale tree fixture')
+  local first, first_output = start_daemon(program, 'tree', nilptr)
+  wait_file(first_marker)
+  wait_state(client, 'tree', 'RUNNING')
+  local tree = pid_of(client, 'tree')
+  local found, fields = string.match(content(first_marker), '^(%d+) (%d+)')
+  assert(found and tonumber(fields[1]) == tree and tonumber(fields[2]) > 1, 'bad tree fixture')
+  local descendant = (@cint)(tonumber(fields[2]))
+  local tree_path = '/proc/' .. tostring(tree)
+  local descendant_path = '/proc/' .. tostring(descendant)
+  local belongs = content(descendant_path .. '/cgroup')
+  local prefix = '0::' .. string.sub(root, #'/sys/fs/cgroup' + 1) .. '/theseus-instance-'
+  assert(string.find(belongs, prefix, 1, true) == 1, belongs)
+  local scope, captures = string.match(belongs, '^0::([^\n]+)/service%-%d+\n$')
+  assert(scope, belongs)
+  local scope_path = '/sys/fs/cgroup' .. captures[1]
+  assert(content(tree_path .. '/cgroup') == belongs, 'detached process left the service cgroup')
+
+  local competitor, competitor_output = start_daemon(program, 'tree', nilptr)
+  assert(wait_daemon(competitor) == 73, 'live instance was not protected')
+  c_close(competitor_output)
+  assert(pid_of(client, 'tree') == tree and exists(descendant_path), 'duplicate launch disturbed live work')
+  assert(c_kill(first, SIGKILL) == 0 and wait_daemon(first) == 137, 'daemon did not receive SIGKILL')
+  c_close(first_output)
+  assert(exists(descendant_path) and exists(recovery .. '/control.sock'), 'crash left no recovery work')
+
+  local second, second_output = start_daemon(program, 'tree', nilptr)
+  wait_file(second_marker)
+  wait_state(client, 'tree', 'RUNNING')
+  wait_not_present(tree_path)
+  wait_not_present(descendant_path)
+  local stopped, response = execute_test_command({'/bin/busybox', 'timeout', '3', client, 'daemon-stop'}, true)
+  assert(stopped == 0, response)
+  assert(wait_daemon(second) == 0, 'recovered daemon did not stop cleanly')
+  c_close(second_output)
+  assert(not exists(scope_path), 'instance cgroup survived a clean stop')
+  assert(not exists(recovery .. '/control.sock') and not exists(recovery .. '/bound.sock'), 'owned socket survived')
+  local byte: cchar
+  assert(c_readlink((@cstring)(recovery .. '/owner'), &byte, 1) < 0 and errno == ENOENT, 'owner marker survived')
+  assert(c_readlink((@cstring)(recovery .. '/scope'), &byte, 1) < 0 and errno == ENOENT, 'scope marker survived')
+  local removed_first = os.remove(first_marker)
+  local removed_second = os.remove(second_marker)
+  assert(removed_first and removed_second, 'cannot reset tree fixture')
+end
+
+assert(#arg == 3 or (#arg == 4 and arg[4] == '--recovery'),
+       'usage: alpine-qualification LIVE_BINARY_DIRECTORY WORK_DIRECTORY SECONDS [--recovery]')
 local bindir, work = arg[1], arg[2]
 local seconds = tonumber(arg[3]) or 0
 local root = os.getenv('THESEUS_CGROUP_ROOT')
 assert(seconds >= 1 and seconds <= 7200 and seconds % 1 == 0, 'invalid duration')
 assert(string.sub(root, 1, #'/sys/fs/cgroup/') == '/sys/fs/cgroup/', 'a real delegated cgroup is required')
-assert(os.getenv('THESEUS_SOCKET') == work .. '/control.sock', 'control socket must be in the fixture directory')
-for i = 0, 5 do
-  assert(not exists(work .. '/' .. FixtureFiles[i]), 'work directory contains a previous fixture: ' .. FixtureFiles[i])
+local recovery = #arg == 4
+if recovery then
+  assert(os.getenv('THESEUS_RECOVERY_DIR') == work .. '/instance', 'a private instance directory is required')
+  assert(os.getenv('THESEUS_SOCKET') == work .. '/instance/control.sock', 'control socket must be in the instance directory')
+else
+  assert(os.getenv('THESEUS_SOCKET') == work .. '/control.sock', 'control socket must be in the fixture directory')
+  for i = 0, 5 do
+    assert(not exists(work .. '/' .. FixtureFiles[i]), 'work directory contains a previous fixture: ' .. FixtureFiles[i])
+  end
 end
 local start = monotonic_ms()
 local cycles: integer = 0
 repeat
-  qualify(bindir, work, root)
+  if recovery then qualify_recovery(bindir, work, root)
+  else qualify(bindir, work, root) end
   cycles = cycles + 1
   print('QUAL1', 'cycle', cycles, monotonic_ms() - start)
 until monotonic_ms() - start >= seconds * 1000

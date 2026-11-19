@@ -140,3 +140,28 @@ The last tab-separated record is QUAL1, pass, the number of
 complete cycles, and elapsed milliseconds. On failure, keep the guest
 and its test directory for diagnosis. The run uses a separate guest
 PID 1 and qualifies the userspace supervisor.
+
+## Exercise crash recovery in the Alpine guest
+
+Reuse the four binaries from the soak. In the disposable guest,
+create an empty test directory and a private instance directory.
+Use a writable cgroup v2 delegation for the test. The recovery
+mode does not use OpenRC or the qualification target graph.
+
+~~~sh
+mkdir /opt/theseus/recovery-test
+cd /opt/theseus/recovery-test
+mkdir -m 700 instance
+export THESEUS_RECOVERY_DIR="$PWD/instance"
+export THESEUS_SOCKET="$THESEUS_RECOVERY_DIR/control.sock"
+export THESEUS_CGROUP_ROOT=/sys/fs/cgroup/theseus-qualification
+export THESEUS_RECORDS="$PWD/tree.tsc"
+printf 'TSC2\ttree\t%s\037tree\037%s\tnever\t0\tnone\n' /opt/theseus/bin/control-test "$PWD" > "$THESEUS_RECORDS"
+/opt/theseus/bin/alpine-qualification /opt/theseus/bin "$PWD" 180 --recovery
+~~~
+
+Each cycle starts a service with a detached process, verifies the
+live instance rejects a competing launch, and kills the daemon
+with SIGKILL. The next launch must bring the service up again
+after clearing the previous processes, then shut down without
+leaving an instance cgroup or runtime files.

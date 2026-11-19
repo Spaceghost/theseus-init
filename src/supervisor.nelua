@@ -11,6 +11,7 @@ require 'string'
 require 'src.theseus.readiness'
 require 'src.theseus.graph'
 require 'src.theseus.cgroup'
+require 'src.theseus.recovery'
 require 'src.theseus.daemon_log'
 
 local function c_fork(): cint <cimport 'fork', nodecl, cinclude '<unistd.h>'> end
@@ -1120,7 +1121,9 @@ local function supervise(shutdown_fd: cint, reap_fd: cint, child_mask: *Sigset):
   code = prepare(&group, path)
   if code ~= 0 then return code end
 
-  if c_access((@cstring)(path), 0) == 0 then
+  local recovery_dir = os.getenv('THESEUS_RECOVERY_DIR')
+  local recoverable = #recovery_dir > 0
+  if not recoverable and c_access((@cstring)(path), 0) == 0 then
     daemon_log_error('theseusd: refusing pre-existing control socket path: ', path, '\n')
     return 73
   end
@@ -1133,16 +1136,37 @@ local function supervise(shutdown_fd: cint, reap_fd: cint, child_mask: *Sigset):
       return 83
     end
   end
+  local delegated_root = root
+  defer
+    if delegated_root >= 0 then c_close(delegated_root) end
+  end
+  local instance: RecoverableInstance = {dir = -1, scope = -1}
+  defer recovery_close(&instance) end
+  local bind_path = path
+  if recoverable then
+    code = recovery_begin(&instance, path, recovery_dir, delegated_root)
+    if code ~= 0 then
+      daemon_log_error('theseusd: cannot claim recovery directory: ', recovery_dir, ' (exit ', code, ')\n')
+      return code
+    end
+    if instance.recovered then daemon_log('TE1', 'recovery', group.name, 'cleaned') end
+    root = instance.scope
+    bind_path = recovery_bind_path(&instance)
+  end
   local listener = c_socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)
   if listener < 0 then return 74 end
   local address: SockaddrUn
-  fill_address(&address, path)
+  fill_address(&address, bind_path)
   -- Create the socket with mode 0600. There is no wider-access bind window.
   local previous_mask = c_umask(0x7f) -- octal 0177
-  local bound = c_bind(listener, &address, (@cuint)(2 + #path + 1))
+  local bound = c_bind(listener, &address, (@cuint)(2 + #bind_path + 1))
   c_umask(previous_mask)
-  if bound ~= 0 then return 75 end
-  if c_listen(listener, 8) ~= 0 then c_close(listener); c_unlink((@cstring)(path)); return 77 end
+  if bound ~= 0 then c_close(listener); return 75 end
+  if c_listen(listener, 8) ~= 0 or (recoverable and not recovery_publish(&instance)) then
+    c_close(listener)
+    if not recoverable then c_unlink((@cstring)(path)) end
+    return 77
+  end
 
   local exit_code: integer = 78
   local shutdown_client: cint = -1
@@ -1150,7 +1174,7 @@ local function supervise(shutdown_fd: cint, reap_fd: cint, child_mask: *Sigset):
   if root >= 0 then
     for i: integer = 0, group.count - 1 do
       local runtime = &group.runtimes[i]
-      if not cgroup_create(root, i, &runtime.cgroup) then
+      if not cgroup_create(root, i, &runtime.cgroup, recoverable) then
         daemon_log_error('theseusd: cannot create cgroup for ', runtime.service.name, '\n')
         exit_code = 83
         resources_ready = false
@@ -1183,7 +1207,6 @@ local function supervise(shutdown_fd: cint, reap_fd: cint, child_mask: *Sigset):
       stopped = false
     end
   end
-  if root >= 0 then c_close(root) end
   local more = true
   local reap_deadline = monotonic_ms() + 1000
   while more do
@@ -1191,7 +1214,11 @@ local function supervise(shutdown_fd: cint, reap_fd: cint, child_mask: *Sigset):
     ok, more = reap_pending_children(&group)
     if not ok or (more and monotonic_ms() >= reap_deadline) then stopped = false; break end
   end
-  c_unlink((@cstring)(path))
+  if recoverable then
+    if stopped and not recovery_finish(&instance, delegated_root) then stopped = false end
+  else
+    c_unlink((@cstring)(path))
+  end
   if shutdown_client >= 0 then
     if stopped then write_all(shutdown_client, 'TR1\tOK\n')
     else write_all(shutdown_client, 'TR1\tERROR\tshutdown\n') end
