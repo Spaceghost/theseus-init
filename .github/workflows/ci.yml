@@ -140,6 +140,9 @@ jobs:
           set -eux
           /tmp/nelua-lang/nelua --compile-binary --release -o build/theseus-init src/init.nelua
           /tmp/nelua-lang/nelua --compile-binary --release -o build/pid1-test tests/pid1_guest.nelua
+          /tmp/nelua-lang/nelua --compile-binary --release -o build/pid1-openrc-test tests/pid1_openrc_guest.nelua
+          cue export ./pid1fixtures -e openrcCompiled --out text >build/pid1-openrc-graph.tsc
+          cue export ./pid1fixtures -e openrcCompiled --out text | cmp build/pid1-openrc-graph.tsc -
           cue export ./pid1fixtures -e compiled --out text >build/pid1-graph.tsc
           cue export ./pid1fixtures -e compiled --out text | cmp build/pid1-graph.tsc -
           test "$(grep -c '^TSC3[[:space:]]' build/pid1-graph.tsc)" -eq 2

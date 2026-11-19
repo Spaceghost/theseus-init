@@ -1,0 +1,87 @@
+-- A native PostgreSQL client that must finish while the OpenRC server is alive.
+require 'io'
+require 'string'
+require 'tests.command'
+
+local Sigset: type <cimport 'sigset_t', nodecl, cinclude '<signal.h>'> = @record{}
+local function c_getppid(): cint <cimport 'getppid', nodecl, cinclude '<unistd.h>'> end
+local function c_kill(pid: cint, sig: cint): cint <cimport 'kill', nodecl, cinclude '<signal.h>'> end
+local function c_sigemptyset(set: *Sigset): cint <cimport 'sigemptyset', nodecl, cinclude '<signal.h>'> end
+local function c_sigaddset(set: *Sigset, sig: cint): cint <cimport 'sigaddset', nodecl, cinclude '<signal.h>'> end
+local function c_sigprocmask(how: cint, set: *Sigset, previous: *Sigset): cint <cimport 'sigprocmask', nodecl, cinclude '<signal.h>'> end
+local function c_signalfd(fd: cint, set: *Sigset, flags: cint): cint <cimport 'signalfd', nodecl, cinclude '<sys/signalfd.h>'> end
+local function c_read(fd: cint, data: pointer, size: csize): clong <cimport 'read', nodecl, cinclude '<unistd.h>'> end
+local function c_poll(fds: pointer, count: culong, timeout: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
+local SIG_BLOCK: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SIGTERM: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SIGKILL: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SFD_CLOEXEC: cint <cimport, nodecl, cinclude '<sys/signalfd.h>'>
+local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
+local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
+
+local function content(path: string): string
+  local file = io.open(path, 'r')
+  assert(file:isopen(), path)
+  local data = file:read('*a')
+  file:close()
+  return data
+end
+
+local function sql(query: cstring): (integer, string)
+  return execute_test_command({'/bin/busybox', 'timeout', '2', '/usr/bin/psql',
+    '-v', 'ON_ERROR_STOP=1', '-XAtq', '-d',
+    'host=/run/postgresql user=postgres dbname=postgres connect_timeout=1', '-c', query}, true)
+end
+
+local function expect_sql(query: cstring, expected: string)
+  local code, output = sql(query)
+  assert(code == 0 and output == expected, output)
+end
+
+local mask: Sigset
+assert(c_sigemptyset(&mask) == 0 and c_sigaddset(&mask, SIGTERM) == 0)
+assert(c_sigprocmask(SIG_BLOCK, &mask, nilptr) == 0)
+local fd = c_signalfd(-1, &mask, SFD_CLOEXEC)
+assert(fd >= 0)
+assert(content('/proc/1/comm') == 'theseus-init\n')
+local worker = c_getppid()
+assert(worker > 1)
+local code, level = execute_test_command({'/opt/theseus/bin/the', 'openrc-runlevel'}, true)
+assert(code == 0 and level == 'default\n', level)
+for _ = 1, 8 do
+  local result = sql('SELECT 42')
+  if result == 0 then break end
+  c_poll(nilptr, 0, 100)
+end
+expect_sql('SELECT 42', '42\n')
+assert(run_test_command({'/bin/busybox', 'timeout', '2', '/usr/bin/mosquitto_pub',
+  '-h', '127.0.0.1', '-q', '1', '-t', 'theseus/pid1', '-m', 'ready'}) == 0)
+assert(#content('/run/cronie.pid') > 0)
+local boot = content('/proc/cmdline')
+local restarting = string.find(boot, 'test.action=reboot', 1, true) ~= 0
+if restarting then
+  expect_sql('SELECT boot FROM theseus_pid1_stop', '1\n')
+  print('VM_OPENRC_TRANSACTION_PERSISTED')
+else
+  expect_sql('CREATE TABLE theseus_pid1_stop (boot integer PRIMARY KEY)', '')
+  expect_sql('SELECT count(*) FROM theseus_pid1_stop', '0\n')
+end
+print('VM_OPENRC_NATIVE_READY')
+io.stdout:flush()
+if string.find(boot, 'test.action=worker-crash', 1, true) ~= 0 then
+  assert(c_kill(worker, SIGKILL) == 0)
+else
+  local power: cstring = 'poweroff'
+  if restarting then power = 'reboot' end
+  assert(run_test_command({'/bin/busybox', power}) == 0)
+end
+
+local signal: [128]byte
+local count = c_read(fd, &signal[0], #signal)
+while count < 0 and errno == EINTR do count = c_read(fd, &signal[0], #signal) end
+assert(count == #signal)
+local transaction: cstring = 'INSERT INTO theseus_pid1_stop VALUES (1)'
+if restarting then transaction = 'INSERT INTO theseus_pid1_stop VALUES (2)' end
+expect_sql(transaction, '')
+print('VM_NATIVE_STOP_TRANSACTION')
+io.stdout:flush()

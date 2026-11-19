@@ -37,6 +37,29 @@ root read-only, and requests the kernel action. It returns to
 rescue if the syscall fails. A daemon-stop request only stops
 the userspace worker and leads to rescue.
 
+## OpenRC-managed services
+
+On Alpine, add theseus.openrc=1 alongside theseus.pid1=1 to boot
+the installed OpenRC runlevels. Configure OpenRC's cgroups service
+in the boot runlevel with unified cgroup mode. PID 1 runs sysinit,
+boot, and default in order. It launches the native target after
+OpenRC completes and leaves individual script and dependency
+handling to OpenRC. If the runlevel program fails, the init process
+enters rescue. A required application can still have its own
+readiness requirements after a runlevel completes.
+
+A system shutdown stops the native target first, so its clients
+can finish work using servers managed by OpenRC. PID 1 then executes
+OpenRC shutdown and finishes kernel shutdown. A failed native
+supervisor is cleaned up while already running OpenRC services
+remain available in rescue. Use the kernel option theseus.rescue=1
+to enter the console before either service manager starts.
+
+Each OpenRC invocation has a two-minute deadline. A shutdown
+request can interrupt a boot runlevel. PID 1 signals the active
+runlevel process group and then attempts the shutdown runlevel.
+A runlevel failure or timeout is reported on the console.
+
 ## VM checks
 
 Use disposable disk overlays and capture the serial console.
@@ -63,5 +86,13 @@ endpoint before leaving rescue after a supervisor crash.
 For a disk-backed guest, run a read-only filesystem check
 after the kernel action.
 
-This entry point currently starts native targets. Alpine's OpenRC
-boot and shutdown runlevels have separate userspace qualification.
+For a mixed VM check, install PostgreSQL, Mosquitto, and Cronie
+in the OpenRC default runlevel. Set up the PostgreSQL cluster and
+configure the test services for loopback. Build
+tests/pid1_openrc_guest.nelua as /opt/theseus/bin/pid1-openrc-test
+and export openrcCompiled from ./pid1fixtures as the graph.
+Boot once with test.action=poweroff, then boot the same disk with
+test.action=reboot. The native client writes a PostgreSQL transaction
+during its own shutdown and checks for it after the next boot. Boot
+a fresh overlay with test.action=worker-crash to check that OpenRC
+services remain available while the native scope is reclaimed.

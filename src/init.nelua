@@ -20,6 +20,7 @@ local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unis
 local function c_read(fd: cint, data: pointer, count: csize): clong <cimport 'read', nodecl, cinclude '<unistd.h>'> end
 local function c_write(fd: cint, data: pointer, count: csize): clong <cimport 'write', nodecl, cinclude '<unistd.h>'> end
 local function c_dup2(source: cint, dest: cint): cint <cimport 'dup2', nodecl, cinclude '<unistd.h>'> end
+local function c_setpgid(pid: cint, group: cint): cint <cimport 'setpgid', nodecl, cinclude '<unistd.h>'> end
 local function c_setsid(): cint <cimport 'setsid', nodecl, cinclude '<unistd.h>'> end
 local function c_ioctl(fd: cint, command: culong, value: cint): cint <cimport 'ioctl', nodecl, cinclude '<sys/ioctl.h>'> end
 local function c_statfs(path: cstring, data: *Statfs): cint <cimport 'statfs', nodecl, cinclude '<sys/statfs.h>'> end
@@ -84,12 +85,21 @@ local RuntimeDir = '/run/theseus-init'
 local SocketPath = RuntimeDir .. '/control.sock'
 local Delegation = '/sys/fs/cgroup/theseus-init'
 local Worker: cstring = '/sbin/theseusd'
+local OpenRC: cstring = '/sbin/openrc'
 local Rescue: cstring = '/bin/sh'
 -- 32 services each get up to four seconds for probe, leader, and cgroup cleanup.
 local WorkerGrace <comptime> = 135000
+local OpenRCGrace <comptime> = 120000
 
 local Action = @enum{None = 0, Poweroff, Reboot, Halt}
-local Session = @record{worker: cint, rescue: cint, rescue_at: integer}
+local Session = @record{
+  worker: cint,
+  rescue: cint,
+  rescue_at: integer,
+  openrc: cint,
+  openrc_failed: boolean,
+  openrc_started: boolean,
+}
 local console: cint = -1
 
 local function report(event: string)
@@ -115,31 +125,43 @@ local function directory(path: cstring, mode: cuint): boolean
   return c_mkdir(path, mode) == 0 or errno == EEXIST
 end
 
-local function mount_type(kind: cstring, path: cstring, flags: culong, magic: clong): boolean
+local function has_type(path: cstring, magic: clong): boolean
   local info: Statfs <noinit>
-  if c_statfs(path, &info) == 0 and info.f_type == magic then return true end
-  return c_mount(kind, path, kind, flags, nilptr) == 0
+  return c_statfs(path, &info) == 0 and info.f_type == magic
 end
 
-local function command_line(): (boolean, boolean)
+local function mount_type(kind: cstring, path: cstring, flags: culong, magic: clong): boolean
+  return has_type(path, magic) or c_mount(kind, path, kind, flags, nilptr) == 0
+end
+
+local function command_line(): (boolean, boolean, boolean)
   local file = io.open('/proc/cmdline', 'r')
-  if not file:isopen() then return false, false end
+  if not file:isopen() then return false, false, false end
   local line = file:read('*a')
   file:close()
-  local enabled, rescue: boolean, boolean
+  local enabled, rescue, openrc: boolean, boolean, boolean
   for option in string.gmatch(line, '%S+') do
     if option == 'theseus.pid1=1' then enabled = true end
     if option == 'theseus.rescue=1' then rescue = true end
+    if option == 'theseus.openrc=1' then openrc = true end
   end
-  return enabled, rescue
+  return enabled, rescue, openrc
 end
 
-local function provision(): boolean
+local function provision_run(): boolean
+  return directory('/run', 0x1ed) and mount_type('tmpfs', '/run', MS_NOSUID | MS_NODEV, TMPFS_MAGIC)
+end
+
+local function provision(openrc: boolean): boolean
   local flags = MS_NOSUID | MS_NODEV | MS_NOEXEC
-  return directory('/run', 0x1ed) and mount_type('tmpfs', '/run', MS_NOSUID | MS_NODEV, TMPFS_MAGIC) and
-    mount_type('sysfs', '/sys', flags, SYSFS_MAGIC) and
-    mount_type('cgroup2', '/sys/fs/cgroup', flags, CGROUP2_SUPER_MAGIC) and
-    directory((@cstring)(RuntimeDir), 0x1c0) and directory((@cstring)(Delegation), 0x1c0)
+  if not mount_type('sysfs', '/sys', flags, SYSFS_MAGIC) then return false end
+  if openrc then
+    -- OpenRC owns the hierarchy. Mounting over it could hide its service groups.
+    if not has_type('/sys/fs/cgroup', CGROUP2_SUPER_MAGIC) then return false end
+  elseif not mount_type('cgroup2', '/sys/fs/cgroup', flags, CGROUP2_SUPER_MAGIC) then
+    return false
+  end
+  return directory((@cstring)(RuntimeDir), 0x1c0) and directory((@cstring)(Delegation), 0x1c0)
 end
 
 local function signal_queue(): cint
@@ -168,11 +190,15 @@ local function notification(fd: cint, timeout: cint): (boolean, Action)
   return true, Action.None
 end
 
+local function unblock_signals()
+  local unblocked: Sigset
+  if c_sigemptyset(&unblocked) ~= 0 or c_sigprocmask(SIG_SETMASK, &unblocked, nilptr) ~= 0 then c_exit(126) end
+end
+
 local function launch(rescue: boolean): cint
   local pid = c_fork()
   if pid ~= 0 then return pid end
-  local unblocked: Sigset
-  if c_sigemptyset(&unblocked) ~= 0 or c_sigprocmask(SIG_SETMASK, &unblocked, nilptr) ~= 0 then c_exit(126) end
+  unblock_signals()
   if rescue then
     c_setsid()
     local fd = c_open(Console, O_RDWR | O_NOCTTY)
@@ -218,6 +244,10 @@ local function reap(session: *Session): boolean
       session.rescue = 0
       session.rescue_at = now_ms() + 1000
       report('rescue-exit')
+    elseif pid == session.openrc then
+      session.openrc = 0
+      session.openrc_failed = status ~= 0
+      report('openrc-exit\t' .. tostring((status >> 8) & 0xff) .. '\t' .. tostring(status & 0x7f))
     else
       report('adopted-exit\t' .. tostring(pid) .. '\t' .. tostring((status >> 8) & 0xff) .. '\t' .. tostring(status & 0x7f))
     end
@@ -237,6 +267,63 @@ local function await_cleanup(fd: cint, session: *Session, worker_only: boolean, 
     notification(fd, (@cint)(timeout))
   end
   return false
+end
+
+local function launch_openrc(level: cstring): cint
+  local pid = c_fork()
+  if pid > 0 then
+    c_setpgid(pid, pid)
+  elseif pid == 0 then
+    if c_setpgid(0, 0) ~= 0 then c_exit(126) end
+    unblock_signals()
+    local argv: [3]cstring = {OpenRC, level, nilptr}
+    c_execv(OpenRC, &argv[0])
+    c_exit(127)
+  end
+  return pid
+end
+
+-- Keep PID 1 responsive while the distribution's runlevel program runs.
+local function openrc_phase(fd: cint, session: *Session, level: cstring, interruptible: boolean): (boolean, Action)
+  report('openrc-start\t' .. tostring(level))
+  session.openrc = launch_openrc(level)
+  if session.openrc <= 0 then return false, Action.None end
+  local deadline = now_ms() + OpenRCGrace
+  local action = Action.None
+  local interrupted = false
+  while session.openrc > 0 do
+    local ok, received = notification(fd, 100)
+    reap(session)
+    if interruptible and action == Action.None and received ~= Action.None then action = received end
+    if session.openrc <= 0 then break end
+    local now = now_ms()
+    if not interrupted and (now >= deadline or action ~= Action.None or not ok) then
+      if now >= deadline then report('openrc-timeout\t' .. tostring(level)) end
+      if c_kill(-session.openrc, SIGTERM) ~= 0 then c_kill(session.openrc, SIGTERM) end
+      interrupted = true
+      deadline = now + 2000
+    elseif interrupted and now >= deadline then
+      if c_kill(-session.openrc, SIGKILL) ~= 0 then c_kill(session.openrc, SIGKILL) end
+      -- Poll one final bounded interval for the phase leader to exit.
+      for _ = 1, 10 do
+        notification(fd, 100)
+        reap(session)
+        if session.openrc <= 0 then break end
+      end
+      break
+    end
+  end
+  return session.openrc == 0 and not session.openrc_failed and not interrupted, action
+end
+
+local function boot_openrc(fd: cint, session: *Session): (boolean, Action)
+  session.openrc_started = true
+  local levels: [3]cstring = {'sysinit', 'boot', 'default'}
+  for i = 0, 2 do
+    local ok, action = openrc_phase(fd, session, levels[i], true)
+    if not ok or action ~= Action.None then return false, action end
+  end
+  return true, Action.None
 end
 
 local function shutdown(fd: cint, session: *Session, action: Action, had_worker: boolean)
@@ -259,8 +346,13 @@ local function shutdown(fd: cint, session: *Session, action: Action, had_worker:
     end
   end
   if had_worker and not reclaim() then report('supervisor-reclaim-failed') end
-  -- The service supervisor gets its graceful, ordered stop first.
-  -- Sweep children and session processes outside its managed cgroups last.
+  -- Keep compatibility services available until native clients have stopped.
+  if session.openrc_started then
+    if session.openrc > 0 then report('openrc-phase-still-running')
+    elseif not openrc_phase(fd, session, 'shutdown', false) then report('openrc-shutdown-failed') end
+    session.openrc_started = false
+  end
+  -- Sweep children and session processes outside the managed cgroups last.
   c_kill(-1, SIGTERM)
   if not await_cleanup(fd, session, false, 2000) then
     c_kill(-1, SIGKILL)
@@ -279,26 +371,38 @@ local function run()
   directory('/sys', 0x1ed)
   if c_access(Console, 0) ~= 0 then c_mount('devtmpfs', '/dev', 'devtmpfs', MS_NOSUID, nilptr) end
   console = c_open(Console, O_WRONLY | O_NONBLOCK | O_CLOEXEC | O_NOCTTY)
-  local boot, preferred_rescue = false, false
+  local boot, preferred_rescue, openrc = false, false, false
   if mount_type('proc', '/proc', MS_NOSUID | MS_NODEV | MS_NOEXEC, PROC_SUPER_MAGIC) then
-    boot, preferred_rescue = command_line()
+    boot, preferred_rescue, openrc = command_line()
   end
   c_setenv('PATH', '/usr/sbin:/usr/bin:/sbin:/bin', 1)
   local fd = signal_queue()
   if fd >= 0 and c_reboot(RB_DISABLE_CAD) ~= 0 then report('ctrl-alt-del-config-failed') end
   local session: Session
   local reason: string
+  local pending = Action.None
   if fd < 0 then
     reason = 'signal-queue'
   elseif not boot then
     reason = 'missing-opt-in'
   elseif preferred_rescue then
     reason = 'requested'
-  elseif not provision() then
+  elseif not provision_run() then
     reason = 'boot-filesystems'
   else
-    session.worker = launch(false)
-    if session.worker <= 0 then reason = 'supervisor-fork' end
+    if openrc then
+      local ok: boolean
+      ok, pending = boot_openrc(fd, &session)
+      if not ok then reason = 'openrc-boot' end
+    end
+    if #reason == 0 then
+      if not provision(openrc) then
+        reason = 'boot-filesystems'
+      else
+        session.worker = launch(false)
+        if session.worker <= 0 then reason = 'supervisor-fork' end
+      end
+    end
   end
   local had_worker = session.worker > 0
   local in_rescue = not had_worker
@@ -307,7 +411,9 @@ local function run()
   while true do
     local timeout: cint = 100
     if fd < 0 then timeout = 1000 end
-    local ok, action = notification(fd, timeout)
+    local ok, action = true, pending
+    if pending == Action.None then ok, action = notification(fd, timeout) end
+    pending = Action.None
     reap(&session)
     if action ~= Action.None then
       shutdown(fd, &session, action, had_worker)
