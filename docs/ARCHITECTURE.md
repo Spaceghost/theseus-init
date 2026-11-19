@@ -17,7 +17,7 @@ CUE service declarations
         |
         | validate + compile
         v
-TSC2 and TSC4 service records / TSC3 graph records
+TSC2 and TSC4 service records / TSC3 and TSC5 graph records
         |
         v
 Nelua Theseus core
@@ -67,9 +67,10 @@ which uses the same field layout and appends the absolute socket path
 and startup timeout in milliseconds. Legacy TSC2 records declaring
 Unix socket readiness need recompilation before the daemon starts them.
 
-The graph planner consumes TSC3 service records, which append the
-`requires`, `wants`, `after`, and `before` lists to the service fields. It
-reads target membership from TGT1 records in the same input.
+Graph records append the `requires`, `wants`, `after`, and `before`
+lists to the service fields. TSC3 wraps the TSC2 fields. TSC5 wraps the
+TSC4 fields and preserves Unix readiness settings. TGT1 records supply
+target membership in the same input.
 
 ## Userspace daemon
 
@@ -101,6 +102,35 @@ one of `ready`, `timeout`, or `exited-before-ready`.
 The live daemon implements this probe. The one-shot CLI can inspect
 TSC4 service configuration and directs socket-ready services to
 `theseusd` for execution.
+
+## Native targets
+
+Set `THESEUS_GRAPH` to the compiled graph file and start
+`theseusd --target TARGET` in the foreground. The daemon validates the
+complete target graph and selected runtime records before binding the
+control socket or creating children. It uses the same order as
+`theseus-graph TARGET`. Self-edges and other cycles fail before a plan is
+published.
+
+Target members and their transitive `requires` dependencies are
+required. The daemon admits foreground services in order, waiting for
+the preceding startup verdict and any hard dependencies to be running.
+A terminal failure of a wanted service allows the target to continue.
+A wanted service whose hard dependency fails is skipped. If a required
+service stops or fails and has no remaining restart scheduled, the
+daemon shuts down the target and exits 82. A dependency's restart
+backoff after startup leaves existing services running.
+
+A close-on-exec handshake keeps newly forked children in `STARTING`
+until exec succeeds or reports failure. Services with socket readiness
+then wait for their listener. Services configured as `none` or `pid`
+need no application probe after exec.
+
+Use the live `the state of SERVICE` against the target's control socket
+to inspect any selected service. `theseus daemon-stop` stops and reaps
+owned direct children in reverse plan order. Target events report
+running, failed, skipped, and stopping outcomes. One daemon manages
+one target, and the target contains up to 32 services.
 
 ## PID 1 boundary
 

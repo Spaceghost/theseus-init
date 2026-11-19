@@ -66,6 +66,7 @@ jobs:
             rc=$?
           fi
           test "$rc" -eq 67
+          test ! -s build/cycle.out
           grep -F 'dependency/order cycle' build/cycle.err
 
       - name: Reject missing hard dependency
@@ -80,3 +81,17 @@ jobs:
           fi
           test "$rc" -eq 66
           grep -F 'missing hard dependency: missing-hard-dependency' build/broken.err
+
+      - name: Reject self-dependencies without emitting partial plans
+        run: |
+          set -eux
+          export THESEUS_GRAPH="$PWD/build/self-loop.tsc"
+          for edges in 'self,,,' ',self,,' ',,self,' ',,,self'; do
+            IFS=, read -r requires wants after before <<<"${edges%,},"
+            printf 'TSC3\tself\t/bin/true\tnever\t0\tnone\t%s\t%s\t%s\t%s\nTGT1\tloop\tself\n' \
+              "$requires" "$wants" "$after" "$before" >"$THESEUS_GRAPH"
+            rc=0
+            build/theseus-graph loop >build/self-loop.out 2>build/self-loop.err || rc=$?
+            test "$rc" -eq 67
+            test ! -s build/self-loop.out
+          done

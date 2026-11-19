@@ -44,15 +44,15 @@ Generated C from Nelua is a build artifact, never maintained source. Shell scrip
 
 ## Current status
 
-The userspace daemon supervises one foreground child per invocation. It
-tracks the child with a Linux pidfd, applies bounded restart policy, and
-serves status and shutdown requests over a local Unix socket. For
-services with Unix socket readiness, the daemon waits for a listener
-owned by the supervised process. The native
-target planner validates dependencies and produces an execution order.
+The userspace daemon supervises an individual foreground service or a
+native target. It tracks direct children with Linux pidfds, applies
+bounded restart policy, and serves status and shutdown requests over
+a local Unix socket. A target uses the validated dependency order and
+waits for the configured service readiness before admitting subsequent
+services. Run it with `theseusd --target TARGET`.
 
-Target execution, descendant ownership, and broader Alpine package
-qualification are still pending. The rescue entry point below is separate from the service
+Application-level health checks, descendant ownership, and broader
+Alpine package qualification are still pending. The rescue entry point below is separate from the service
 supervisor.
 
 ## Early boot in nebox

@@ -169,6 +169,10 @@ jobs:
             sleep 0.02
           done
           test "$(stat -c '%a' "$THESEUS_SOCKET")" = 600
+          for i in $(seq 1 100); do
+            if test "$(timeout 2s build/live/the state of sleep-stop)" = RUNNING; then break; fi
+            sleep 0.02
+          done
           if ! build/live/the status of sleep-stop | tee build/live/status.txt; then
             cat build/live/daemon.log >&2
             exit 1
@@ -329,4 +333,96 @@ jobs:
           test -S "$job_dir/service.sock"
           rm "$job_dir/service.sock" "$job_dir/services.tsc" "$job_dir/gate" "$job_dir/child-started"
           rmdir "$job_dir"
+          trap - EXIT
+
+      - name: Execute native targets with readiness, rollback, and reverse shutdown
+        run: |
+          set -eux
+          job_dir="$(mktemp -d "$RUNNER_TEMP/tst.XXXXXXXX")"
+          export THESEUS_SOCKET="$job_dir/control.sock"
+          export THESEUS_GRAPH="$job_dir/graph.tsc"
+          cue export ./targetfixtures -e compiled --out text -t "testDir=$job_dir" \
+            -t "testProgram=$PWD/build/live/control-test" > "$THESEUS_GRAPH"
+          daemon_pid=
+          cleanup() {
+            if test -n "$daemon_pid"; then
+              kill "$daemon_pid" 2>/dev/null || true
+              wait "$daemon_pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          wait_state() {
+            for i in $(seq 1 150); do
+              if test -S "$THESEUS_SOCKET" &&
+                 test "$(timeout 2s build/live/the state of "$1")" = "$2"; then return 0; fi
+              sleep 0.02
+            done
+            return 1
+          }
+
+          check_reaped() {
+            test ! -e "$THESEUS_SOCKET"
+            spawned="$(awk '$1 == "daemon-spawn" {print $4}' "$1")"
+            test -n "$spawned"
+            for pid in $spawned; do test ! -e "/proc/$pid"; done
+          }
+
+          build/live/theseusd --target demo >build/live/target-demo.log 2>&1 &
+          daemon_pid=$!
+          wait_state gate STARTING
+          test "$(timeout 2s build/live/the state of app)" = PLANNED
+          touch "$job_dir/release"
+          wait_state app RUNNING
+          test "$(timeout 2s build/live/the state of skipped)" = FAILED
+          timeout 8s build/live/theseus daemon-stop
+          wait "$daemon_pid"
+          daemon_pid=
+          grep -Fx "$(printf 'TE1\ttarget\tdemo\trunning')" build/live/target-demo.log
+          awk '$1 == "TE1" && $2 == "target" && $4 == "stopping" {print $5}' \
+            build/live/target-demo.log > "$job_dir/stop-order"
+          printf 'app\ngate\n' | cmp - "$job_dir/stop-order"
+          ! grep -F "$(printf 'daemon-spawn\tskipped\t')" build/live/target-demo.log
+          check_reaped build/live/target-demo.log
+
+          rm "$job_dir/gate.sock"
+          build/live/theseusd --target demo >build/live/target-lost.log 2>&1 &
+          daemon_pid=$!
+          wait_state app RUNNING
+          gate_pid="$(timeout 2s build/live/the status of gate | awk '$1 == "pid" {print $2}')"
+          test "$gate_pid" -gt 0
+          kill -TERM "$gate_pid"
+          timeout 8s tail --pid="$daemon_pid" -f /dev/null
+          rc=0
+          wait "$daemon_pid" || rc=$?
+          daemon_pid=
+          test "$rc" -eq 82
+          grep -Fx "$(printf 'TE1\ttarget\tdemo\tfailed\tgate')" build/live/target-lost.log
+          check_reaped build/live/target-lost.log
+
+          build/live/theseusd --target rollback >build/live/target-rollback.log 2>&1 &
+          daemon_pid=$!
+          timeout 8s tail --pid="$daemon_pid" -f /dev/null
+          rc=0
+          wait "$daemon_pid" || rc=$?
+          daemon_pid=
+          test "$rc" -eq 82
+          grep -Fx "$(printf 'TE1\ttarget\trollback\tfailed\tbad')" build/live/target-rollback.log
+          ! grep -F "$(printf 'daemon-spawn\tunstarted\t')" build/live/target-rollback.log
+          check_reaped build/live/target-rollback.log
+
+          rc=0
+          timeout 8s build/live/theseusd --target bad-exec >build/live/target-exec.log 2>&1 || rc=$?
+          test "$rc" -eq 82
+          grep -Fx "$(printf 'TE1\tservice\texec-failure\t1\texec-failed')" build/live/target-exec.log
+          ! grep -F "$(printf 'daemon-spawn\texec-dependent\t')" build/live/target-exec.log
+          check_reaped build/live/target-exec.log
+
+          export THESEUS_GRAPH="$PWD/build/invalid-target.tsc"
+          printf 'TSC3\tself\t/bin/true\tnever\t0\tnone\tself\t\t\t\nTGT1\tloop\tself\n' > "$THESEUS_GRAPH"
+          rc=0
+          timeout 2s build/live/theseusd --target loop >build/live/target-invalid.log 2>&1 || rc=$?
+          test "$rc" -eq 67
+          test ! -e "$THESEUS_SOCKET"
+          ! grep -F 'daemon-spawn' build/live/target-invalid.log
           trap - EXIT

@@ -8,6 +8,7 @@ require 'io'
 require 'math'
 require 'os'
 require 'string'
+require 'src.theseus.graph'
 
 local function c_fork(): cint <cimport 'fork', nodecl, cinclude '<unistd.h>'> end
 local function c_execvp(file: cstring, argv: *cstring): cint <cimport 'execvp', nodecl, cinclude '<unistd.h>'> end
@@ -24,6 +25,8 @@ local function c_getsockopt(fd: cint, level: cint, option: cint, value: pointer,
 local function c_bind(fd: cint, address: pointer, length: cuint): cint <cimport 'bind', nodecl, cinclude '<sys/socket.h>'> end
 local function c_listen(fd: cint, backlog: cint): cint <cimport 'listen', nodecl, cinclude '<sys/socket.h>'> end
 local function c_accept4(fd: cint, address: pointer, length: pointer, flags: cint): cint <cimport 'accept4', nodecl, cinclude '<sys/socket.h>'> end
+local function c_pipe2(fds: *cint, flags: cint): cint <cimport 'pipe2', nodecl, cinclude '<unistd.h>'> end
+local function c_write(fd: cint, buffer: pointer, count: csize): clong <cimport 'write', nodecl, cinclude '<unistd.h>'> end
 local function c_read(fd: cint, buffer: pointer, count: csize): clong <cimport 'read', nodecl, cinclude '<unistd.h>'> end
 local function c_send(fd: cint, buffer: pointer, count: csize, flags: cint): clong <cimport 'send', nodecl, cinclude '<sys/socket.h>'> end
 local function c_unlink(path: cstring): cint <cimport 'unlink', nodecl, cinclude '<unistd.h>'> end
@@ -67,6 +70,8 @@ local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
 local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
 local EAGAIN: cint <cimport, nodecl, cinclude '<errno.h>'>
 local ESRCH: cint <cimport, nodecl, cinclude '<errno.h>'>
+local O_CLOEXEC: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local O_NONBLOCK: cint <cimport, nodecl, cinclude '<fcntl.h>'>
 local POLLIN: cshort <cimport, nodecl, cinclude '<poll.h>'>
 local SYS_pidfd_open: clong <cimport, nodecl, cinclude '<sys/syscall.h>'>
 local SYS_pidfd_send_signal: clong <cimport, nodecl, cinclude '<sys/syscall.h>'>
@@ -96,9 +101,11 @@ local ExecArgv = @record{
 
 local Runtime = @record{
   service: Service,
+  status_request: string,
   state: ServiceState,
   pid: cint,
   pidfd: cint,
+  execfd: cint,
   attempts: integer,
   restarts: integer,
   action_at: integer,
@@ -106,6 +113,18 @@ local Runtime = @record{
   kill_sent: boolean,
   last_exit: integer,
   last_signal: integer,
+}
+
+local Supervision = @record{
+  name: string,
+  target: boolean,
+  count: integer,
+  next_start: integer,
+  announced: boolean,
+  runtimes: [NativeMaxServices]Runtime,
+  arguments: [NativeMaxServices]ExecArgv,
+  required: [NativeMaxServices]boolean,
+  needs: [NativeMaxServices][NativeMaxServices]boolean,
 }
 
 local function state_name(state: ServiceState): string
@@ -264,16 +283,30 @@ end
 local function spawn(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset): boolean
   runtime.state = ServiceState.Starting
   runtime.attempts = runtime.attempts + 1
+  local handshake: [2]cint
+  if c_pipe2(&handshake[0], O_CLOEXEC | O_NONBLOCK) ~= 0 then
+    runtime.state = ServiceState.Failed
+    return false
+  end
   local pid = c_fork()
   if pid == 0 then
+    c_close(handshake[0])
     if c_sigprocmask(SIG_SETMASK, child_mask, nilptr) == 0 then
       c_execvp(argv.cargs[0], &argv.cargs[0])
     end
+    local failed: cchar = 1
+    c_write(handshake[1], &failed, 1)
     c__exit(127)
   end
-  if pid < 0 then runtime.state = ServiceState.Failed; return false end
+  c_close(handshake[1])
+  if pid < 0 then
+    c_close(handshake[0])
+    runtime.state = ServiceState.Failed
+    return false
+  end
   local pidfd = pidfd_open_for(pid)
   if pidfd < 0 then
+    c_close(handshake[0])
     c_kill(pid, SIGKILL)
     local status: cint = 0
     wait_for_child(pid, &status)
@@ -282,14 +315,37 @@ local function spawn(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset): b
   end
   runtime.pid = pid
   runtime.pidfd = pidfd
-  if runtime.service.readiness == ReadinessKind.UnixSocket then
+  runtime.execfd = handshake[0]
+  local timeout = runtime.service.readiness_timeout
+  if timeout == 0 then timeout = 30000 end
+  runtime.ready_by = monotonic_ms() + timeout
+  runtime.action_at = runtime.ready_by
+  print('daemon-spawn', runtime.service.name, 'pid', pid, 'pidfd', pidfd, 'attempt', runtime.attempts)
+  return true
+end
+
+local function close_execfd(runtime: *Runtime)
+  if runtime.execfd >= 0 then
+    c_close(runtime.execfd)
+    runtime.execfd = -1
+  end
+end
+
+local function record_exec(runtime: *Runtime): boolean
+  local failed: cchar
+  local got = c_read(runtime.execfd, &failed, 1)
+  if got < 0 then return errno == EAGAIN or errno == EINTR end
+  close_execfd(runtime)
+  if runtime.state ~= ServiceState.Starting then return true end
+  if got > 0 then
+    print('TE1', 'service', runtime.service.name, runtime.attempts, 'exec-failed')
+  elseif runtime.service.readiness == ReadinessKind.UnixSocket then
     runtime.action_at = monotonic_ms()
-    runtime.ready_by = runtime.action_at + runtime.service.readiness_timeout
   else
     if runtime.service.readiness == ReadinessKind.Pid then runtime.state = ServiceState.Ready end
     runtime.state = ServiceState.Running
+    runtime.action_at = 0
   end
-  print('daemon-spawn', runtime.service.name, 'pid', pid, 'pidfd', pidfd, 'attempt', runtime.attempts)
   return true
 end
 
@@ -304,6 +360,7 @@ end
 local function reap(runtime: *Runtime): boolean
   local status: cint = 0
   if not wait_for_child(runtime.pid, &status) then return false end
+  close_execfd(runtime)
   c_close(runtime.pidfd)
   runtime.pidfd = -1
   runtime.pid = 0
@@ -413,7 +470,7 @@ local function advance_service(runtime: *Runtime, argv: *ExecArgv, child_mask: *
       runtime.action_at = now + 1000
       return signal_child(runtime, SIGTERM)
     end
-    if has_ready_peer(runtime) then
+    if runtime.execfd < 0 and runtime.service.readiness == ReadinessKind.UnixSocket and has_ready_peer(runtime) then
       runtime.state = ServiceState.Ready
       print('TE1', 'readiness', runtime.service.name, runtime.attempts, 'ready')
       runtime.state = ServiceState.Running
@@ -513,27 +570,103 @@ local function stop_child(runtime: *Runtime): boolean
   return true
 end
 
-local function serve(listener: cint, shutdown_fd: cint, runtime: *Runtime, argv: *ExecArgv,
+local function terminal(state: ServiceState): boolean
+  return state == ServiceState.Failed or state == ServiceState.Stopped
+end
+
+local function advance_target(group: *Supervision, child_mask: *Sigset): integer
+  for i: integer = 0, group.count - 1 do
+    local runtime = &group.runtimes[i]
+    if group.required[i] then
+      if terminal(runtime.state) then
+        print('TE1', 'target', group.name, 'failed', runtime.service.name)
+        return 82
+      end
+    end
+  end
+
+  -- Admit services in the planner's order, waiting for each startup verdict.
+  while group.next_start < group.count do
+    local i = group.next_start
+    if i > 0 then
+      local previous = group.runtimes[i - 1].state
+      if previous ~= ServiceState.Running and not terminal(previous) then return 0 end
+    end
+    local runtime = &group.runtimes[i]
+    local unavailable: integer = -1
+    for j: integer = 0, i - 1 do
+      if group.needs[i][j] then
+        local dependency = group.runtimes[j].state
+        if terminal(dependency) then unavailable = j; break end
+        if dependency ~= ServiceState.Running then return 0 end
+      end
+    end
+    if unavailable >= 0 then
+      runtime.state = ServiceState.Failed
+      print('TE1', 'target', group.name, 'skipped', runtime.service.name,
+            group.runtimes[unavailable].service.name)
+    elseif not spawn(runtime, &group.arguments[i], child_mask) then
+      print('TE1', 'target', group.name, 'failed', runtime.service.name)
+      return 80
+    end
+    group.next_start = i + 1
+  end
+  if not group.announced then
+    for i: integer = 0, group.count - 1 do
+      if group.required[i] and group.runtimes[i].state ~= ServiceState.Running then return 0 end
+    end
+    local last = group.runtimes[group.count - 1].state
+    if last == ServiceState.Running or terminal(last) then
+      print('TE1', 'target', group.name, 'running')
+      group.announced = true
+    end
+  end
+  return 0
+end
+
+local function reply_status(client: cint, request: string, group: *Supervision)
+  for i: integer = 0, group.count - 1 do
+    local runtime = &group.runtimes[i]
+    if request == runtime.status_request then
+      write_status(client, runtime)
+      return
+    end
+  end
+  write_all(client, 'TR1\tERROR\trequest\n')
+end
+
+local function serve(listener: cint, shutdown_fd: cint, group: *Supervision,
                      child_mask: *Sigset): (integer, cint)
-  local fds: [3 + MaxClients]Pollfd
+  local fds: [2 + MaxClients + 2 * NativeMaxServices]Pollfd
+  local first_child = 2 + MaxClients
+  local first_exec = first_child + group.count
+  local count = first_exec + group.count
   fds[0] = {fd = listener, events = POLLIN}
   fds[1] = {fd = shutdown_fd, events = POLLIN}
-  fds[2].events = POLLIN
+  for i: integer = 0, group.count - 1 do
+    fds[first_child + i].events = POLLIN
+    fds[first_exec + i].events = POLLIN
+  end
   local clients: [MaxClients]ControlClient
   for slot: integer = 0, MaxClients - 1 do
-    fds[slot + 3] = {fd = -1, events = POLLIN}
+    fds[slot + 2] = {fd = -1, events = POLLIN}
   end
 
   local exit_code: integer = 0
   local shutdown_client: cint = -1
-  local status_request = 'TQ1\tSTATUS\t' .. runtime.service.name .. '\n'
   while true do
-    fds[2].fd = runtime.pidfd
-    local deadline = runtime.action_at
+    local deadline: integer = 0
+    for i: integer = 0, group.count - 1 do
+      local runtime = &group.runtimes[i]
+      fds[first_child + i].fd = runtime.pidfd
+      fds[first_exec + i].fd = runtime.execfd
+      local action = runtime.action_at
+      if action ~= 0 and (deadline == 0 or action < deadline) then deadline = action end
+    end
     local now = monotonic_ms()
     local free_slot: integer = -1
     for slot: integer = 0, MaxClients - 1 do
-      local event = &fds[slot + 3]
+      local event = &fds[slot + 2]
       local expires = clients[slot].deadline
       if event.fd >= 0 and expires <= now then
         c_close(event.fd)
@@ -548,17 +681,30 @@ local function serve(listener: cint, shutdown_fd: cint, runtime: *Runtime, argv:
     local timeout: cint = -1
     if deadline > now then timeout = (@cint)(deadline - now)
     elseif deadline ~= 0 then timeout = 0 end
-    local ready = c_poll(&fds[0], 3 + MaxClients, timeout)
+    local ready = c_poll(&fds[0], (@culong)(count), timeout)
     if ready < 0 then
       if errno ~= EINTR then exit_code = 79; break end
     else
       if fds[1].revents ~= 0 then break end
-      if fds[2].revents ~= 0 then
-        if (fds[2].revents & POLLIN) == 0 or not record_exit(runtime) then exit_code = 80; break end
+      for i: integer = 0, group.count - 1 do
+        local runtime = &group.runtimes[i]
+        local event = fds[first_child + i].revents
+        -- Process the handshake before the exit, even when a fast child exits
+        -- after poll reported only its pidfd.
+        if runtime.execfd >= 0 and (fds[first_exec + i].revents ~= 0 or event ~= 0) and
+           not record_exec(runtime) then
+          exit_code = 80
+          break
+        end
+        if event ~= 0 and ((event & POLLIN) == 0 or not record_exit(runtime)) then
+          exit_code = 80
+          break
+        end
       end
+      if exit_code ~= 0 then break end
 
       for slot: integer = 0, MaxClients - 1 do
-        local event = &fds[slot + 3]
+        local event = &fds[slot + 2]
         if event.revents == 0 then continue end
         local state, request = read_request(event.fd, &clients[slot])
         if state == RequestState.Pending then continue end
@@ -567,8 +713,8 @@ local function serve(listener: cint, shutdown_fd: cint, runtime: *Runtime, argv:
           event.fd = -1
           break
         end
-        if state == RequestState.Complete and request == status_request then
-          write_status(event.fd, runtime)
+        if state == RequestState.Complete then
+          reply_status(event.fd, request, group)
         elseif state ~= RequestState.Closed then
           write_all(event.fd, 'TR1\tERROR\trequest\n')
         end
@@ -580,49 +726,124 @@ local function serve(listener: cint, shutdown_fd: cint, runtime: *Runtime, argv:
       if (fds[0].revents & POLLIN) ~= 0 then
         local fd = c_accept4(listener, nilptr, nilptr, SOCK_CLOEXEC | SOCK_NONBLOCK)
         if fd >= 0 then
-          fds[free_slot + 3].fd = fd
+          fds[free_slot + 2].fd = fd
           clients[free_slot].used = 0
           clients[free_slot].deadline = monotonic_ms() + ControlTimeout
         elseif errno ~= EAGAIN and errno ~= EINTR then exit_code = 79; break end
       elseif fds[0].revents ~= 0 then exit_code = 79; break end
 
-      if not advance_service(runtime, argv, child_mask) then exit_code = 80; break end
+      for i: integer = 0, group.count - 1 do
+        if not advance_service(&group.runtimes[i], &group.arguments[i], child_mask) then
+          exit_code = 80
+          break
+        end
+      end
+      if exit_code ~= 0 then break end
+      if group.target then
+        exit_code = advance_target(group, child_mask)
+        if exit_code ~= 0 then break end
+      end
     end
   end
 
   for slot: integer = 0, MaxClients - 1 do
-    local fd = fds[slot + 3].fd
+    local fd = fds[slot + 2].fd
     if fd >= 0 then c_close(fd) end
   end
   return exit_code, shutdown_client
 end
 
-local function main(): integer
-  if #arg ~= 1 then io.stderr:write('usage: theseusd SERVICE\n'); return 64 end
+local function load_target(name: string, group: *Supervision): integer
+  local path = os.getenv('THESEUS_GRAPH')
+  if #path == 0 then path = './build/graph.tsc' end
+  local graph: NativeGraph
+  if not load_native_graph(path, &graph) then return 65 end
+  local plan: NativePlan
+  local code = plan_native_target(&graph, name, &plan)
+  if code ~= 0 then return code end
+  group.count = plan.count
+  group.needs = plan.needs
+  for i: integer = 0, plan.count - 1 do
+    local member = plan.order[i]
+    local ok, service = parse_service(graph.services[member].runtime_record)
+    if not ok then
+      io.stderr:write('theseusd: invalid runtime fields for ', graph.services[member].name, '\n')
+      return 65
+    end
+    group.runtimes[i].service = service
+    group.required[i] = plan.required[member]
+  end
+  return 0
+end
+
+local function load_single(name: string, group: *Supervision): integer
   local records = os.getenv('THESEUS_RECORDS')
   if #records == 0 then records = './build/services.tsc' end
-  local ok: boolean
-  local service: Service
-  ok, service = load_service(records, arg[1])
-  if not ok then io.stderr:write('theseusd: unknown service: ', arg[1], '\n'); return 3 end
-  if service.readiness == ReadinessKind.UnixSocket then
-    if #service.readiness_path == 0 then
-      io.stderr:write('theseusd: recompile the service to supply its unix-socket readiness path\n')
-      return 69
-    end
-    if not peer_pidfd_available() then
-      io.stderr:write('theseusd: unix-socket readiness requires kernel SO_PEERPIDFD support\n')
-      return 69
-    end
-  end
-  local argv: ExecArgv
-  if not decode_argv(service.argv_serialized, &argv) then return 65 end
+  local ok, service = load_service(records, name)
+  if not ok then io.stderr:write('theseusd: unknown service: ', name, '\n'); return 3 end
+  group.count = 1
+  group.runtimes[0].service = service
+  return 0
+end
 
-  local path = socket_path()
-  if service.readiness_path == path then
-    io.stderr:write('theseusd: readiness and control sockets need distinct paths\n')
-    return 65
+local function prepare(group: *Supervision, path: string): integer
+  local socket_probes = false
+  for i: integer = 0, group.count - 1 do
+    local runtime = &group.runtimes[i]
+    local service = &runtime.service
+    if not decode_argv(service.argv_serialized, &group.arguments[i]) then
+      io.stderr:write('theseusd: invalid argv for ', service.name, '\n')
+      return 65
+    end
+    runtime.pidfd = -1
+    runtime.execfd = -1
+    runtime.last_exit = -1
+    runtime.status_request = 'TQ1\tSTATUS\t' .. service.name .. '\n'
+    if service.readiness == ReadinessKind.UnixSocket then
+      local endpoint = service.readiness_path
+      if #endpoint == 0 then
+        io.stderr:write('theseusd: recompile the service to supply its unix-socket readiness path\n')
+        return 69
+      end
+      if endpoint == path then
+        io.stderr:write('theseusd: readiness and control sockets need distinct paths\n')
+        return 65
+      end
+      for j: integer = 0, i - 1 do
+        if group.runtimes[j].service.readiness_path == endpoint then
+          io.stderr:write('theseusd: multiple services declare readiness at ', endpoint, '\n')
+          return 65
+        end
+      end
+      socket_probes = true
+    end
   end
+  if socket_probes and not peer_pidfd_available() then
+    io.stderr:write('theseusd: unix-socket readiness requires kernel SO_PEERPIDFD support\n')
+    return 69
+  end
+  return 0
+end
+
+local function main(): integer
+  local group: Supervision
+  local code: integer
+  if #arg == 2 and arg[1] == '--target' then
+    group.target = true
+    group.name = arg[2]
+    code = load_target(group.name, &group)
+  elseif #arg == 1 and arg[1] ~= '--target' then
+    group.name = arg[1]
+    code = load_single(group.name, &group)
+  else
+    io.stderr:write('usage: theseusd SERVICE | theseusd --target TARGET\n')
+    return 64
+  end
+  if code ~= 0 then return code end
+  local path = socket_path()
+  code = prepare(&group, path)
+  if code ~= 0 then return code end
+
   if c_access((@cstring)(path), 0) == 0 then
     io.stderr:write('theseusd: refusing pre-existing control socket path: ', path, '\n')
     return 73
@@ -641,15 +862,26 @@ local function main(): integer
   if bound ~= 0 then return 75 end
   if c_listen(listener, 8) ~= 0 then c_close(listener); c_unlink((@cstring)(path)); return 77 end
 
-  local runtime: Runtime = {service = service, state = ServiceState.Planned, pidfd = -1, last_exit = -1}
   local exit_code: integer = 78
   local shutdown_client: cint = -1
-  if spawn(&runtime, &argv, &child_mask) then
-    exit_code, shutdown_client = serve(listener, shutdown_fd, &runtime, &argv, &child_mask)
+  if group.target then
+    exit_code = advance_target(&group, &child_mask)
+  elseif spawn(&group.runtimes[0], &group.arguments[0], &child_mask) then
+    exit_code = 0
+  end
+  if exit_code == 0 then
+    exit_code, shutdown_client = serve(listener, shutdown_fd, &group, &child_mask)
   end
 
   c_close(listener)
-  local stopped = stop_child(&runtime)
+  local stopped = true
+  for i: integer = group.count - 1, 0, -1 do
+    local runtime = &group.runtimes[i]
+    if runtime.pidfd >= 0 and group.target then
+      print('TE1', 'target', group.name, 'stopping', runtime.service.name)
+    end
+    if not stop_child(runtime) then stopped = false end
+  end
   c_unlink((@cstring)(path))
   c_close(shutdown_fd)
   if shutdown_client >= 0 then
@@ -661,7 +893,7 @@ local function main(): integer
     io.stderr:write('theseusd: failed to stop owned child\n')
     return 81
   end
-  print('daemon-stopped', service.name)
+  print('daemon-stopped', group.name)
   return exit_code
 end
 

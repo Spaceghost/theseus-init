@@ -1,0 +1,311 @@
+require 'io'
+require 'string'
+
+global NativeMaxServices <comptime> = 32
+local MAX_TARGETS: integer = 16
+
+local GraphService = @record{
+  name: string,
+  runtime_record: string,
+  requires: string,
+  wants: string,
+  after: string,
+  before: string,
+}
+
+local Target = @record{
+  name: string,
+  members: string,
+}
+
+global NativeGraph = @record{
+  services: [NativeMaxServices]GraphService,
+  service_count: integer,
+  targets: [16]Target,
+  target_count: integer,
+}
+
+local function next_field(line: string, cursor: isize): (string, isize)
+  local first, last = string.find(line, '\t', cursor, true)
+  if first == 0 then return string.sub(line, cursor), 0 end
+  return string.sub(line, cursor, first - 1), last + 1
+end
+
+local function next_list_item(list: string, cursor: isize): (string, isize)
+  if cursor == 0 then return '', 0 end
+  local first, last = string.find(list, ',', cursor, true)
+  if first == 0 then return string.sub(list, cursor), 0 end
+  return string.sub(list, cursor, first - 1), last + 1
+end
+
+local function list_contains(list: string, wanted: string): boolean
+  if #list == 0 then return false end
+  local cursor: isize = 1
+  while cursor ~= 0 do
+    local item: string
+    item, cursor = next_list_item(list, cursor)
+    if item == wanted then return true end
+  end
+  return false
+end
+
+local function valid_name(name: string): boolean
+  return #name <= 63 and string.find(name, '^[a-zA-Z0-9][a-zA-Z0-9._@:+-]*$') == 1
+end
+
+local function valid_list(list: string): boolean
+  if #list == 0 then return true end
+  local cursor: isize = 1
+  while cursor ~= 0 do
+    local item: string
+    item, cursor = next_list_item(list, cursor)
+    if not valid_name(item) then return false end
+  end
+  return true
+end
+
+local function parse_service(line: string): (boolean, GraphService)
+  local service: GraphService
+  local cursor: isize = 1
+  local field: string
+  field, cursor = next_field(line, cursor)
+  if (field ~= 'TSC3' and field ~= 'TSC5') or cursor == 0 then return false, service end
+  local runtime_magic = 'TSC2'
+  local runtime_fields: integer = 4
+  if field == 'TSC5' then
+    runtime_magic = 'TSC4'
+    runtime_fields = 6
+  end
+
+  local payload_start = cursor
+  service.name, cursor = next_field(line, cursor)
+  if not valid_name(service.name) or cursor == 0 then return false, service end
+  for _: integer = 1, runtime_fields do
+    field, cursor = next_field(line, cursor)
+    if cursor == 0 then return false, service end
+  end
+  service.runtime_record = runtime_magic .. '\t' .. string.sub(line, payload_start, cursor - 2)
+
+  service.requires, cursor = next_field(line, cursor)
+  if cursor == 0 then return false, service end
+  service.wants, cursor = next_field(line, cursor)
+  if cursor == 0 then return false, service end
+  service.after, cursor = next_field(line, cursor)
+  if cursor == 0 then return false, service end
+  service.before, cursor = next_field(line, cursor)
+  if cursor ~= 0 or not valid_list(service.requires) or not valid_list(service.wants) or
+     not valid_list(service.after) or not valid_list(service.before) then return false, service end
+  return true, service
+end
+
+local function parse_target(line: string): (boolean, Target)
+  local target: Target
+  local cursor: isize = 1
+  local magic: string
+  magic, cursor = next_field(line, cursor)
+  if magic ~= 'TGT1' or cursor == 0 then return false, target end
+  target.name, cursor = next_field(line, cursor)
+  if not valid_name(target.name) or cursor == 0 then return false, target end
+  target.members, cursor = next_field(line, cursor)
+  if #target.members == 0 or cursor ~= 0 or not valid_list(target.members) then return false, target end
+  return true, target
+end
+
+local function find_service(graph: *NativeGraph, name: string): integer
+  for i: integer = 0, graph.service_count - 1 do
+    if graph.services[i].name == name then return i end
+  end
+  return -1
+end
+
+local function find_target(graph: *NativeGraph, name: string): integer
+  for i: integer = 0, graph.target_count - 1 do
+    if graph.targets[i].name == name then return i end
+  end
+  return -1
+end
+
+global function load_native_graph(path: string, graph: *NativeGraph): boolean
+  local file = io.open(path, 'r')
+  if not file:isopen() then
+    io.stderr:write('theseus-graph: cannot open graph records: ', path, '\n')
+    return false
+  end
+  for line in file:lines() do
+    if #line > 0 then
+      local prefix = string.sub(line, 1, 5)
+      if prefix == 'TSC3\t' or prefix == 'TSC5\t' then
+        if graph.service_count >= NativeMaxServices then
+          io.stderr:write('theseus-graph: service bound exceeded\n')
+          file:close()
+          return false
+        end
+        local ok: boolean
+        local service: GraphService
+        ok, service = parse_service(line)
+        if not ok or find_service(graph, service.name) >= 0 then
+          io.stderr:write('theseus-graph: malformed or duplicate service record\n')
+          file:close()
+          return false
+        end
+        graph.services[graph.service_count] = service
+        graph.service_count = graph.service_count + 1
+      elseif string.sub(line, 1, 5) == 'TGT1\t' then
+        if graph.target_count >= MAX_TARGETS then
+          io.stderr:write('theseus-graph: target bound exceeded\n')
+          file:close()
+          return false
+        end
+        local ok: boolean
+        local target: Target
+        ok, target = parse_target(line)
+        if not ok or find_target(graph, target.name) >= 0 then
+          io.stderr:write('theseus-graph: malformed or duplicate target record\n')
+          file:close()
+          return false
+        end
+        graph.targets[graph.target_count] = target
+        graph.target_count = graph.target_count + 1
+      else
+        io.stderr:write('theseus-graph: unknown record type\n')
+        file:close()
+        return false
+      end
+    end
+  end
+  file:close()
+  return graph.service_count > 0 and graph.target_count > 0
+end
+
+local function select_refs(graph: *NativeGraph, list: string, selected: *[NativeMaxServices]boolean,
+                           hard: boolean): (boolean, boolean)
+  if #list == 0 then return true, false end
+  local changed = false
+  local cursor: isize = 1
+  while cursor ~= 0 do
+    local name: string
+    name, cursor = next_list_item(list, cursor)
+    local index = find_service(graph, name)
+    if index < 0 then
+      if hard then
+        io.stderr:write('theseus-graph: missing hard dependency: ', name, '\n')
+        return false, changed
+      end
+    elseif not selected[index] then
+      selected[index] = true
+      changed = true
+    end
+  end
+  return true, changed
+end
+
+local function select_target(graph: *NativeGraph, target: *Target,
+                             selected: *[NativeMaxServices]boolean, include_wants: boolean): boolean
+  local cursor: isize = 1
+  while cursor ~= 0 do
+    local name: string
+    name, cursor = next_list_item(target.members, cursor)
+    local index = find_service(graph, name)
+    if index < 0 then
+      io.stderr:write('theseus-graph: target member is missing: ', name, '\n')
+      return false
+    end
+    selected[index] = true
+  end
+
+  local changed = true
+  while changed do
+    changed = false
+    for i: integer = 0, graph.service_count - 1 do
+      if selected[i] then
+        local ok: boolean
+        local added: boolean
+        ok, added = select_refs(graph, graph.services[i].requires, selected, true)
+        if not ok then return false end
+        if added then changed = true end
+        if include_wants then
+          ok, added = select_refs(graph, graph.services[i].wants, selected, false)
+          if not ok then return false end
+          if added then changed = true end
+        end
+      end
+    end
+  end
+  return true
+end
+
+-- `a` must precede `b` when b hard/soft-depends on a, b explicitly runs after
+-- a, or a explicitly runs before b. Ordering-only edges never select services.
+local function precedes(graph: *NativeGraph, a: integer, b: integer): boolean
+  local aname = graph.services[a].name
+  local bname = graph.services[b].name
+  return list_contains(graph.services[b].requires, aname) or
+         list_contains(graph.services[b].wants, aname) or
+         list_contains(graph.services[b].after, aname) or
+         list_contains(graph.services[a].before, bname)
+end
+
+global NativePlan = @record{
+  count: integer,
+  order: [NativeMaxServices]integer,
+  required: [NativeMaxServices]boolean,
+  needs: [NativeMaxServices][NativeMaxServices]boolean,
+}
+
+global function plan_native_target(graph: *NativeGraph, target_name: string, result: *NativePlan): integer
+  result.count = 0
+  local target_index = find_target(graph, target_name)
+  if target_index < 0 then
+    io.stderr:write('theseus-graph: unknown target: ', target_name, '\n')
+    return 3
+  end
+
+  local selected: [NativeMaxServices]boolean
+  local target = &graph.targets[target_index]
+  if not select_target(graph, target, &selected, true) then return 66 end
+  if not select_target(graph, target, &result.required, false) then return 66 end
+
+  local indegree: [NativeMaxServices]integer
+  local emitted: [NativeMaxServices]boolean
+  local selected_count: integer = 0
+  for b: integer = 0, graph.service_count - 1 do
+    if selected[b] then
+      selected_count = selected_count + 1
+      for a: integer = 0, graph.service_count - 1 do
+        if selected[a] and precedes(graph, a, b) then indegree[b] = indegree[b] + 1 end
+      end
+    end
+  end
+
+  for position: integer = 1, selected_count do
+    local candidate: integer = -1
+    -- CUE list order is preserved in TSC3. Choosing the first ready service is
+    -- deterministic while keeping the runtime planner allocation-free here.
+    for i: integer = 0, graph.service_count - 1 do
+      if selected[i] and not emitted[i] and indegree[i] == 0 then
+        candidate = i
+        break
+      end
+    end
+    if candidate < 0 then
+      io.stderr:write('theseus-graph: dependency/order cycle in target: ', target_name, '\n')
+      return 67
+    end
+    emitted[candidate] = true
+    result.order[position - 1] = candidate
+    for b: integer = 0, graph.service_count - 1 do
+      if selected[b] and not emitted[b] and precedes(graph, candidate, b) then
+        indegree[b] = indegree[b] - 1
+      end
+    end
+  end
+  for i: integer = 0, selected_count - 1 do
+    local member = result.order[i]
+    for j: integer = 0, i - 1 do
+      result.needs[i][j] = list_contains(graph.services[member].requires,
+                                         graph.services[result.order[j]].name)
+    end
+  end
+  result.count = selected_count
+  return 0
+end
