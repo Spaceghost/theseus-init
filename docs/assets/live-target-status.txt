@@ -1,0 +1,35 @@
+Live target status on Cascadia x86-64, 2026-11-20
+Theseus source a0fcb3aec02e891bebe15a2c4d2922be86de6d56
+Installed APK theseus-init-0_git20261119-r14, Nebox shell r4
+
+Theseus booted as PID 1. The installed client read the default target
+without setting THESEUS_SOCKET. A second supervisor used its own socket
+and cgroup v2 delegation. A required socket-readiness check expired.
+The captured queries ran while the anchor held its SIGTERM handler.
+The test checked the original PID 1 console PID after rollback.
+Both QEMU accelerators produced the following serial output.
+
+target	default
+  state	RUNNING
+  services-running	1/1
+  required-running	1/1
+serial-console	RUNNING
+CHECK default target and console via installed Nelua client
+target	fault
+  state	FAILED
+  services-running	1/5
+  required-running	1/5
+  failed-requirement	bad
+tree	RUNNING
+anchor	STOPPING
+bad	FAILED
+unstarted	FAILED
+leaf	FAILED
+CHECK required failure and two skipped dependents while anchor stops
+TE1	ownership	tree	1	drained
+TE1	target	fault	stopped	82
+CHECK drained detached descendant, removed delegated cgroups, PID 1 console still running
+QUERY EXIT 0
+
+kvm signed r14 boot, rollback queries, cgroup cleanup and clean poweroff passed
+tcg signed r14 boot, rollback queries, cgroup cleanup and clean poweroff passed

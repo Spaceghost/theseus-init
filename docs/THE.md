@@ -48,6 +48,8 @@ During an orderly shutdown the target reports `STOPPING`. If a hard
 requirement fails, the target reports `FAILED` and names the service
 under `failed-requirement` during rollback. Planned hard dependents
 show `FAILED` with PID 0. The control socket closes after service cleanup.
+See the [installed Cascadia rollback transcript](assets/live-target-status.txt)
+for an example with an active console and a separate failed target.
 
 The bootstrap client can inspect compiled configuration and offers
 these forms:
