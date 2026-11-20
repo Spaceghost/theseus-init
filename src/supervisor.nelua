@@ -57,6 +57,8 @@ local Pollfd = @record{fd: cint, events: cshort, revents: cshort}
 local MaxClients <comptime> = 8
 local FirstClient <comptime> = 4
 local ready_fd: cint = -1
+local report_heartbeat = false
+local HeartbeatInterval <comptime> = 1000
 local PollSlots = @[FirstClient + MaxClients + 3 * NativeMaxServices]Pollfd
 local function c_poll(fds: *Pollfd, count: culong, timeout_ms: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
 
@@ -719,6 +721,12 @@ local function terminal(state: ServiceState): boolean
   return state == ServiceState.Failed or state == ServiceState.Stopped
 end
 
+local function send_boot_marker(marker: byte): clong
+  local sent = c_write(ready_fd, &marker, 1)
+  while sent < 0 and errno == EINTR do sent = c_write(ready_fd, &marker, 1) end
+  return sent
+end
+
 local function advance_target(group: *Supervision, child_mask: *Sigset, clients: *PollSlots): integer
   for i: integer = 0, group.count - 1 do
     local runtime = &group.runtimes[i]
@@ -765,11 +773,11 @@ local function advance_target(group: *Supervision, child_mask: *Sigset, clients:
       daemon_log('TE1', 'target', group.name, 'running')
       group.announced = true
       if ready_fd >= 0 then
-        local marker: byte = 82 -- R
-        local sent = c_write(ready_fd, &marker, 1)
-        while sent < 0 and errno == EINTR do sent = c_write(ready_fd, &marker, 1) end
-        c_close(ready_fd)
-        ready_fd = -1
+        local sent = send_boot_marker(82) -- R
+        if not report_heartbeat then
+          c_close(ready_fd)
+          ready_fd = -1
+        end
         if sent ~= 1 then return 74 end
       end
     end
@@ -870,6 +878,7 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
   local shutdown_client: cint = -1
   local more_exits = false
   local accept_at: integer = 0
+  local heartbeat_at: integer = 0
   while true do
     local deadline: integer = 0
     fds[3].fd = daemon_log_writable_fd()
@@ -902,6 +911,9 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
       end
     end
 
+    if report_heartbeat and group.announced and (deadline == 0 or heartbeat_at < deadline) then
+      deadline = heartbeat_at
+    end
     local timeout: cint = -1
     if deadline > now then timeout = (@cint)(deadline - now)
     elseif deadline ~= 0 then timeout = 0 end
@@ -1003,6 +1015,13 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
           accept_at = monotonic_ms() + AcceptRetryMs
         elseif errno ~= EAGAIN and errno ~= EINTR then exit_code = 79; break end
       elseif fds[0].revents ~= 0 then exit_code = 79; break end
+
+      now = monotonic_ms()
+      if report_heartbeat and group.announced and now >= heartbeat_at then
+        local sent = send_boot_marker(72) -- H
+        if sent ~= 1 and (sent >= 0 or errno ~= EAGAIN) then exit_code = 74; break end
+        heartbeat_at = now + HeartbeatInterval
+      end
     end
   end
 
@@ -1204,7 +1223,8 @@ local function supervise(shutdown_fd: cint, reap_fd: cint, child_mask: *Sigset):
 end
 
 local function main(): integer
-  if #arg == 4 and arg[1] == '--target' and arg[3] == '--ready-fd' then
+  if #arg == 4 and arg[1] == '--target' and (arg[3] == '--ready-fd' or arg[3] == '--heartbeat-fd') then
+    report_heartbeat = arg[3] == '--heartbeat-fd'
     local descriptor = arg[4]
     if #descriptor > 9 or string.find(descriptor, '^[0-9]+$') ~= 1 then return 64 end
     ready_fd = (@cint)(tonumber(descriptor))

@@ -61,9 +61,19 @@ have reached their configured readiness and the native target
 reports running. If the deadline expires first, PID 1 allows up to
 four seconds for native shutdown before killing the supervisor and
 continuing the orderly reboot. Set the deadline for the target's
-startup and retry policy. This deadline covers startup only. A hung
-PID 1 or kernel requires an independent watchdog or reset.
+startup and retry policy.
 
+A trial can set `theseus.trial_heartbeat_timeout=SECONDS` from 3 to
+3600. Once the target reports running, the supervisor reports
+progress from its event loop at one-second intervals. If the
+configured interval elapses without progress, PID 1 gives the worker
+up to four seconds to stop before forced cleanup and reboot. The
+heartbeat checks supervisor responsiveness. Use service readiness
+and application-level tests to verify individual workloads. Set the
+startup deadline separately and install a matching `theseusd` from
+the same release.
+
+A hung PID 1 or kernel requires an independent watchdog or reset.
 A one-boot entry can also set `theseus.trial_watchdog=1`. Load the
 watchdog driver before PID 1 and configure a reset-capable
 `/dev/watchdog0` with a timeout of at least five seconds appropriate

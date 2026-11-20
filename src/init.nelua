@@ -147,15 +147,25 @@ local function mount_type(kind: cstring, path: cstring, flags: culong, magic: cl
   return has_type(path, magic) or c_mount(kind, path, kind, flags, nilptr) == 0
 end
 
-local function command_line(): (boolean, boolean, boolean, boolean, boolean, integer, boolean)
+local function parse_seconds(value: string, minimum: integer): integer
+  if #value <= 4 and string.find(value, '^[0-9]+$') == 1 then
+    local seconds = (@integer)(tonumber(value))
+    if seconds >= minimum and seconds <= 3600 then return seconds end
+  end
+  return -1
+end
+
+local function command_line(): (boolean, boolean, boolean, boolean, boolean, integer, boolean, integer)
   local file = io.open('/proc/cmdline', 'r')
-  if not file:isopen() then return false, false, false, true, false, 0, false end
+  if not file:isopen() then return false, false, false, true, false, 0, false, 0 end
   local line = file:read('*a')
   file:close()
   local enabled, rescue, openrc, rescue_disabled, trial: boolean, boolean, boolean, boolean, boolean
   local trial_watchdog = false
   local trial_seconds: integer = 0
+  local heartbeat_seconds: integer = 0
   local timeout_prefix = 'theseus.trial_timeout='
+  local heartbeat_prefix = 'theseus.trial_heartbeat_timeout='
   for option in string.gmatch(line, '%S+') do
     if option == 'theseus.pid1=1' then enabled = true end
     if option == 'theseus.rescue=1' then rescue = true end
@@ -164,15 +174,12 @@ local function command_line(): (boolean, boolean, boolean, boolean, boolean, int
     if option == 'theseus.trial=1' then trial = true end
     if option == 'theseus.trial_watchdog=1' then trial_watchdog = true end
     if string.sub(option, 1, #timeout_prefix) == timeout_prefix then
-      local seconds = string.sub(option, #timeout_prefix + 1)
-      trial_seconds = -1
-      if #seconds <= 4 and string.find(seconds, '^[0-9]+$') == 1 then
-        local value = (@integer)(tonumber(seconds))
-        if value >= 1 and value <= 3600 then trial_seconds = value end
-      end
+      trial_seconds = parse_seconds(string.sub(option, #timeout_prefix + 1), 1)
+    elseif string.sub(option, 1, #heartbeat_prefix) == heartbeat_prefix then
+      heartbeat_seconds = parse_seconds(string.sub(option, #heartbeat_prefix + 1), 3)
     end
   end
-  return enabled, rescue, openrc, rescue_disabled, trial and enabled and not rescue, trial_seconds, trial_watchdog
+  return enabled, rescue, openrc, rescue_disabled, trial and enabled and not rescue, trial_seconds, trial_watchdog, heartbeat_seconds
 end
 
 local function provision_run(): boolean
@@ -256,7 +263,7 @@ local function unblock_signals()
   if c_sigemptyset(&unblocked) ~= 0 or c_sigprocmask(SIG_SETMASK, &unblocked, nilptr) ~= 0 then c_exit(126) end
 end
 
-local function launch(rescue: boolean, ready_writer: cint): cint
+local function launch(rescue: boolean, ready_writer: cint, heartbeat: boolean): cint
   local pid = c_fork()
   if pid ~= 0 then return pid end
   unblock_signals()
@@ -280,7 +287,9 @@ local function launch(rescue: boolean, ready_writer: cint): cint
     if ready_writer >= 0 then
       local descriptor = tostring(ready_writer)
       if c_fcntl(ready_writer, F_SETFD, 0) < 0 then c_exit(126) end
-      local argv: [6]cstring = {worker, '--target', 'default', '--ready-fd', (@cstring)(descriptor), nilptr}
+      local option: cstring = '--ready-fd'
+      if heartbeat then option = '--heartbeat-fd' end
+      local argv: [6]cstring = {worker, '--target', 'default', option, (@cstring)(descriptor), nilptr}
       c_execv(worker, &argv[0])
       c_exit(127)
     end
@@ -484,8 +493,9 @@ local function run()
   local boot, preferred_rescue, openrc, rescue_disabled, trial = false, false, false, true, false
   local trial_watchdog = false
   local trial_seconds: integer = 0
+  local heartbeat_seconds: integer = 0
   if mount_type('proc', '/proc', MS_NOSUID | MS_NODEV | MS_NOEXEC, PROC_SUPER_MAGIC) then
-    boot, preferred_rescue, openrc, rescue_disabled, trial, trial_seconds, trial_watchdog = command_line()
+    boot, preferred_rescue, openrc, rescue_disabled, trial, trial_seconds, trial_watchdog, heartbeat_seconds = command_line()
   end
   if rescue_disabled then report('rescue-console\tdisabled') end
   c_setenv('PATH', '/usr/sbin:/usr/bin:/sbin:/bin', 1)
@@ -495,7 +505,8 @@ local function run()
   local reason: string
   local pending = Action.None
   local ready_reader: cint = -1
-  local ready_deadline: integer = 0
+  local trial_ready = false
+  local trial_deadline: integer = 0
   if fd < 0 then
     reason = 'signal-queue'
   elseif not boot then
@@ -504,6 +515,8 @@ local function run()
     reason = 'requested'
   elseif trial and trial_seconds < 0 then
     reason = 'trial-timeout-config'
+  elseif trial and heartbeat_seconds < 0 then
+    reason = 'trial-heartbeat-config'
   elseif not select_bundle() then
     reason = 'release-path'
   elseif not provision_run() then
@@ -524,14 +537,15 @@ local function run()
         reason = 'boot-filesystems'
       else
         local ready: [2]cint = {-1, -1}
-        if trial and trial_seconds > 0 and c_pipe2(&ready[0], O_CLOEXEC | O_NONBLOCK) ~= 0 then
+        local heartbeat = trial and heartbeat_seconds > 0
+        if trial and (trial_seconds > 0 or heartbeat) and c_pipe2(&ready[0], O_CLOEXEC | O_NONBLOCK) ~= 0 then
           reason = 'trial-ready-pipe'
         else
           if ready[0] >= 0 then
             ready_reader = ready[0]
-            ready_deadline = now_ms() + trial_seconds * 1000
+            if trial_seconds > 0 then trial_deadline = now_ms() + trial_seconds * 1000 end
           end
-          session.worker = launch(false, ready[1])
+          session.worker = launch(false, ready[1], heartbeat)
           if ready[1] >= 0 then c_close(ready[1]) end
           if session.worker <= 0 then reason = 'supervisor-fork' end
         end
@@ -557,14 +571,35 @@ local function run()
     end
     local worker_grace: integer = WorkerGrace
     if action == Action.None and trial and not in_rescue and ready_reader >= 0 then
-      local marker: byte
-      if c_read(ready_reader, &marker, 1) == 1 and marker == 82 then
-        c_close(ready_reader)
-        ready_reader = -1
-        report('trial-ready')
-      elseif now_ms() >= ready_deadline then
+      local markers: [64]byte
+      local count = c_read(ready_reader, &markers[0], #markers)
+      local read_error = errno
+      local now = now_ms()
+      for i = 0, count - 1 do
+        if not trial_ready and markers[i] == 82 then -- R
+          trial_ready = true
+          trial_deadline = now + heartbeat_seconds * 1000
+          report('trial-ready')
+          if heartbeat_seconds == 0 then
+            c_close(ready_reader)
+            ready_reader = -1
+            trial_deadline = 0
+            break
+          end
+        elseif trial_ready and markers[i] == 72 then -- H
+          trial_deadline = now + heartbeat_seconds * 1000
+        end
+      end
+      if heartbeat_seconds > 0 and count == 0 then
+        reason = 'supervisor-heartbeat-closed'
+      elseif count < 0 and read_error ~= EAGAIN and read_error ~= EINTR then
+        reason = 'supervisor-trial-channel'
+      elseif trial_deadline > 0 and now >= trial_deadline then
+        if trial_ready then reason = 'supervisor-heartbeat-timeout'
+        else reason = 'supervisor-startup-timeout' end
+      end
+      if #reason > 0 then
         in_rescue = true
-        reason = 'supervisor-startup-timeout'
         worker_grace = 4000
       end
     end
@@ -585,7 +620,7 @@ local function run()
       if fd < 0 then report('signal-queue-failed') end
     end
     if in_rescue and not rescue_disabled and session.rescue <= 0 and now_ms() >= session.rescue_at then
-      session.rescue = launch(true, -1)
+      session.rescue = launch(true, -1, false)
       if session.rescue < 0 then session.rescue_at = now_ms() + 1000 end
     end
   end
