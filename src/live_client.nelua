@@ -7,11 +7,13 @@ require 'os'
 require 'string'
 require 'src.theseus.openrc'
 require 'src.theseus.name'
+require 'src.theseus.install_paths'
 
 local function c_socket(domain: cint, kind: cint, protocol: cint): cint <cimport 'socket', nodecl, cinclude '<sys/socket.h>'> end
 local function c_connect(fd: cint, address: pointer, length: cuint): cint <cimport 'connect', nodecl, cinclude '<sys/socket.h>'> end
 local function c_read(fd: cint, buffer: pointer, count: csize): clong <cimport 'read', nodecl, cinclude '<unistd.h>'> end
 local function c_send(fd: cint, buffer: pointer, count: csize, flags: cint): clong <cimport 'send', nodecl, cinclude '<sys/socket.h>'> end
+local function c_access(path: cstring, mode: cint): cint <cimport 'access', nodecl, cinclude '<unistd.h>'> end
 local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
 local Timespec: type <cimport 'struct timespec', nodecl, cinclude '<time.h>'> = @record{tv_sec: clong, tv_nsec: clong}
 local function c_clock_gettime(clock: cint, value: *Timespec): cint <cimport 'clock_gettime', nodecl, cinclude '<time.h>'> end
@@ -42,9 +44,10 @@ local function is_the(): boolean
   return string.sub(arg[0], -3) == 'the'
 end
 
-local function socket_path(): string
+local function socket_path(allow_system: boolean): string
   local path = os.getenv('THESEUS_SOCKET')
   if #path == 0 then
+    if allow_system and c_access(TheseusControlSocket, 0) == 0 then return TheseusControlSocket end
     io.stderr:write('theseus: THESEUS_SOCKET is required in userspace mode\n')
     os.exit(64)
   end
@@ -137,8 +140,8 @@ local function exchange_failed(deadline: integer): (boolean, string)
   return false, ''
 end
 
-local function exchange(request: string, timeout: integer): (boolean, string)
-  local path = socket_path()
+local function exchange(request: string, timeout: integer, allow_system: boolean): (boolean, string)
+  local path = socket_path(allow_system)
   local deadline = monotonic_ms() + timeout
   local fd = c_socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0)
   if fd < 0 then return exchange_failed(deadline) end
@@ -237,7 +240,7 @@ local function query_status(name: string, state_only: boolean, target_only: bool
   if not valid_native_name(name) then io.stderr:write('theseus: invalid name\n'); return 64 end
   local verb = 'STATUS'
   if target_only then verb = 'TARGET' end
-  local ok, response = exchange('TQ1\t' .. verb .. '\t' .. name .. '\n', QueryTimeout)
+  local ok, response = exchange('TQ1\t' .. verb .. '\t' .. name .. '\n', QueryTimeout, true)
   if not ok then return 69 end
   if response == 'TR1\tERROR\tunknown-target\n' then return unknown_target(name) end
   if string.find(response, '^TR1\tTARGET\t') == 1 then return show_target_status(response, name, state_only) end
@@ -271,7 +274,7 @@ local function query_services(filter: string, target: string): integer
     if not valid_native_name(target) then io.stderr:write('theseus: invalid target name\n'); return 64 end
     request = 'TQ1\tSERVICES\t' .. target .. '\n'
   end
-  local ok, response = exchange(request, QueryTimeout)
+  local ok, response = exchange(request, QueryTimeout, true)
   if not ok then return 69 end
   if response == 'TR1\tERROR\tunknown-target\n' then return unknown_target(target) end
   if not print_services(response, filter) then
@@ -284,7 +287,7 @@ end
 local function shutdown(): integer
   local ok: boolean
   local response: string
-  ok, response = exchange('TQ1\tSHUTDOWN\n', ShutdownTimeout)
+  ok, response = exchange('TQ1\tSHUTDOWN\n', ShutdownTimeout, false)
   if not ok then return 69 end
   if response == 'TR1\tERROR\tstopping\n' then
     io.stderr:write('theseus: shutdown already in progress\n')
