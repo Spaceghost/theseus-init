@@ -104,7 +104,8 @@ the child has been reaped and the socket removed.
 The one-shot `theseus run SERVICE --stop-after-ms N` path uses the
 same per-service grace and pidfd escalation. It reports an ordinary
 exit as soon as the child exits, even before the stop timer expires. Both a
-graceful exit and a forced stop are final for that invocation.
+graceful exit and a forced stop are final for that invocation. See the
+[shutdown test results](assets/one-shot-stop.txt).
 
 For CUE readiness kind `unix-socket`, the child starts in `STARTING`
 and the daemon attempts nonblocking connections until the configured

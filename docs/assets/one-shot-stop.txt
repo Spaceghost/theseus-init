@@ -1,0 +1,20 @@
+Theseus one-shot stop on a disposable Linux test process.
+The early service used a 60000 ms stop timer. All three children were reaped.
+
+result	delayed	STOPPED	attempts	1	restarts	0	exit	0	signal	0
+shutdown	stubborn	term-timeout	1200
+result	stubborn	STOPPED	attempts	1	restarts	0	exit	-1	signal	9
+result	early	STOPPED	attempts	1	restarts	0	exit	0	signal	0
+
+PID 1 regression with nine Alpine OpenRC services (TCG, first boot)
+NETWORK_PID1_SERVICES_AVAILABLE_AT_NATIVE_SHUTDOWN first
+TE1	service	network-client	1	exited	0	0
+TI1	shutdown-ready
+reboot: Restarting system
+
+PID 1 regression with nine Alpine OpenRC services (TCG, second boot)
+NETWORK_PID1_PREVIOUS_CHECKPOINT_OK
+NETWORK_PID1_SERVICES_AVAILABLE_AT_NATIVE_SHUTDOWN second
+TE1	service	network-client	1	exited	0	0
+TI1	shutdown-ready
+reboot: Power down
