@@ -1,6 +1,8 @@
 # Theseus
 
-**Theseus is a dependable Linux service supervisor and, eventually, PID 1.**
+**Theseus is a Linux service supervisor and PID 1.** Cascadia boots it by
+default in its x86-64 live image and persistent VM. Both offer OpenRC
+recovery. [Cascadia distribution and downloads](https://spacegho.st/cascadia/)
 
 It is written in **Nelua**. Its native service model is declared in **CUE**. No Lua runtime, no maintained C implementation, no YAML service language, and no database is required to boot.
 
@@ -51,6 +53,11 @@ a local Unix socket. It reaps adopted descendants while running. A target uses t
 waits for the configured service readiness before admitting subsequent
 services. Run it with `theseusd --target TARGET`.
 
+On an installed Cascadia VM with Theseus r14 or later, `the status of default`
+shows the target’s phase and running counts. Use `the services of default`
+to see each member’s state. A rollback names the failed hard requirement
+while the daemon stops its other services. [Live query reference](docs/THE.md)
+
 Set `THESEUS_CGROUP_ROOT` to a delegated cgroup v2 directory to track
 and clean up each service's descendants. See
 [resource ownership](docs/ARCHITECTURE.md#resource-ownership).
@@ -62,10 +69,10 @@ The PostgreSQL example uses `pg_isready` to wait until the database
 accepts connections. The [Alpine soak procedure](docs/OPENRC.md#soak-native-targets-alongside-openrc) exercises native targets and live OpenRC packages together. The [full guest check](docs/OPENRC.md#qualify-complete-alpine-boots-and-shutdowns) covers boot and shutdown under Alpine init. Broader Alpine package qualification remains open. The rescue entry point below is separate from the service
 supervisor.
 
-## Opt-in PID 1
+## Running as PID 1
 
-The [native PID 1 entry point](docs/PID1.md) is available for isolated
-Linux VM qualification. It supervises the native daemon and enters
+Other Linux systems can opt in to the [native PID 1 entry point](docs/PID1.md)
+for isolated VM qualification. It supervises the native daemon and enters
 console rescue on boot failure. An additional boot option runs the
 installed OpenRC boot and shutdown runlevels.
 [Verified Linux bundles and versioned installation](docs/INSTALL.md) cover download, trial boots, and rollback.
