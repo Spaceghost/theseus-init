@@ -28,6 +28,7 @@ local function c_dup2(source: cint, dest: cint): cint <cimport 'dup2', nodecl, c
 local function c_setpgid(pid: cint, group: cint): cint <cimport 'setpgid', nodecl, cinclude '<unistd.h>'> end
 local function c_setsid(): cint <cimport 'setsid', nodecl, cinclude '<unistd.h>'> end
 local function c_ioctl(fd: cint, command: culong, value: cint): cint <cimport 'ioctl', nodecl, cinclude '<sys/ioctl.h>'> end
+local function c_watchdog_ioctl(fd: cint, command: culong, value: *cint): cint <cimport 'ioctl', nodecl, cinclude '<sys/ioctl.h>'> end
 local function c_statfs(path: cstring, data: *Statfs): cint <cimport 'statfs', nodecl, cinclude '<sys/statfs.h>'> end
 local function c_mount(source: cstring, target: cstring, kind: cstring, flags: culong, data: pointer): cint <cimport 'mount', nodecl, cinclude '<sys/mount.h>'> end
 local function c_mkdir(path: cstring, mode: cuint): cint <cimport 'mkdir', nodecl, cinclude '<sys/stat.h>'> end
@@ -83,6 +84,9 @@ local ECHILD: cint <cimport, nodecl, cinclude '<errno.h>'>
 local EEXIST: cint <cimport, nodecl, cinclude '<errno.h>'>
 local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
 local CLOCK_MONOTONIC: cint <cimport, nodecl, cinclude '<time.h>'>
+local WDIOC_KEEPALIVE: culong <cimport, nodecl, cinclude '<linux/watchdog.h>'>
+local WDIOC_SETOPTIONS: culong <cimport, nodecl, cinclude '<linux/watchdog.h>'>
+local WDIOS_DISABLECARD: cint <cimport, nodecl, cinclude '<linux/watchdog.h>'>
 local RB_DISABLE_CAD: cint <cimport, nodecl, cinclude '<sys/reboot.h>'>
 local RB_HALT_SYSTEM: cint <cimport, nodecl, cinclude '<sys/reboot.h>'>
 local RB_AUTOBOOT: cint <cimport, nodecl, cinclude '<sys/reboot.h>'>
@@ -108,6 +112,8 @@ local Session = @record{
   openrc_started: boolean,
 }
 local console: cint = -1
+local watchdog: cint = -1
+local watchdog_warned = false
 
 local function report(event: string)
   if console < 0 then return end
@@ -141,12 +147,13 @@ local function mount_type(kind: cstring, path: cstring, flags: culong, magic: cl
   return has_type(path, magic) or c_mount(kind, path, kind, flags, nilptr) == 0
 end
 
-local function command_line(): (boolean, boolean, boolean, boolean, boolean, integer)
+local function command_line(): (boolean, boolean, boolean, boolean, boolean, integer, boolean)
   local file = io.open('/proc/cmdline', 'r')
-  if not file:isopen() then return false, false, false, true, false, 0 end
+  if not file:isopen() then return false, false, false, true, false, 0, false end
   local line = file:read('*a')
   file:close()
   local enabled, rescue, openrc, rescue_disabled, trial: boolean, boolean, boolean, boolean, boolean
+  local trial_watchdog = false
   local trial_seconds: integer = 0
   local timeout_prefix = 'theseus.trial_timeout='
   for option in string.gmatch(line, '%S+') do
@@ -155,6 +162,7 @@ local function command_line(): (boolean, boolean, boolean, boolean, boolean, int
     if option == 'theseus.rescue=off' then rescue_disabled = true end
     if option == 'theseus.openrc=1' then openrc = true end
     if option == 'theseus.trial=1' then trial = true end
+    if option == 'theseus.trial_watchdog=1' then trial_watchdog = true end
     if string.sub(option, 1, #timeout_prefix) == timeout_prefix then
       local seconds = string.sub(option, #timeout_prefix + 1)
       trial_seconds = -1
@@ -164,7 +172,7 @@ local function command_line(): (boolean, boolean, boolean, boolean, boolean, int
       end
     end
   end
-  return enabled, rescue, openrc, rescue_disabled, trial and enabled and not rescue, trial_seconds
+  return enabled, rescue, openrc, rescue_disabled, trial and enabled and not rescue, trial_seconds, trial_watchdog
 end
 
 local function provision_run(): boolean
@@ -206,6 +214,10 @@ local function relay_shutdown_output(fd: cint): boolean
 end
 
 local function notification(fd: cint, timeout: cint, output: cint): (boolean, Action)
+  if watchdog >= 0 and c_ioctl(watchdog, WDIOC_KEEPALIVE, 0) ~= 0 and not watchdog_warned then
+    report('watchdog-keepalive-failed\t' .. tostring(errno))
+    watchdog_warned = true
+  end
   local events: [2]Pollfd = {{fd = fd, events = POLLIN}, {fd = output, events = POLLIN}}
   local ready = c_poll(&events[0], 2, timeout)
   if ready <= 0 then return ready == 0 or errno == EINTR, Action.None end
@@ -448,6 +460,16 @@ local function shutdown(fd: cint, session: *Session, action: Action, had_worker:
   end
   c_sync()
   if c_mount(nilptr, '/', nilptr, MS_REMOUNT | MS_RDONLY, nilptr) ~= 0 then report('root-remount-failed') end
+  if watchdog >= 0 and action ~= Action.Reboot then
+    local option = WDIOS_DISABLECARD
+    if c_watchdog_ioctl(watchdog, WDIOC_SETOPTIONS, &option) == 0 then
+      c_close(watchdog)
+      watchdog = -1
+      report('watchdog-disabled')
+    else
+      report('watchdog-disable-failed\t' .. tostring(errno))
+    end
+  end
   report('shutdown-ready')
   c_reboot(cmd)
   report('reboot-syscall-failed\t' .. tostring(errno))
@@ -460,9 +482,10 @@ local function run()
   if c_access(Console, 0) ~= 0 then c_mount('devtmpfs', '/dev', 'devtmpfs', MS_NOSUID, nilptr) end
   console = c_open(Console, O_WRONLY | O_NONBLOCK | O_CLOEXEC | O_NOCTTY)
   local boot, preferred_rescue, openrc, rescue_disabled, trial = false, false, false, true, false
+  local trial_watchdog = false
   local trial_seconds: integer = 0
   if mount_type('proc', '/proc', MS_NOSUID | MS_NODEV | MS_NOEXEC, PROC_SUPER_MAGIC) then
-    boot, preferred_rescue, openrc, rescue_disabled, trial, trial_seconds = command_line()
+    boot, preferred_rescue, openrc, rescue_disabled, trial, trial_seconds, trial_watchdog = command_line()
   end
   if rescue_disabled then report('rescue-console\tdisabled') end
   c_setenv('PATH', '/usr/sbin:/usr/bin:/sbin:/bin', 1)
@@ -486,6 +509,11 @@ local function run()
   elseif not provision_run() then
     reason = 'boot-filesystems'
   else
+    if trial and trial_watchdog then
+      watchdog = c_open('/dev/watchdog0', O_WRONLY | O_CLOEXEC)
+      if watchdog >= 0 then report('watchdog-armed')
+      else report('watchdog-unavailable\t' .. tostring(errno)) end
+    end
     if openrc then
       local ok: boolean
       ok, pending = boot_openrc(fd, &session)

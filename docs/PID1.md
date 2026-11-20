@@ -64,6 +64,17 @@ continuing the orderly reboot. Set the deadline for the target's
 startup and retry policy. This deadline covers startup only. A hung
 PID 1 or kernel requires an independent watchdog or reset.
 
+A one-boot entry can also set `theseus.trial_watchdog=1`. Load the
+watchdog driver before PID 1 and configure a reset-capable
+`/dev/watchdog0` with a timeout of at least five seconds appropriate
+for your system. Opening it arms the timer. PID 1 feeds it from its
+event loop, including during OpenRC boot and shutdown. If the device
+cannot be opened, PID 1 reports the error and continues with software
+trial handling. During a reboot, the watchdog stays armed through
+filesystem sync. On halt or poweroff, PID 1 attempts to disable it
+and reports failure if the device cannot stop. Qualify the device's
+reset and poweroff behavior before enabling it on hardware.
+
 ## OpenRC-managed services
 
 On Alpine, add theseus.openrc=1 alongside theseus.pid1=1 to boot
