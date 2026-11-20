@@ -53,6 +53,22 @@ PID 1 with PostgreSQL, Cronie, and Mosquitto. The second boot read
 the transaction the native client committed during the first
 shutdown.
 
+A second Alpine 3.24.4 comparison applied the full start, restart, reload,
+and stop sequence to three more installed scripts. Both Theseus clients
+matched the direct OpenRC status output and exit codes.
+
+| Service | Installed OpenRC APK | Workload check |
+| --- | --- | --- |
+| nginx | `nginx-openrc-1.30.7-r0` | HTTP response with the configured body |
+| haproxy | `haproxy-openrc-3.4.8-r0` | HTTP frontend returns the configured body |
+| sshd | `openssh-server-common-openrc-10.3_p1-r2` | OpenSSH protocol greeting on loopback |
+
+The expanded userspace comparison passed under KVM and QEMU software
+emulation. Two more KVM boots ran the same network services through
+Alpine OpenRC under Theseus PID 1. The native client used the services
+during startup and its shutdown handler. The second boot read the
+first boot's checkpoint. See the [serial results](assets/openrc-network-corpus.txt).
+
 ## Reproduce the comparison
 
 1. Build `src/theseus.nelua` as `theseus` and
@@ -87,6 +103,18 @@ shutdown.
    rc-update --stack add theseus-shared theseus-b
    ./alpine-openrc-test ./theseus ./the --runlevels
    ```
+
+For the network cases, install `nginx`, `haproxy`, `openssh-server` and
+their OpenRC subpackages. Configure Nginx to listen on `127.0.0.1:8082`
+and return `theseus nginx` followed by a newline. Configure HAProxy's HTTP
+frontend on `127.0.0.1:8083` to return `theseus haproxy`. Bind OpenSSH to
+`127.0.0.1:2222` with an Ed25519 host key, disable password and
+keyboard-interactive authentication, and set `rc_need="networking"`
+in `/etc/conf.d/sshd`. Then run the lifecycle comparison.
+
+```sh
+./alpine-openrc-test ./theseus ./the nginx haproxy sshd
+```
 
 Repeat with the binary built from `src/live_client.nelua` and its own
 `the` symlink to exercise the live client's entry point. This corpus

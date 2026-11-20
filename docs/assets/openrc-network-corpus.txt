@@ -1,0 +1,45 @@
+Alpine 3.24.4 x86-64, stock OpenRC 0.63.2-r0, QEMU guests with loopback only.
+Theseus runtime from the attested 28d6365 bundle. The one-shot client was
+built from the same source. The three installed init scripts matched
+the Alpine-signed APK contents byte for byte.
+
+Stock Alpine PID 1 (kvm)
+NETWORK_CORPUS_CLIENT one-shot
+openrc-catalog	total	65
+openrc-corpus	nginx	pass
+openrc-corpus	haproxy	pass
+openrc-corpus	sshd	pass
+NETWORK_CORPUS_CLIENT live
+openrc-catalog	total	65
+openrc-corpus	nginx	pass
+openrc-corpus	haproxy	pass
+openrc-corpus	sshd	pass
+openrc-corpus	stacked-runlevels	pass
+NETWORK_CORPUS_PASS
+
+Stock Alpine PID 1 (tcg)
+NETWORK_CORPUS_CLIENT one-shot
+openrc-catalog	total	65
+openrc-corpus	nginx	pass
+openrc-corpus	haproxy	pass
+openrc-corpus	sshd	pass
+NETWORK_CORPUS_CLIENT live
+openrc-catalog	total	65
+openrc-corpus	nginx	pass
+openrc-corpus	haproxy	pass
+openrc-corpus	sshd	pass
+openrc-corpus	stacked-runlevels	pass
+NETWORK_CORPUS_PASS
+
+Theseus PID 1 (KVM, first boot)
+NETWORK_PID1_WORKLOADS_READY first
+NETWORK_PID1_SERVICES_AVAILABLE_AT_NATIVE_SHUTDOWN first
+TI1	openrc-start	shutdown
+reboot: Restarting system
+
+Theseus PID 1 (KVM, second boot)
+NETWORK_PID1_PREVIOUS_CHECKPOINT_OK
+NETWORK_PID1_WORKLOADS_READY second
+NETWORK_PID1_SERVICES_AVAILABLE_AT_NATIVE_SHUTDOWN second
+TI1	openrc-start	shutdown
+reboot: Power down

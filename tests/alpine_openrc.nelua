@@ -33,6 +33,12 @@ local function verify_status(service: cstring, started: boolean)
   assert((status == 0) == started, 'unexpected OpenRC status')
 end
 
+local function verify_http(url: cstring, body: string): integer
+  local code, output = execute_test_command({'/usr/bin/wget', '-T', '2', '-q', '-O', '-', url}, true)
+  if code == 0 and output == body then return 0 end
+  return 1
+end
+
 local function workload(service: cstring): integer
   local name = tostring(service)
   if name == 'postgresql' then
@@ -42,6 +48,15 @@ local function workload(service: cstring): integer
     return run_test_command({'/usr/bin/wget', '-T', '2', '-q', '-O', '/dev/null', 'http://127.0.0.1:8080/'})
   elseif name == 'caddy' then
     return run_test_command({'/usr/bin/wget', '-T', '2', '-q', '-O', '/dev/null', 'http://127.0.0.1:8081/'})
+  elseif name == 'nginx' then
+    return verify_http('http://127.0.0.1:8082/', 'theseus nginx\n')
+  elseif name == 'haproxy' then
+    return verify_http('http://127.0.0.1:8083/', 'theseus haproxy')
+  elseif name == 'sshd' then
+    local _, banner = execute_test_command({'/bin/busybox', 'timeout', '2',
+                                            '/bin/busybox', 'nc', '-w', '1', '127.0.0.1', '2222'}, true)
+    if string.find(banner, '^SSH%-2%.0%-OpenSSH_') == 1 then return 0 end
+    return 1
   elseif name == 'valkey' then
     return run_test_command({'/bin/busybox', 'timeout', '2', '/usr/bin/valkey-cli', '-h', '127.0.0.1', 'PING'})
   elseif name == 'mosquitto' then
@@ -74,7 +89,8 @@ local function cycle(runner: Runner, service: cstring)
   assert(action(runner, service, 'restart') == 0, 'restart failed')
   verify_status(service, true)
   verify_workload(service)
-  if tostring(service) == 'postgresql' then
+  local name = tostring(service)
+  if name == 'postgresql' or name == 'nginx' or name == 'haproxy' or name == 'sshd' then
     assert(action(runner, service, 'reload') == 0, 'reload failed')
     verify_workload(service)
   end
@@ -149,7 +165,8 @@ end
 for i: integer = 3, #arg do
   local name = arg[i]
   assert(name == 'postgresql' or name == 'lighttpd' or name == 'cronie' or name == 'caddy' or
-         name == 'valkey' or name == 'mosquitto', 'unknown workload fixture')
+         name == 'valkey' or name == 'mosquitto' or name == 'nginx' or name == 'haproxy' or name == 'sshd',
+         'unknown workload fixture')
   print('openrc-corpus', name, 'baseline')
   cycle(Runner.OpenRC, (@cstring)(name))
   print('openrc-corpus', name, 'adapter')
