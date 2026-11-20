@@ -107,6 +107,8 @@ local SIGKILL: cint <cimport, nodecl, cinclude '<signal.h>'>
 local SockaddrUn = @record{sun_family: cushort, sun_path: [108]cchar}
 local ServiceState = @enum{Planned = 0, Starting, Ready, Running, Stopped, Failed, Backoff, Stopping}
 
+local LeaderStop = @enum{None = 0, Term, Kill}
+
 local Runtime = @record{
   service: RuntimeService,
   status_request: string,
@@ -127,7 +129,7 @@ local Runtime = @record{
   failed_retries: integer,
   action_at: integer,
   ready_by: integer,
-  kill_sent: boolean,
+  leader_stop: LeaderStop,
   last_exit: integer,
   last_signal: integer,
 }
@@ -292,6 +294,7 @@ local function spawn(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset, cl
   end
   runtime.pid = pid
   runtime.pidfd = pidfd
+  runtime.leader_stop = LeaderStop.None
   runtime.execfd = handshake[0]
   local timeout = runtime.service.readiness_options.timeout
   if timeout == 0 then timeout = 30000 end
@@ -468,8 +471,18 @@ local function has_ready_peer(runtime: *Runtime, clients: *PollSlots): boolean
   return ready
 end
 
-local function signal_child(runtime: *Runtime, signal: cint): boolean
-  return pidfd_send_signal(runtime.pidfd, signal) or errno == ESRCH
+local function signal_leader_stop(runtime: *Runtime, stage: LeaderStop): boolean
+  local signal = SIGTERM
+  local timeout = runtime.service.stop_grace_ms
+  if stage == LeaderStop.Kill then
+    daemon_log('TE1', 'shutdown', runtime.service.name, runtime.attempts, 'term-timeout', timeout)
+    signal = SIGKILL
+    timeout = NativeStopCleanupStepMs
+  end
+  if not pidfd_send_signal(runtime.pidfd, signal) and errno ~= ESRCH then return false end
+  runtime.leader_stop = stage
+  runtime.action_at = monotonic_ms() + timeout
+  return true
 end
 
 local function mark_ready(runtime: *Runtime)
@@ -566,9 +579,7 @@ local function advance_service(runtime: *Runtime, argv: *ExecArgv, child_mask: *
       if not cancel_probe(runtime, now) then return false end
       daemon_log('TE1', 'readiness', runtime.service.name, runtime.attempts, 'timeout')
       transition(runtime, ServiceState.Stopping, 'readiness-timeout')
-      runtime.kill_sent = false
-      runtime.action_at = now + 1000
-      return signal_child(runtime, SIGTERM)
+      return signal_leader_stop(runtime, LeaderStop.Term)
     end
     if runtime.probe_fd >= 0 then
       if now >= runtime.probe_by then
@@ -585,10 +596,8 @@ local function advance_service(runtime: *Runtime, argv: *ExecArgv, child_mask: *
     return true
   end
   -- The startup timed out. Keep serving control requests while the child stops.
-  if runtime.state == ServiceState.Stopping and not runtime.kill_sent then
-    runtime.kill_sent = true
-    runtime.action_at = now + 1000
-    return signal_child(runtime, SIGKILL)
+  if runtime.state == ServiceState.Stopping and runtime.leader_stop == LeaderStop.Term then
+    return signal_leader_stop(runtime, LeaderStop.Kill)
   end
   daemon_log_error('theseusd: could not stop child after readiness timeout\n')
   return false
@@ -1089,7 +1098,10 @@ local function wait_cleanup(control: *ControlServer, watched: *cint, timeout: in
   while control.observing do
     if watched ~= nilptr and $watched < 0 then return 1 end
     local now = monotonic_ms()
-    if now >= deadline then return 0 end
+    if now >= deadline then
+      if watched ~= nilptr then return wait_pidfd_exit($watched, 0) end
+      return 0
+    end
     local wake = deadline
     local free_slot = prepare_control(control, now, &wake)
     fds[1].fd = -1
@@ -1126,13 +1138,12 @@ end
 
 local function stop_leader(runtime: *Runtime, control: *ControlServer): boolean
   if runtime.pidfd < 0 then return true end
-  if not signal_child(runtime, SIGTERM) then return false end
-  local ready = wait_cleanup(control, &runtime.pidfd, runtime.service.stop_grace_ms)
-  if ready == 0 then
-    daemon_log('TE1', 'shutdown', runtime.service.name, runtime.attempts, 'term-timeout',
-               runtime.service.stop_grace_ms)
-    if not signal_child(runtime, SIGKILL) then return false end
-    ready = wait_cleanup(control, &runtime.pidfd, NativeStopCleanupStepMs)
+  if runtime.leader_stop == LeaderStop.None and not signal_leader_stop(runtime, LeaderStop.Term) then return false end
+  -- A readiness timeout may already have signalled this same leader.
+  local ready = wait_cleanup(control, &runtime.pidfd, math.max(0, runtime.action_at - monotonic_ms()))
+  if ready == 0 and runtime.leader_stop == LeaderStop.Term then
+    if not signal_leader_stop(runtime, LeaderStop.Kill) then return false end
+    ready = wait_cleanup(control, &runtime.pidfd, math.max(0, runtime.action_at - monotonic_ms()))
   end
   return ready > 0 and (runtime.pidfd < 0 or reap(runtime))
 end

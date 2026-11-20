@@ -24,6 +24,7 @@ _ready: schema.#CompiledService & {
 _timeout: schema.#CompiledService & {
   service: {
     name: "socket-timeout"
+    stopGraceMs: 240
     exec: [testProgram, "ignore-term", "\(testDir)/child-started"]
     restart: "on-failure"
     maxRestarts: 1
@@ -48,7 +49,17 @@ _earlyExit: schema.#CompiledService & {
   }
 }
 
-readinessRecords: strings.Join([_ready.compiled, _timeout.compiled, _earlyExit.compiled], "\n")
+_slowStop: schema.#CompiledService & {
+  service: {
+    name: "slow-stop"
+    exec: [testProgram, "delay-term", "\(testDir)/slow-stop"]
+    restart: "never"
+    stopGraceMs: 3500
+    readiness: {kind: "unix-socket", path: "\(testDir)/absent.sock", timeoutMs: 500}
+  }
+}
+
+readinessRecords: strings.Join([_ready.compiled, _timeout.compiled, _earlyExit.compiled, _slowStop.compiled], "\n")
 
 _probeTimeout: schema.#CompiledService & {
   service: {

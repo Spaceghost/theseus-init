@@ -29,6 +29,8 @@ local StopSigset: type <cimport 'sigset_t', nodecl, cinclude '<signal.h>'> = @re
 local function c_sigemptyset(set: *StopSigset): cint <cimport 'sigemptyset', nodecl, cinclude '<signal.h>'> end
 local function c_sigaddset(set: *StopSigset, signal: cint): cint <cimport 'sigaddset', nodecl, cinclude '<signal.h>'> end
 local function c_sigprocmask(how: cint, set: *StopSigset, old: *StopSigset): cint <cimport 'sigprocmask', nodecl, cinclude '<signal.h>'> end
+local function c_sigpending(set: *StopSigset): cint <cimport 'sigpending', nodecl, cinclude '<signal.h>'> end
+local function c_sigismember(set: *StopSigset, signal: cint): cint <cimport 'sigismember', nodecl, cinclude '<signal.h>'> end
 local function c_sigwait(set: *StopSigset, signal: *cint): cint <cimport 'sigwait', nodecl, cinclude '<signal.h>'> end
 local SIG_BLOCK: cint <cimport, nodecl, cinclude '<signal.h>'>
 local AF_UNIX: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
@@ -196,6 +198,8 @@ if arg[1] == 'delay-term' then
   local signo: cint
   assert(c_sigwait(&mask, &signo) == 0 and signo == SIGTERM, 'failed to receive SIGTERM')
   if #arg >= 3 then wait_for_file(arg[3]) else c_usleep(1500000) end
+  local pending: StopSigset
+  assert(c_sigpending(&pending) == 0 and c_sigismember(&pending, SIGTERM) == 0, 'received SIGTERM twice during cleanup')
   local done = io.open(arg[2] .. '.stopped', 'w')
   assert(done:isopen(), 'failed to publish completion')
   done:close()

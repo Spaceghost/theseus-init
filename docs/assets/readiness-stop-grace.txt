@@ -1,0 +1,23 @@
+Theseus readiness timeout and SIGTERM grace | Linux x86-64 | 2026-11-20
+
+A service started a SIGTERM handler but never created its readiness socket.
+The supervisor stopped it after a 700 ms startup timeout. Timings below
+start when the child received the first SIGTERM. In the overlap case an
+operator requested daemon shutdown 500 ms later.
+
+Signed Cascadia r15, before the fix
+flush grace=3500ms launches=1 SIGTERM=1 checkpoints=0 elapsed=1.040s exit=[['-1', '9']] daemon=82
+short grace=240ms launches=1 SIGTERM=1 checkpoints=0 elapsed=1.035s exit=[['-1', '9']] daemon=82
+overlap grace=2600ms launches=1 SIGTERM=2 checkpoints=0 elapsed=3.193s exit=[['-1', '9']] daemon=0
+
+Fixed userspace supervisor
+flush grace=3500ms launches=1 SIGTERM=1 checkpoints=1 elapsed=1.573s exit=[['0', '0']] daemon=82
+short grace=240ms launches=1 SIGTERM=1 checkpoints=0 elapsed=0.271s exit=[['-1', '9']] daemon=82
+overlap grace=2600ms launches=1 SIGTERM=1 checkpoints=0 elapsed=2.620s exit=[['-1', '9']] daemon=0
+retry grace=240ms launches=2 SIGTERM=2 checkpoints=0 elapsed=2.225s exit=[['-1', '9'], ['-1', '9']] daemon=82
+default grace=1000ms launches=1 SIGTERM=1 checkpoints=0 elapsed=1.022s exit=[['-1', '9']] daemon=82
+
+The checkpoint needs 1.5 seconds to write. An expired readiness check
+still failed the target (82) when its child finished cleanup and exited
+zero. Operator shutdown returned zero. The control socket remained
+responsive while waiting. Every child was reaped and the socket removed.

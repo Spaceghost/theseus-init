@@ -110,6 +110,12 @@ cgroup cleanup. This keeps the target within PID 1's 135-second
 worker allowance even in reverse dependency order. The daemon acknowledges a successful control shutdown after
 the child has been reaped and the socket removed.
 
+When startup readiness times out, the service receives SIGTERM and keeps
+its configured grace to finish cleanup. It stays in `STOPPING` during this
+interval. An operator shutdown continues the same deadline. A clean exit
+after the readiness timeout still counts as a failed startup for retries.
+See the [readiness timeout and shutdown measurements](assets/readiness-stop-grace.txt).
+
 The one-shot `theseus run SERVICE --stop-after-ms N` path uses the
 same per-service grace and pidfd escalation. It reports an ordinary
 exit as soon as the child exits, even before the stop timer expires. Both a

@@ -629,10 +629,26 @@ jobs:
           wait_state socket-timeout FAILED
           test "$(grep -c '^daemon-exit' build/live/ready-timeout.log)" -eq 2
           grep -Fx "$(printf 'TE1\treadiness\tsocket-timeout\t2\ttimeout')" build/live/ready-timeout.log
+          for attempt in 1 2; do
+            grep -Fx "$(printf 'TE1\tshutdown\tsocket-timeout\t%s\tterm-timeout\t240' "$attempt")" build/live/ready-timeout.log
+          done
           ! grep -E '[[:space:]]ready$' build/live/ready-timeout.log
           kill -0 "$foreign_pid"
           test ! -e "$job_dir/foreign-probe.pid"
           stop_daemon
+
+          for shutdown in after-exit during-grace; do
+            log="build/live/slow-stop-$shutdown.log"
+            build/live/theseusd slow-stop >"$log" 2>&1 &
+            daemon_pid=$!
+            wait_state slow-stop STOPPING
+            if test "$shutdown" = after-exit; then wait_state slow-stop FAILED; fi
+            stop_daemon
+            test -f "$job_dir/slow-stop.stopped"
+            grep -Fx "$(printf 'TE1\tservice\tslow-stop\t1\texited\t0\t0')" "$log"
+            if grep -F 'term-timeout' "$log"; then exit 1; fi
+            rm "$job_dir/slow-stop.ready" "$job_dir/slow-stop.stopped"
+          done
 
           build/live/theseusd socket-early-exit >build/live/early-exit.log 2>&1 &
           daemon_pid=$!
