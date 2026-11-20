@@ -33,6 +33,7 @@ local function c_mount(source: cstring, target: cstring, kind: cstring, flags: c
 local function c_mkdir(path: cstring, mode: cuint): cint <cimport 'mkdir', nodecl, cinclude '<sys/stat.h>'> end
 local function c_access(path: cstring, mode: cint): cint <cimport 'access', nodecl, cinclude '<unistd.h>'> end
 local function c_setenv(name: cstring, value: cstring, replace: cint): cint <cimport 'setenv', nodecl, cinclude '<stdlib.h>'> end
+local function c_unsetenv(name: cstring): cint <cimport 'unsetenv', nodecl, cinclude '<stdlib.h>'> end
 local function c_kill(pid: cint, signal: cint): cint <cimport 'kill', nodecl, cinclude '<signal.h>'> end
 local function c_waitpid(pid: cint, status: *cint, flags: cint): cint <cimport 'waitpid', nodecl, cinclude '<sys/wait.h>'> end
 local function c_signal(sig: cint, action: SignalHandler): SignalHandler <cimport 'signal', nodecl, cinclude '<signal.h>'> end
@@ -306,17 +307,18 @@ local function await_cleanup(fd: cint, session: *Session, worker_only: boolean, 
   return false
 end
 
-local function launch_openrc(level: cstring, output: cint): cint
+local function launch_openrc(argument: cstring, output: cint): cint
   local pid = c_fork()
   if pid > 0 then
     c_setpgid(pid, pid)
   elseif pid == 0 then
     if c_setpgid(0, 0) ~= 0 then c_exit(126) end
     unblock_signals()
+    if c_unsetenv('RC_REBOOT') ~= 0 then c_exit(126) end
     -- A pipe endpoint may already occupy an inherited standard descriptor.
     if output >= 0 and (c_dup2(output, 1) < 0 or c_dup2(output, 2) < 0 or
        c_fcntl(1, F_SETFD, 0) < 0 or c_fcntl(2, F_SETFD, 0) < 0) then c_exit(126) end
-    local argv: [3]cstring = {OpenRC, level, nilptr}
+    local argv: [3]cstring = {OpenRC, argument, nilptr}
     c_execv(OpenRC, &argv[0])
     c_exit(127)
   end
@@ -324,7 +326,8 @@ local function launch_openrc(level: cstring, output: cint): cint
 end
 
 -- Keep PID 1 responsive while the distribution's runlevel program runs.
-local function openrc_phase(fd: cint, session: *Session, level: cstring, shutting_down: boolean): (boolean, Action)
+local function openrc_phase(fd: cint, session: *Session, level: cstring, shutdown_action: Action): (boolean, Action)
+  local shutting_down = shutdown_action ~= Action.None
   report('openrc-start\t' .. tostring(level))
   local output: [2]cint = {-1, -1}
   if shutting_down then
@@ -347,7 +350,10 @@ local function openrc_phase(fd: cint, session: *Session, level: cstring, shuttin
       c_close(output[0])
     end
   end
-  session.openrc = launch_openrc(level, output[1])
+  -- OpenRC maps reboot onto shutdown and sets RC_REBOOT for its scripts.
+  local argument = level
+  if shutdown_action == Action.Reboot then argument = 'reboot' end
+  session.openrc = launch_openrc(argument, output[1])
   if session.openrc <= 0 then return false, Action.None end
   local deadline = now_ms() + OpenRCGrace
   local action = Action.None
@@ -383,7 +389,7 @@ local function boot_openrc(fd: cint, session: *Session): (boolean, Action)
   session.openrc_started = true
   local levels: [3]cstring = {'sysinit', 'boot', 'default'}
   for i = 0, 2 do
-    local ok, action = openrc_phase(fd, session, levels[i], false)
+    local ok, action = openrc_phase(fd, session, levels[i], Action.None)
     if not ok or action ~= Action.None then return false, action end
   end
   return true, Action.None
@@ -412,7 +418,7 @@ local function shutdown(fd: cint, session: *Session, action: Action, had_worker:
   -- Keep compatibility services available until native clients have stopped.
   if session.openrc_started then
     if session.openrc > 0 then report('openrc-phase-still-running')
-    elseif not openrc_phase(fd, session, 'shutdown', true) then report('openrc-shutdown-failed') end
+    elseif not openrc_phase(fd, session, 'shutdown', action) then report('openrc-shutdown-failed') end
     session.openrc_started = false
   end
   -- Sweep children and session processes outside the managed cgroups last.

@@ -1,0 +1,7 @@
+#!/sbin/openrc-run
+
+description="Record the action visible to OpenRC shutdown scripts"
+
+start() {
+    printf 'VM_OPENRC_SHUTDOWN_ACTION level=%s reboot=%s\n' "${RC_RUNLEVEL-}" "${RC_REBOOT-unset}"
+}

@@ -50,7 +50,9 @@ readiness requirements after a runlevel completes.
 
 A system shutdown stops the native target first, so its clients
 can finish work using servers managed by OpenRC. PID 1 then executes
-OpenRC shutdown and finishes kernel shutdown. A failed native
+OpenRC shutdown and finishes kernel shutdown. On reboot, PID 1
+invokes OpenRC with its reboot argument so shutdown scripts receive
+RC_REBOOT=YES while RC_RUNLEVEL remains shutdown. A failed native
 supervisor is cleaned up while already running OpenRC services
 remain available in rescue. Use the kernel option theseus.rescue=1
 to enter the console before either service manager starts.
@@ -60,7 +62,10 @@ request can interrupt a boot runlevel. PID 1 sends SIGTERM to the
 active process group and gives it two seconds before sending
 SIGKILL, even if the leader exits during that interval. PID 1
 retains the leader's PID until the final group signal. A runlevel
-failure or timeout is reported on the console. During OpenRC shutdown,
+failure or timeout is reported on the console. OpenRC reports the
+runlevel program's exit status separately from individual script
+results. Check the service's own shutdown result when verifying
+that it stopped cleanly. During OpenRC shutdown,
 PID 1 forwards script output to the console on a best-effort basis.
 If the console stalls, PID 1 discards output that cannot be written
 immediately so that the scripts can continue.
@@ -97,7 +102,12 @@ configure the test services for loopback. Build
 tests/pid1_openrc_guest.nelua as /opt/theseus/bin/pid1-openrc-test
 and export openrcCompiled from ./pid1fixtures as the graph.
 Boot once with test.action=poweroff, then boot the same disk with
-test.action=reboot. The native client writes a PostgreSQL transaction
+test.action=reboot. To check the action seen by OpenRC, install
+tests/openrc_shutdown_action as an executable named
+/etc/init.d/theseus-shutdown-action and add it to the shutdown
+runlevel with rc-update. Expect the VM_OPENRC_SHUTDOWN_ACTION
+line to show level=shutdown on both boots and reboot=YES only
+on reboot. The native client writes a PostgreSQL transaction
 during its own shutdown and checks for it after the next boot. Boot
 a fresh overlay with test.action=worker-crash to check that OpenRC
 services remain available while the native scope is reclaimed.
