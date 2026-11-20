@@ -100,7 +100,9 @@ local OpenRC: cstring = '/sbin/openrc'
 local Rescue: cstring = '/bin/sh'
 local BootFallback: cstring = '/usr/libexec/theseus/boot-fallback'
 local ClearBootGuard: cstring = '/usr/libexec/theseus/boot-guard-clear'
-local FallbackGrace <comptime> = 5000
+-- The recovery selector must persist the boot choice before PID 1 reboots.
+local FallbackGrace <comptime> = 30000
+local ClearGuardGrace <comptime> = 5000
 -- 32 services each get up to four seconds for probe, leader, and cgroup cleanup.
 local WorkerGrace <comptime> = 135000
 local OpenRCGrace <comptime> = 120000
@@ -552,7 +554,7 @@ end
 local function clear_boot_guard(fd: cint)
   local pid = launch_boot_command(ClearBootGuard, nilptr, -1)
   if pid < 0 then report('boot-guard-clear-fork-failed'); return end
-  local deadline = now_ms() + FallbackGrace
+  local deadline = now_ms() + ClearGuardGrace
   while now_ms() < deadline do
     local status: cint
     local got = c_waitpid(pid, &status, WNOHANG)

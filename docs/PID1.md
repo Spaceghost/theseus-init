@@ -112,7 +112,7 @@ the supervisor starts, or in-place recovery gives up, PID 1 starts
 the distribution-owned executable
 `/usr/libexec/theseus/boot-fallback` with no arguments. The executable
 must durably select a recovery entry for the next boot before
-returning success. It must finish within five seconds.
+returning success. It must finish within 30 seconds.
 
 PID 1 reboots through its normal shutdown path after a successful
 selection. A failed selector leaves PID 1 in rescue with the configured
