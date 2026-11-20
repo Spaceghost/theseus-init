@@ -675,6 +675,8 @@ local function stop_leader(runtime: *Runtime): boolean
   if not signal_child(runtime, SIGTERM) then return false end
   local ready = wait_for_exit(runtime.pidfd, runtime.service.stop_grace_ms)
   if ready == 0 then
+    daemon_log('TE1', 'shutdown', runtime.service.name, runtime.attempts, 'term-timeout',
+               runtime.service.stop_grace_ms)
     if not signal_child(runtime, SIGKILL) then return false end
     ready = wait_for_exit(runtime.pidfd, NativeStopCleanupStepMs)
   end

@@ -25,6 +25,12 @@ local function c_setsid(): cint <cimport 'setsid', nodecl, cinclude '<unistd.h>'
 local function c_getpid(): cint <cimport 'getpid', nodecl, cinclude '<unistd.h>'> end
 local SignalHandler = @function(cint): void
 local function c_signal(signal: cint, handler: SignalHandler): SignalHandler <cimport 'signal', nodecl, cinclude '<signal.h>'> end
+local StopSigset: type <cimport 'sigset_t', nodecl, cinclude '<signal.h>'> = @record{}
+local function c_sigemptyset(set: *StopSigset): cint <cimport 'sigemptyset', nodecl, cinclude '<signal.h>'> end
+local function c_sigaddset(set: *StopSigset, signal: cint): cint <cimport 'sigaddset', nodecl, cinclude '<signal.h>'> end
+local function c_sigprocmask(how: cint, set: *StopSigset, old: *StopSigset): cint <cimport 'sigprocmask', nodecl, cinclude '<signal.h>'> end
+local function c_sigwait(set: *StopSigset, signal: *cint): cint <cimport 'sigwait', nodecl, cinclude '<signal.h>'> end
+local SIG_BLOCK: cint <cimport, nodecl, cinclude '<signal.h>'>
 local AF_UNIX: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
 local SOCK_STREAM: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
 local SOCK_NONBLOCK: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
@@ -178,6 +184,22 @@ if arg[1] == 'tree' then
     os.exit(42)
   end
   while true do c_pause() end
+end
+
+if arg[1] == 'delay-term' then
+  local mask: StopSigset
+  assert(c_sigemptyset(&mask) == 0 and c_sigaddset(&mask, SIGTERM) == 0 and
+         c_sigprocmask(SIG_BLOCK, &mask, nilptr) == 0, 'failed to block SIGTERM')
+  local marker = io.open(arg[2] .. '.ready', 'w')
+  assert(marker:isopen(), 'failed to publish readiness')
+  marker:close()
+  local signo: cint
+  assert(c_sigwait(&mask, &signo) == 0 and signo == SIGTERM, 'failed to receive SIGTERM')
+  c_usleep(1500000)
+  local done = io.open(arg[2] .. '.stopped', 'w')
+  assert(done:isopen(), 'failed to publish completion')
+  done:close()
+  os.exit(0)
 end
 
 if arg[1] == 'ignore-term' then

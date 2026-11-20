@@ -71,6 +71,11 @@ Graph records append the `requires`, `wants`, `after`, and `before`
 lists to the service fields. TSC3 wraps the TSC2 fields. TSC5 wraps the
 TSC4 fields and preserves Unix readiness settings. TSC7 wraps TSC6. TGT1 records supply
 target membership in the same input.
+A nondefault `stopGraceMs` wraps the service as
+`TSC8<TAB>milliseconds<TAB>service-record` or the graph service as
+`TSC9<TAB>milliseconds<TAB>graph-service-record`. The inner record
+retains its readiness fields and any graph edges. The default continues
+to compile to the existing formats.
 
 ## Userspace daemon
 
@@ -86,9 +91,14 @@ readiness checks, it can close unfinished control requests to free
 the descriptors those operations need.
 
 `theseus daemon-stop`, SIGTERM, and SIGINT initiate shutdown. The daemon
-signals its direct child through the pidfd and gives it one second to
-exit. If that expires, it sends SIGKILL and waits up to one more second
-for exit. The daemon acknowledges a successful control shutdown after
+signals its direct child through the pidfd. The CUE service field
+`stopGraceMs` sets its SIGTERM grace in milliseconds, from 1 through
+60000, with a default of 1000. On expiration Theseus emits a
+`TE1 shutdown` event, sends SIGKILL, and waits up to one additional
+second for exit. Targets must fit a 128-second aggregate allowance
+including three seconds per service for probe, forced-exit, and
+cgroup cleanup. This keeps the target within PID 1's 135-second
+worker allowance even in reverse dependency order. The daemon acknowledges a successful control shutdown after
 the child has been reaped and the socket removed.
 
 For CUE readiness kind `unix-socket`, the child starts in `STARTING`
@@ -247,6 +257,7 @@ ordered fields for state and exit events.
 | --- | --- |
 | `state` | Service, attempt, previous state, next state, reason |
 | `service` | Service, attempt, `exited`, exit code, signal |
+| `shutdown` | Service, attempt, `term-timeout`, grace milliseconds |
 | `process` | PID, `adopted-exit`, exit code, signal |
 
 A signal exit uses code `-1`. An ordinary exit uses signal `0`.

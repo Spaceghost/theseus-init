@@ -135,6 +135,37 @@ jobs:
           test -x build/live/theseusd
           test -x build/live/theseus
 
+      - name: Bound graceful target shutdown in reverse dependency order
+        run: |
+          set -eu
+          work="$PWD/build/stop-grace"
+          mkdir -p "$work"
+          export THESEUS_GRAPH="$work/graph.tsc" THESEUS_SOCKET="$work/control.sock"
+          cue export ./shutdownfixtures -e compiled --out text \
+            -t testDir="$work" -t testProgram="$PWD/build/live/control-test" >"$THESEUS_GRAPH"
+          rc=0
+          build/live/theseusd --target over-budget >"$work/invalid.log" 2>&1 || rc=$?
+          test "$rc" -eq 65
+          grep -F 'shutdown budget exceeded for target: over-budget' "$work/invalid.log"
+          test ! -e "$THESEUS_SOCKET"
+          build/live/theseusd --target default >"$work/daemon.log" 2>&1 &
+          daemon=$!
+          trap 'kill "$daemon" 2>/dev/null || true' EXIT
+          for ignored in $(seq 1 100); do
+            if test -e "$work/delayed.ready" && test -e "$work/stubborn.ready"; then break; fi
+            sleep 0.05
+          done
+          test -e "$work/delayed.ready"
+          test -e "$work/stubborn.ready"
+          build/live/theseus daemon-stop
+          wait "$daemon"
+          trap - EXIT
+          test ! -e "$THESEUS_SOCKET"
+          test -e "$work/delayed.stopped"
+          grep -E '^TE1[[:space:]]shutdown[[:space:]]stubborn[[:space:]]1[[:space:]]term-timeout[[:space:]]1200$' "$work/daemon.log"
+          awk '$2 == "service" && $5 == "exited" {print $3, $6, $7}' "$work/daemon.log" >"$work/exits"
+          printf 'stubborn -1 9\ndelayed 0 0\n' | cmp - "$work/exits"
+
       - name: Build the opt-in PID 1 entry point
         run: |
           set -eux
