@@ -87,7 +87,12 @@ installed service scripts matched the original Alpine APKs byte for
 byte. A separate Theseus PID 1 run under TCG reached all nine workloads,
 then the supervisor sent SIGKILL when the native client's shutdown
 handler exceeded the one-second SIGTERM grace. OpenRC shutdown still
-completed. See the [serial results](assets/openrc-nebox-corpus.txt).
+completed. See the [r11 serial results](assets/openrc-nebox-corpus.txt).
+
+Cascadia's signed Theseus r12 package completed the same shutdown checks
+on KVM and TCG with `stopGraceMs: 8000` on the native client. Both runs
+rebooted and read the checkpoint before powering down. See the
+[r12 shutdown trace](assets/native-stop-grace.txt).
 
 ## Reproduce the comparison
 

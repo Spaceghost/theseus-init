@@ -1,0 +1,43 @@
+Theseus native shutdown grace, signed Cascadia Theseus r12 and Nebox r3.
+The Alpine 3.24.4 test probed all nine OpenRC workloads before and during
+native shutdown. The CUE service used stopGraceMs: 8000.
+
+Userspace target with a stubborn dependent and a delayed dependency
+TE1	shutdown	stubborn	1	term-timeout	1200
+TE1	service	stubborn	1	exited	-1	9
+TE1	service	delayed	1	exited	0	0
+theseus-graph: shutdown budget exceeded for target: over-budget
+
+Theseus PID 1 (KVM, first boot)
+NETWORK_PID1_WORKLOADS_READY first
+NETWORK_PID1_SERVICES_AVAILABLE_AT_NATIVE_SHUTDOWN first
+TE1	service	network-client	1	exited	0	0
+TI1	openrc-start	shutdown
+TI1	shutdown-ready
+reboot: Restarting system
+
+Theseus PID 1 (KVM, second boot)
+NETWORK_PID1_PREVIOUS_CHECKPOINT_OK
+NETWORK_PID1_WORKLOADS_READY second
+NETWORK_PID1_SERVICES_AVAILABLE_AT_NATIVE_SHUTDOWN second
+TE1	service	network-client	1	exited	0	0
+TI1	openrc-start	shutdown
+TI1	shutdown-ready
+reboot: Power down
+
+Theseus PID 1 (TCG, first boot)
+NETWORK_PID1_WORKLOADS_READY first
+NETWORK_PID1_SERVICES_AVAILABLE_AT_NATIVE_SHUTDOWN first
+TE1	service	network-client	1	exited	0	0
+TI1	openrc-start	shutdown
+TI1	shutdown-ready
+reboot: Restarting system
+
+Theseus PID 1 (TCG, second boot)
+NETWORK_PID1_PREVIOUS_CHECKPOINT_OK
+NETWORK_PID1_WORKLOADS_READY second
+NETWORK_PID1_SERVICES_AVAILABLE_AT_NATIVE_SHUTDOWN second
+TE1	service	network-client	1	exited	0	0
+TI1	openrc-start	shutdown
+TI1	shutdown-ready
+reboot: Power down
