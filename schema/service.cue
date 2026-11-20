@@ -7,7 +7,7 @@ import (
 
 #ServiceName: string & =~"^[a-zA-Z0-9][a-zA-Z0-9._@:+-]{0,62}$"
 #SafeText: string & !~"[\\t\\r\\n\\x00\\x1f]"
-#RestartPolicy: "never" | "on-failure" | "always"
+#RestartPolicy: "never" | "on-failure" | "always" | "respawn"
 #ReadinessKind: "none" | "pid" | "unix-socket"
 
 #StartupProbe: {

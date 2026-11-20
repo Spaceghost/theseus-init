@@ -77,6 +77,15 @@ A nondefault `stopGraceMs` wraps the service as
 retains its readiness fields and any graph edges. The default continues
 to compile to the existing formats.
 
+
+Serial gettys can select `restart: "respawn"`. After a clean exit the
+supervisor waits one second before launching the next session. Each clean
+exit resets the service's failure count. A nonzero exit, signal or failed
+startup costs one retry, up to `maxRestarts` consecutive retries. The
+reported restart count includes every relaunch. The same policy applies
+to the one-shot runner and native targets. Older binaries reject records
+that select this policy.
+
 ## Userspace daemon
 
 Set `THESEUS_SOCKET` to an absolute path in a directory controlled by the

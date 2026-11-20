@@ -124,6 +124,7 @@ local Runtime = @record{
   exit_state: ServiceState,
   attempts: integer,
   restarts: integer,
+  failed_retries: integer,
   action_at: integer,
   ready_by: integer,
   kill_sent: boolean,
@@ -334,14 +335,6 @@ local function record_exec(runtime: *Runtime): boolean
   return true
 end
 
-local function should_restart(runtime: *Runtime): boolean
-  if runtime.service.restart == RestartPolicy.Always then return true end
-  if runtime.service.restart == RestartPolicy.OnFailure then
-    return runtime.state == ServiceState.Failed
-  end
-  return false
-end
-
 local function reap(runtime: *Runtime): boolean
   local status: cint = 0
   if not wait_for_child(runtime.pid, &status) then return false end
@@ -366,9 +359,11 @@ local function finish_exit(runtime: *Runtime)
   transition(runtime, runtime.exit_state, 'child-exit')
   runtime.drain_by = 0
   runtime.action_at = 0
-  if should_restart(runtime) and runtime.restarts < runtime.service.max_restarts then
-    local delay = (runtime.restarts + 1) * 10
-    if delay > 1000 then delay = 1000 end
+  local delay: integer
+  delay, runtime.failed_retries = next_restart(runtime.service.restart, runtime.service.max_restarts,
+                                              runtime.restarts, runtime.failed_retries,
+                                              runtime.exit_state == ServiceState.Failed)
+  if delay > 0 then
     runtime.action_at = monotonic_ms() + delay
     transition(runtime, ServiceState.Backoff, 'retry')
   end

@@ -1,0 +1,18 @@
+Theseus respawn policy, Linux x86-64, 2026-11-20
+
+A CUE service used PID readiness, respawn, and maxRestarts=1. The
+one-shot runner and the native target launched real children. The
+child exited with statuses 1, 0, 1, 0, 0, 0, 1, 1. The test recorded
+each launch on CLOCK_MONOTONIC. CUE emitted identical records on two
+exports for each runner.
+PASS one-shot admitted 8 children, reset consecutive failures on a clean exit, stopped at 2 consecutive failures, minimum launch interval 1.084s
+PASS target admitted 8 children, reset consecutive failures on a clean exit, stopped at 2 consecutive failures, minimum launch interval 1.084s
+
+result	console	FAILED	attempts	8	restarts	7	exit	1	signal	0
+TE1	target	default	failed	console
+TE1	target	default	stopped	82
+
+Other policies with maxRestarts=1
+never 1 children, exit 1
+on-failure 2 children, exit 0
+always 2 children, exit 0

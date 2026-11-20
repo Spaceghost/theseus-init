@@ -2,8 +2,8 @@
 require 'string'
 require 'src.theseus.graph'
 require 'src.theseus.readiness'
+require 'src.theseus.restart'
 
-global RestartPolicy = @enum{Never = 0, OnFailure, Always}
 global ReadinessKind = @enum{None = 0, Pid, UnixSocket}
 
 global RuntimeService = @record{
@@ -60,15 +60,12 @@ global function parse_runtime_service(line: string): (boolean, RuntimeService)
   if #service.argv_serialized == 0 or cursor == 0 then return false, service end
   local restart: string
   restart, cursor = next_field(line, cursor)
-  if restart == 'never' then service.restart = RestartPolicy.Never
-  elseif restart == 'on-failure' then service.restart = RestartPolicy.OnFailure
-  elseif restart == 'always' then service.restart = RestartPolicy.Always
-  else return false, service end
-  if cursor == 0 then return false, service end
+  local ok: boolean
+  ok, service.restart = parse_restart(restart)
+  if not ok or cursor == 0 then return false, service end
   local maximum: string
   maximum, cursor = next_field(line, cursor)
   if cursor == 0 then return false, service end
-  local ok: boolean
   ok, service.max_restarts = parse_decimal(maximum, 1000000)
   if not ok then return false, service end
   local readiness: string

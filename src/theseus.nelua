@@ -8,6 +8,7 @@ require 'io'
 require 'os'
 require 'string'
 require 'src.theseus.readiness'
+require 'src.theseus.restart'
 require 'src.theseus.shutdown_policy'
 require 'src.theseus.pidfd'
 require 'src.theseus.openrc'
@@ -47,12 +48,6 @@ local ServiceState = @enum{
   Stopped,
   Failed,
   Backoff,
-}
-
-local RestartPolicy = @enum{
-  Never = 0,
-  OnFailure,
-  Always,
 }
 
 local ReadinessKind = @enum{
@@ -116,25 +111,11 @@ local function state_name(state: ServiceState): string
   return 'UNKNOWN'
 end
 
-local function restart_name(policy: RestartPolicy): string
-  if policy == RestartPolicy.Never then return 'never' end
-  if policy == RestartPolicy.OnFailure then return 'on-failure' end
-  if policy == RestartPolicy.Always then return 'always' end
-  return 'invalid'
-end
-
 local function readiness_name(kind: ReadinessKind): string
   if kind == ReadinessKind.None then return 'none' end
   if kind == ReadinessKind.Pid then return 'pid' end
   if kind == ReadinessKind.UnixSocket then return 'unix-socket' end
   return 'invalid'
-end
-
-local function parse_restart(value: string): (boolean, RestartPolicy)
-  if value == 'never' then return true, RestartPolicy.Never end
-  if value == 'on-failure' then return true, RestartPolicy.OnFailure end
-  if value == 'always' then return true, RestartPolicy.Always end
-  return false, RestartPolicy.Never
 end
 
 local function parse_readiness(value: string): (boolean, ReadinessKind)
@@ -369,14 +350,6 @@ local function wait_for_child(pid: cint): ExitResult
   return result
 end
 
-local function restart_needed(policy: RestartPolicy, result: ExitResult): boolean
-  if policy == RestartPolicy.Always then return true end
-  if policy == RestartPolicy.OnFailure then
-    return result.signal ~= 0 or result.exit_code ~= 0
-  end
-  return false
-end
-
 local function cleanup_unidentified_child(pid: cint)
   -- pidfd acquisition failed. The child is ours and has not been reaped, so
   -- its PID cannot have been recycled. PID-based SIGKILL is cleanup only.
@@ -436,6 +409,7 @@ local function supervise_service(service: Service, stop_after_ms: integer): inte
 
   local attempts: integer = 0
   local restarts: integer = 0
+  local failed_retries: integer = 0
   while true do
     if not transition(&service, ServiceState.Starting) then return 70 end
     attempts = attempts + 1
@@ -520,14 +494,14 @@ local function supervise_service(service: Service, stop_after_ms: integer): inte
     end
     print('exit', service.name, 'code', result.exit_code, 'signal', result.signal)
 
-    local wants_restart = restart_needed(service.restart, result)
-    if wants_restart and restarts < service.max_restarts then
+    local delay_ms: integer
+    delay_ms, failed_retries = next_restart(service.restart, service.max_restarts, restarts,
+                                           failed_retries, not succeeded)
+    if delay_ms > 0 then
       restarts = restarts + 1
       if service.state == ServiceState.Failed then
         if not transition(&service, ServiceState.Backoff) then return 70 end
       end
-      local delay_ms = restarts * 10
-      if delay_ms > 1000 then delay_ms = 1000 end
       c_usleep((@cuint)(delay_ms * 1000))
       print('restart', service.name, 'count', restarts, 'delay-ms', delay_ms)
       -- STOPPED may restart directly; BACKOFF transitions to STARTING.
@@ -712,6 +686,16 @@ local function selftest()
   ok, service = parse_service_record('TSC2\tbad\t/bin/false\tnever\t0\tmagic')
   assert(not ok)
 
+  ok, service = parse_service_record('TSC2\tconsole\t/bin/login\trespawn\t1\tpid')
+  assert(ok and restart_name(service.restart) == 'respawn')
+  local delay, failures = next_restart(service.restart, 1, 20, 0, true)
+  assert(delay == 1000 and failures == 1)
+  delay, failures = next_restart(service.restart, 1, 21, failures, true)
+  assert(delay == 0 and failures == 1)
+  delay, failures = next_restart(service.restart, 1, 21, failures, false)
+  assert(delay == 1000 and failures == 0)
+  delay, failures = next_restart(service.restart, 0, 22, failures, false)
+  assert(delay == 1000 and failures == 0)
   print('Theseus core self-test passed')
 end
 

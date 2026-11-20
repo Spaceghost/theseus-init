@@ -1,0 +1,33 @@
+global RestartPolicy = @enum{Never = 0, OnFailure, Always, Respawn}
+
+global function parse_restart(value: string): (boolean, RestartPolicy)
+  if value == 'never' then return true, RestartPolicy.Never end
+  if value == 'on-failure' then return true, RestartPolicy.OnFailure end
+  if value == 'always' then return true, RestartPolicy.Always end
+  if value == 'respawn' then return true, RestartPolicy.Respawn end
+  return false, RestartPolicy.Never
+end
+
+global function restart_name(policy: RestartPolicy): string
+  if policy == RestartPolicy.Never then return 'never' end
+  if policy == RestartPolicy.OnFailure then return 'on-failure' end
+  if policy == RestartPolicy.Always then return 'always' end
+  if policy == RestartPolicy.Respawn then return 'respawn' end
+  return 'invalid'
+end
+
+-- A positive delay schedules a retry. Respawn budgets consecutive failures
+-- separately from the total restart count reported to operators.
+global function next_restart(policy: RestartPolicy, maximum: integer, restarts: integer,
+                             failed_retries: integer, failed: boolean): (integer, integer)
+  if policy == RestartPolicy.Respawn then
+    if not failed then return 1000, 0 end
+    if failed_retries >= maximum then return 0, failed_retries end
+    return 1000, failed_retries + 1
+  end
+  if policy == RestartPolicy.Never or (policy == RestartPolicy.OnFailure and not failed) or
+     restarts >= maximum then return 0, failed_retries end
+  local delay = (restarts + 1) * 10
+  if delay > 1000 then delay = 1000 end
+  return delay, failed_retries
+end
