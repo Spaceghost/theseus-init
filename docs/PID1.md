@@ -132,8 +132,12 @@ boot trials.
 When a ready native target has an orderly shutdown request, PID 1 runs
 `/usr/libexec/theseus/boot-guard-clear` after process cleanup and sync
 and before remounting the root filesystem read-only. The distribution's
-hook must durably clear the guard and finish within five seconds. Install
-both helpers if the profile also uses the software recovery selector.
+hook must durably clear the guard and finish within five seconds. PID 1
+keeps the mark if the supervisor exits unsuccessfully, ownership reclaim
+fails, OpenRC's shutdown runlevel fails, or children remain after cleanup.
+It reports `TI1 boot-guard-retained shutdown-incomplete` and still honors
+the requested reboot or poweroff. Install both helpers if the profile
+also uses the software recovery selector.
 The guard remains armed across unexpected resets, even after target
 readiness. Recovery on a specific device still depends on qualifying
 its independent reset behavior. The guard ends at the final shutdown

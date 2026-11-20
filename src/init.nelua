@@ -113,6 +113,7 @@ local RecoveryStable <comptime> = 5 * 60 * 1000
 local Action = @enum{None = 0, Poweroff, Reboot, Halt}
 local Session = @record{
   worker: cint,
+  worker_exit_clean: boolean,
   rescue: cint,
   rescue_at: integer,
   openrc: cint,
@@ -428,6 +429,7 @@ local function reap(session: *Session): boolean
     if pid <= 0 then return pid == 0 or errno ~= ECHILD end
     if pid == session.worker then
       session.worker = 0
+      session.worker_exit_clean = status == 0
       report('supervisor-exit\t' .. tostring((status >> 8) & 0xff) .. '\t' .. tostring(status & 0x7f))
     elseif pid == session.rescue then
       session.rescue = 0
@@ -581,29 +583,47 @@ local function shutdown(fd: cint, session: *Session, action: Action, had_worker:
   else
     report('shutdown\tpoweroff')
   end
+  local clean = true
   if session.worker > 0 then
+    session.worker_exit_clean = false
     c_kill(session.worker, SIGTERM)
     if not await_cleanup(fd, session, true, worker_grace) then
+      clean = false
       report('supervisor-timeout')
       c_kill(session.worker, SIGKILL)
       await_cleanup(fd, session, true, 1000)
     end
+    clean = clean and session.worker_exit_clean
   end
-  if had_worker and not reclaim() then report('supervisor-reclaim-failed') end
+  if had_worker and not reclaim() then
+    clean = false
+    report('supervisor-reclaim-failed')
+  end
   -- Keep compatibility services available until native clients have stopped.
   if session.openrc_started then
-    if session.openrc > 0 then report('openrc-phase-still-running')
-    elseif not openrc_phase(fd, session, 'shutdown', action) then report('openrc-shutdown-failed') end
+    if session.openrc > 0 then
+      clean = false
+      report('openrc-phase-still-running')
+    elseif not openrc_phase(fd, session, 'shutdown', action) then
+      clean = false
+      report('openrc-shutdown-failed')
+    end
     session.openrc_started = false
   end
   -- Sweep children and session processes outside the managed cgroups last.
   c_kill(-1, SIGTERM)
   if not await_cleanup(fd, session, false, 2000) then
     c_kill(-1, SIGKILL)
-    if not await_cleanup(fd, session, false, 1000) then report('remaining-processes') end
+    if not await_cleanup(fd, session, false, 1000) then
+      clean = false
+      report('remaining-processes')
+    end
   end
   c_sync()
-  if clear_guard then clear_boot_guard(fd) end
+  if clear_guard then
+    if clean then clear_boot_guard(fd)
+    else report('boot-guard-retained\tshutdown-incomplete') end
+  end
   if c_mount(nilptr, '/', nilptr, MS_REMOUNT | MS_RDONLY, nilptr) ~= 0 then report('root-remount-failed') end
   if watchdog >= 0 and action ~= Action.Reboot then
     local option = WDIOS_DISABLECARD
