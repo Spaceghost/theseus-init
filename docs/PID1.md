@@ -44,6 +44,15 @@ root read-only, and requests the kernel action. It returns to
 rescue if the syscall fails. A daemon-stop request only stops
 the userspace worker and leads to rescue.
 
+A bootloader can add `theseus.trial=1` to a one-boot entry after it
+has durably consumed that selection. If startup fails or the
+supervisor exits during the trial, PID 1 runs the existing orderly
+reboot sequence. Its `trial-reboot` console event includes the
+failure reason. A manual shutdown request takes precedence, and
+`theseus.rescue=1` still requests rescue. A failed reboot syscall
+does not trigger repeated trial reboots. This policy does not detect
+a hung kernel or a live supervisor that never finishes startup.
+
 ## OpenRC-managed services
 
 On Alpine, add theseus.openrc=1 alongside theseus.pid1=1 to boot

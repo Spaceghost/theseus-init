@@ -141,19 +141,20 @@ local function mount_type(kind: cstring, path: cstring, flags: culong, magic: cl
   return has_type(path, magic) or c_mount(kind, path, kind, flags, nilptr) == 0
 end
 
-local function command_line(): (boolean, boolean, boolean, boolean)
+local function command_line(): (boolean, boolean, boolean, boolean, boolean)
   local file = io.open('/proc/cmdline', 'r')
-  if not file:isopen() then return false, false, false, true end
+  if not file:isopen() then return false, false, false, true, false end
   local line = file:read('*a')
   file:close()
-  local enabled, rescue, openrc, rescue_disabled: boolean, boolean, boolean, boolean
+  local enabled, rescue, openrc, rescue_disabled, trial: boolean, boolean, boolean, boolean, boolean
   for option in string.gmatch(line, '%S+') do
     if option == 'theseus.pid1=1' then enabled = true end
     if option == 'theseus.rescue=1' then rescue = true end
     if option == 'theseus.rescue=off' then rescue_disabled = true end
     if option == 'theseus.openrc=1' then openrc = true end
+    if option == 'theseus.trial=1' then trial = true end
   end
-  return enabled, rescue, openrc, rescue_disabled
+  return enabled, rescue, openrc, rescue_disabled, trial and enabled and not rescue
 end
 
 local function provision_run(): boolean
@@ -441,9 +442,9 @@ local function run()
   directory('/sys', 0x1ed)
   if c_access(Console, 0) ~= 0 then c_mount('devtmpfs', '/dev', 'devtmpfs', MS_NOSUID, nilptr) end
   console = c_open(Console, O_WRONLY | O_NONBLOCK | O_CLOEXEC | O_NOCTTY)
-  local boot, preferred_rescue, openrc, rescue_disabled = false, false, false, true
+  local boot, preferred_rescue, openrc, rescue_disabled, trial = false, false, false, true, false
   if mount_type('proc', '/proc', MS_NOSUID | MS_NODEV | MS_NOEXEC, PROC_SUPER_MAGIC) then
-    boot, preferred_rescue, openrc, rescue_disabled = command_line()
+    boot, preferred_rescue, openrc, rescue_disabled, trial = command_line()
   end
   if rescue_disabled then report('rescue-console\tdisabled') end
   c_setenv('PATH', '/usr/sbin:/usr/bin:/sbin:/bin', 1)
@@ -488,7 +489,19 @@ local function run()
     if pending == Action.None then ok, action = notification(fd, timeout, -1) end
     pending = Action.None
     reap(&session)
+    if action == Action.None and not in_rescue and session.worker == 0 then
+      if not trial and not reclaim() then report('supervisor-reclaim-failed') end
+      in_rescue = true
+      reason = 'supervisor'
+      report('rescue\t' .. reason)
+    end
+    if action == Action.None and trial and in_rescue then
+      report('trial-reboot\t' .. reason)
+      action = Action.Reboot
+    end
     if action ~= Action.None then
+      -- If reboot returns, stay in rescue instead of retrying the action.
+      trial = false
       shutdown(fd, &session, action, had_worker)
       in_rescue = true
       report('rescue\tshutdown-failed')
@@ -496,11 +509,6 @@ local function run()
       if fd >= 0 then c_close(fd) end
       fd = signal_queue()
       if fd < 0 then report('signal-queue-failed') end
-    end
-    if not in_rescue and session.worker == 0 then
-      if not reclaim() then report('supervisor-reclaim-failed') end
-      in_rescue = true
-      report('rescue\tsupervisor')
     end
     if in_rescue and not rescue_disabled and session.rescue <= 0 and now_ms() >= session.rescue_at then
       session.rescue = launch(true)
