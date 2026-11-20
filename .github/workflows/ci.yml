@@ -427,6 +427,9 @@ jobs:
           kill -CONT "$daemon_pid"
           wait "$shutdown_pid"
           wait "$daemon_pid"
+          kill "$backlog_pid"
+          wait "$backlog_pid" || test "$?" -eq 143
+          backlog_pid=
           test ! -e "$THESEUS_SOCKET"
           if kill -0 "$child_pid" 2>/dev/null; then
             echo "owned child remained after daemon shutdown: $child_pid" >&2
