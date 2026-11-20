@@ -99,6 +99,7 @@ local graph_path = '/etc/theseus/graph.tsc'
 local OpenRC: cstring = '/sbin/openrc'
 local Rescue: cstring = '/bin/sh'
 local BootFallback: cstring = '/usr/libexec/theseus/boot-fallback'
+local ClearBootGuard: cstring = '/usr/libexec/theseus/boot-guard-clear'
 local FallbackGrace <comptime> = 5000
 -- 32 services each get up to four seconds for probe, leader, and cgroup cleanup.
 local WorkerGrace <comptime> = 135000
@@ -173,14 +174,15 @@ local function parse_seconds(value: string, minimum: integer): integer
   return -1
 end
 
-local function command_line(): (boolean, boolean, boolean, boolean, boolean, integer, boolean, integer, integer, boolean)
+local function command_line(): (boolean, boolean, boolean, boolean, boolean, integer, boolean, integer, integer, boolean, boolean)
   local file = io.open('/proc/cmdline', 'r')
-  if not file:isopen() then return false, false, false, true, false, 0, false, 0, 0, false end
+  if not file:isopen() then return false, false, false, true, false, 0, false, 0, 0, false, false end
   local line = file:read('*a')
   file:close()
   local enabled, rescue, openrc, rescue_disabled, trial: boolean, boolean, boolean, boolean, boolean
   local trial_watchdog = false
   local fallback_enabled = false
+  local guard = false
   local trial_seconds: integer = 0
   local heartbeat_seconds: integer = 0
   local timeout_prefix = 'theseus.trial_timeout='
@@ -195,6 +197,7 @@ local function command_line(): (boolean, boolean, boolean, boolean, boolean, int
     if option == 'theseus.trial=1' then trial = true end
     if option == 'theseus.trial_watchdog=1' then trial_watchdog = true end
     if option == 'theseus.boot_fallback=1' then fallback_enabled = true end
+    if option == 'theseus.boot_guard=1' then guard = true end
     if string.sub(option, 1, #timeout_prefix) == timeout_prefix then
       trial_seconds = parse_seconds(string.sub(option, #timeout_prefix + 1), 1)
     elseif string.sub(option, 1, #heartbeat_prefix) == heartbeat_prefix then
@@ -203,7 +206,7 @@ local function command_line(): (boolean, boolean, boolean, boolean, boolean, int
       recovery_seconds = parse_seconds(string.sub(option, #recovery_prefix + 1), 3)
     end
   end
-  return enabled, rescue, openrc, rescue_disabled, trial and enabled and not rescue, trial_seconds, trial_watchdog, heartbeat_seconds, recovery_seconds, fallback_enabled
+  return enabled, rescue, openrc, rescue_disabled, trial and enabled and not rescue, trial_seconds, trial_watchdog, heartbeat_seconds, recovery_seconds, fallback_enabled, guard
 end
 
 local function provision_run(): boolean
@@ -539,7 +542,27 @@ local function boot_openrc(fd: cint, session: *Session): (boolean, Action)
   return true, Action.None
 end
 
-local function shutdown(fd: cint, session: *Session, action: Action, had_worker: boolean, worker_grace: integer)
+local function clear_boot_guard(fd: cint)
+  local pid = launch_boot_command(ClearBootGuard, nilptr, -1)
+  if pid < 0 then report('boot-guard-clear-fork-failed'); return end
+  local deadline = now_ms() + FallbackGrace
+  while now_ms() < deadline do
+    local status: cint
+    local got = c_waitpid(pid, &status, WNOHANG)
+    if got == pid then
+      if status == 0 then report('boot-guard-cleared')
+      else report('boot-guard-clear-failed\t' .. tostring((status >> 8) & 0xff) .. '\t' .. tostring(status & 0x7f)) end
+      return
+    end
+    if got < 0 and errno ~= EINTR then report('boot-guard-clear-wait-failed'); return end
+    notification(fd, 50, -1)
+  end
+  if c_kill(-pid, SIGKILL) ~= 0 then c_kill(pid, SIGKILL) end
+  report('boot-guard-clear-timeout')
+end
+
+local function shutdown(fd: cint, session: *Session, action: Action, had_worker: boolean,
+                        worker_grace: integer, clear_guard: boolean)
   local cmd = RB_POWER_OFF
   if action == Action.Reboot then
     cmd = RB_AUTOBOOT
@@ -572,6 +595,7 @@ local function shutdown(fd: cint, session: *Session, action: Action, had_worker:
     if not await_cleanup(fd, session, false, 1000) then report('remaining-processes') end
   end
   c_sync()
+  if clear_guard then clear_boot_guard(fd) end
   if c_mount(nilptr, '/', nilptr, MS_REMOUNT | MS_RDONLY, nilptr) ~= 0 then report('root-remount-failed') end
   if watchdog >= 0 and action ~= Action.Reboot then
     local option = WDIOS_DISABLECARD
@@ -597,11 +621,12 @@ local function run()
   local boot, preferred_rescue, openrc, rescue_disabled, trial = false, false, false, true, false
   local trial_watchdog = false
   local fallback_enabled = false
+  local guard = false
   local trial_seconds: integer = 0
   local heartbeat_seconds: integer = 0
   local recovery_seconds: integer = 0
   if mount_type('proc', '/proc', MS_NOSUID | MS_NODEV | MS_NOEXEC, PROC_SUPER_MAGIC) then
-    boot, preferred_rescue, openrc, rescue_disabled, trial, trial_seconds, trial_watchdog, heartbeat_seconds, recovery_seconds, fallback_enabled = command_line()
+    boot, preferred_rescue, openrc, rescue_disabled, trial, trial_seconds, trial_watchdog, heartbeat_seconds, recovery_seconds, fallback_enabled, guard = command_line()
   end
   if rescue_disabled then report('rescue-console\tdisabled') end
   c_setenv('PATH', '/usr/sbin:/usr/bin:/sbin:/bin', 1)
@@ -614,6 +639,7 @@ local function run()
   local recovery: WorkerRecovery
   local fallback_by: integer = 0
   local recovery_enabled = not trial and recovery_seconds > 0
+  guard = guard and recovery_enabled
   local startup, heartbeat: integer, integer
   if trial then startup, heartbeat = trial_seconds, heartbeat_seconds end
   if recovery_enabled then startup, heartbeat = RecoveryStartup, recovery_seconds end
@@ -634,7 +660,7 @@ local function run()
   elseif not provision_run() then
     reason = 'boot-filesystems'
   else
-    if trial and trial_watchdog then
+    if guard or (trial and trial_watchdog) then
       watchdog = c_open('/dev/watchdog0', O_WRONLY | O_CLOEXEC)
       if watchdog >= 0 then report('watchdog-armed')
       else report('watchdog-unavailable\t' .. tostring(errno)) end
@@ -720,7 +746,8 @@ local function run()
     if action ~= Action.None then
       -- If reboot returns, stay in rescue instead of retrying the action.
       trial = false
-      shutdown(fd, &session, action, had_worker, worker_grace)
+      local clear_guard = guard and not in_rescue and monitor.ready and session.worker > 0
+      shutdown(fd, &session, action, had_worker, worker_grace, clear_guard)
       close_monitor(&monitor)
       in_rescue = true
       report('rescue\tshutdown-failed')

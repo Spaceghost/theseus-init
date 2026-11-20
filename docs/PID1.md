@@ -116,6 +116,25 @@ selection. A failed selector leaves PID 1 in rescue with the configured
 console policy. A pending operator shutdown takes precedence. Trial
 entries continue to use their own rollback policy.
 
+### Keep a bootloader guard until orderly shutdown
+
+Distributions can opt into `theseus.boot_guard=1` alongside installed
+supervisor recovery. Persist a boot-in-progress mark in the bootloader
+before entering this boot path, arrange for the next boot to recover
+if the mark survives, and preload a qualified watchdog driver. Theseus
+arms and feeds `/dev/watchdog0` using the same Linux watchdog API as
+boot trials.
+
+When a ready native target has an orderly shutdown request, PID 1 runs
+`/usr/libexec/theseus/boot-guard-clear` after process cleanup and sync
+and before remounting the root filesystem read-only. The distribution's
+hook must durably clear the guard and finish within five seconds. Install
+both helpers if the profile also uses the software recovery selector.
+The guard remains armed across unexpected resets, even after target
+readiness. Recovery on a specific device still depends on qualifying
+its independent reset behavior. The guard ends at the final shutdown
+checkpoint.
+
 ## OpenRC-managed services
 
 On Alpine, add theseus.openrc=1 alongside theseus.pid1=1 to boot
