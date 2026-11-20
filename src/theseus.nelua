@@ -609,20 +609,23 @@ local function show_service(service: Service)
   print('  max-restarts', service.max_restarts)
   print('  readiness   ', readiness_name(service.readiness))
   print('  argv-record ', service.argv_serialized)
+  local record = 'TSC2'
   if #service.readiness_options.path > 0 then
+    record = 'TSC4'
     print('  readiness-path', service.readiness_options.path)
     print('  readiness-timeout-ms', service.readiness_options.timeout)
     if #service.readiness_options.probe > 0 then
       print('  readiness-probe', service.readiness_options.probe)
       print('  probe-interval-ms', service.readiness_options.interval)
       print('  probe-timeout-ms', service.readiness_options.probe_timeout)
-      print('  source       CUE -> TSC6')
-    else
-      print('  source       CUE -> TSC4')
+      record = 'TSC6'
     end
-  else
-    print('  source       CUE -> TSC2')
   end
+  if service.stop_grace_ms ~= NativeDefaultStopGraceMs then
+    print('  stop-grace-ms', service.stop_grace_ms)
+    record = 'TSC8'
+  end
+  print('  source       CUE -> ' .. record)
 end
 
 local function execute_query(query: Query)
