@@ -81,6 +81,9 @@ the request line. Partial requests and restart backoff share the poll
 loop with child exit detection. When accepting a connection hits the
 process or system descriptor limit, the daemon retries after a short
 delay while existing clients and child events continue to run.
+If the process runs out of descriptors during service startup or
+readiness checks, it can close unfinished control requests to free
+the descriptors those operations need.
 
 `theseus daemon-stop`, SIGTERM, and SIGINT initiate shutdown. The daemon
 signals its direct child through the pidfd and gives it one second to

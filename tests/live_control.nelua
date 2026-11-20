@@ -200,6 +200,17 @@ if arg[1] == 'listen' then
   end
 end
 
+if arg[1] == 'hold-requests' then
+  for _ = 1, 8 do
+    local fd = connect()
+    send(fd, 'TQ1\tSTAT')
+  end
+  local ready = io.open(arg[2], 'w')
+  assert(ready:isopen())
+  ready:close()
+  while true do c_pause() end
+end
+
 local request = 'TQ1\tSTATUS\tsleep-stop\n'
 local fragmented = connect()
 send(fragmented, 'TQ1\tSTAT')

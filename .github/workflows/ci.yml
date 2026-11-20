@@ -290,6 +290,53 @@ jobs:
           test -z "$(ls -A "$job_dir")"
           grep -F 'cannot claim recovery directory' build/live/recovery-no-cgroup.txt
 
+      - name: Prioritize a service restart over incomplete control requests
+        run: |
+          set -eux
+          work="$(mktemp -d "$RUNNER_TEMP/restart-pressure.XXXXXXXX")"
+          export THESEUS_SOCKET="$work/control.sock"
+          export THESEUS_GRAPH="$work/graph.tsc"
+          printf 'TSC3\thold\t/bin/sleep\037120\ton-failure\t1\tnone\t\t\t\t\nTGT1\tdefault\thold\n' >"$THESEUS_GRAPH"
+          build/live/theseusd --target default >"$work/daemon.log" 2>&1 &
+          daemon_pid=$!
+          holder_pid=
+          cleanup() {
+            if test -n "$holder_pid"; then
+              kill "$holder_pid" 2>/dev/null || true
+              wait "$holder_pid" 2>/dev/null || true
+            fi
+            kill "$daemon_pid" 2>/dev/null || true
+            wait "$daemon_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for i in $(seq 1 100); do
+            if grep -Fq "$(printf 'TE1\ttarget\tdefault\trunning')" "$work/daemon.log"; then break; fi
+            sleep 0.02
+          done
+          leader=$(build/live/the status of hold | awk '$1 == "pid" {print $2}')
+          kill -0 "$leader"
+          before=$(ls -1 "/proc/$daemon_pid/fd" | wc -l)
+          build/live/control-test hold-requests "$work/ready" &
+          holder_pid=$!
+          for i in $(seq 1 50); do
+            if test -e "$work/ready" && test "$(ls -1 "/proc/$daemon_pid/fd" | wc -l)" -eq "$((before + 8))"; then break; fi
+            sleep 0.01
+          done
+          test "$(ls -1 "/proc/$daemon_pid/fd" | wc -l)" -eq "$((before + 8))"
+          first_free=0
+          while test -L "/proc/$daemon_pid/fd/$first_free"; do first_free=$((first_free + 1)); done
+          prlimit --pid "$daemon_pid" --nofile="$first_free:"
+          kill -KILL "$leader"
+          for i in $(seq 1 100); do
+            if grep -Eq '^daemon-spawn[[:space:]]+hold.*[[:space:]]attempt[[:space:]]+2$' "$work/daemon.log"; then break; fi
+            kill -0 "$daemon_pid"
+            sleep 0.02
+          done
+          grep -E '^daemon-spawn[[:space:]]+hold.*[[:space:]]attempt[[:space:]]+2$' "$work/daemon.log"
+          test "$(timeout 3s build/live/the state of hold)" = RUNNING
+          timeout 3s build/live/theseus daemon-stop
+          wait "$daemon_pid"
+
       - name: Query live state and shut down without orphans
         run: |
           set -eux
