@@ -135,6 +135,32 @@ jobs:
           test -x build/live/theseusd
           test -x build/live/theseus
 
+      - name: Bound the one-shot timed stop
+        run: |
+          set -eu
+          work="$PWD/build/one-shot-stop"
+          mkdir -p "$work"
+          export THESEUS_RECORDS="$work/services.tsc"
+          cue export ./shutdownfixtures -e delay.compiled --out text \
+            -t testDir="$work" -t testProgram="$PWD/build/live/control-test" >"$THESEUS_RECORDS"
+          printf '\nTSC8\t1200\tTSC2\tstubborn\t%s\037ignore-term\037%s\tnever\t0\tnone\n' \
+            "$PWD/build/live/control-test" "$work/stubborn.ready" >>"$THESEUS_RECORDS"
+          printf 'TSC2\tearly\t/bin/true\tnever\t0\tnone\n' >>"$THESEUS_RECORDS"
+          timeout 10 sh -c 'trap "" CHLD; exec "$@"' sh build/theseus run delayed --stop-after-ms 500 >"$work/delayed.log"
+          test -e "$work/delayed.stopped"
+          grep -E '^result[[:space:]].*delayed.*STOPPED.*exit[[:space:]]0[[:space:]]signal[[:space:]]0$' "$work/delayed.log"
+          timeout 10 build/theseus run stubborn --stop-after-ms 500 >"$work/stubborn.log"
+          test -e "$work/stubborn.ready"
+          grep -E '^shutdown[[:space:]]stubborn[[:space:]]term-timeout[[:space:]]1200$' "$work/stubborn.log"
+          grep -E '^result[[:space:]].*stubborn.*STOPPED.*exit[[:space:]]-1[[:space:]]signal[[:space:]]9$' "$work/stubborn.log"
+          timeout 10 build/theseus run early --stop-after-ms 500 >"$work/early.log"
+          grep -E '^result[[:space:]].*early.*STOPPED.*exit[[:space:]]0[[:space:]]signal[[:space:]]0$' "$work/early.log"
+          for name in delayed stubborn early; do
+            pid="$(awk '$1 == "spawn" {print $4}' "$work/$name.log")"
+            test -n "$pid"
+            test ! -e "/proc/$pid"
+          done
+
       - name: Bound graceful target shutdown in reverse dependency order
         run: |
           set -eu

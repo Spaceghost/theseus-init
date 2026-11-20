@@ -7,7 +7,6 @@ local CLOCK_MONOTONIC: cint <cimport, nodecl, cinclude '<time.h>'>
 local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
 local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
 local POLLIN: cshort <cimport, nodecl, cinclude '<poll.h>'>
-        local event: Pollfd = {fd = peer, events = POLLIN}
 
 global function monotonic_ms(): integer
   local now: Timespec
