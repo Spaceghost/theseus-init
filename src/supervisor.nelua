@@ -10,6 +10,7 @@ require 'os'
 require 'string'
 require 'stringbuilder'
 require 'src.theseus.runtime_service'
+require 'src.theseus.pidfd'
 require 'src.theseus.graph'
 require 'src.theseus.cgroup'
 require 'src.theseus.recovery'
@@ -46,12 +47,10 @@ local function c_umask(mode: cuint): cuint <cimport 'umask', nodecl, cinclude '<
 local SignalHandler = @function(cint): void
 local function c_signal(signal: cint, handler: SignalHandler): SignalHandler <cimport 'signal', nodecl, cinclude '<signal.h>'> end
 local Sigset: type <cimport 'sigset_t', nodecl, cinclude '<signal.h>'> = @record{}
-local Timespec: type <cimport 'struct timespec', nodecl, cinclude '<time.h>'> = @record{tv_sec: clong, tv_nsec: clong}
 local function c_sigemptyset(set: *Sigset): cint <cimport 'sigemptyset', nodecl, cinclude '<signal.h>'> end
 local function c_sigaddset(set: *Sigset, signal: cint): cint <cimport 'sigaddset', nodecl, cinclude '<signal.h>'> end
 local function c_sigprocmask(how: cint, set: *Sigset, previous: *Sigset): cint <cimport 'sigprocmask', nodecl, cinclude '<signal.h>'> end
 local function c_signalfd(fd: cint, set: *Sigset, flags: cint): cint <cimport 'signalfd', nodecl, cinclude '<sys/signalfd.h>'> end
-local function c_clock_gettime(clock: cint, value: *Timespec): cint <cimport 'clock_gettime', nodecl, cinclude '<time.h>'> end
 
 local Pollfd = @record{fd: cint, events: cshort, revents: cshort}
 local MaxClients <comptime> = 8
@@ -88,7 +87,6 @@ local WNOWAIT: cint <cimport, nodecl, cinclude '<sys/wait.h>'>
 local ECHILD: cint <cimport, nodecl, cinclude '<errno.h>'>
 local SFD_NONBLOCK: cint <cimport, nodecl, cinclude '<sys/signalfd.h>'>
 local SFD_CLOEXEC: cint <cimport, nodecl, cinclude '<sys/signalfd.h>'>
-local CLOCK_MONOTONIC: cint <cimport, nodecl, cinclude '<time.h>'>
 local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
 local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
 local EAGAIN: cint <cimport, nodecl, cinclude '<errno.h>'>
@@ -213,12 +211,6 @@ local function decode_wait(status: cint, runtime: *Runtime)
     runtime.last_exit = -1
     runtime.last_signal = term
   end
-end
-
-local function monotonic_ms(): integer
-  local now: Timespec
-  c_clock_gettime(CLOCK_MONOTONIC, &now)
-  return (@integer)(now.tv_sec) * 1000 + now.tv_nsec // 1000000
 end
 
 local function open_shutdown_fd(child_mask: *Sigset): cint
@@ -657,28 +649,15 @@ local function write_status(fd: cint, runtime: *Runtime): boolean
     write_all(fd, last_signal) and write_all(fd, '\n')
 end
 
-local function wait_for_exit(fd: cint, timeout: integer): cint
-  local event: Pollfd = {fd = fd, events = POLLIN}
-  local deadline = monotonic_ms() + timeout
-  local ready = c_poll(&event, 1, (@cint)(timeout))
-  while ready < 0 and errno == EINTR do
-    local remaining = deadline - monotonic_ms()
-    if remaining <= 0 then return 0 end
-    ready = c_poll(&event, 1, (@cint)(remaining))
-  end
-  if ready > 0 and (event.revents & POLLIN) == 0 then return -1 end
-  return ready
-end
-
 local function stop_leader(runtime: *Runtime): boolean
   if runtime.pidfd < 0 then return true end
   if not signal_child(runtime, SIGTERM) then return false end
-  local ready = wait_for_exit(runtime.pidfd, runtime.service.stop_grace_ms)
+  local ready = wait_pidfd_exit(runtime.pidfd, runtime.service.stop_grace_ms)
   if ready == 0 then
     daemon_log('TE1', 'shutdown', runtime.service.name, runtime.attempts, 'term-timeout',
                runtime.service.stop_grace_ms)
     if not signal_child(runtime, SIGKILL) then return false end
-    ready = wait_for_exit(runtime.pidfd, NativeStopCleanupStepMs)
+    ready = wait_pidfd_exit(runtime.pidfd, NativeStopCleanupStepMs)
   end
   return ready > 0 and reap(runtime)
 end
@@ -705,7 +684,7 @@ local function stop_probe(runtime: *Runtime): boolean
   if runtime.probe_fd < 0 then return true end
   if not cancel_probe(runtime, monotonic_ms()) then return false end
   local status: cint
-  return wait_for_exit(runtime.probe_fd, NativeStopCleanupStepMs) > 0 and reap_probe(runtime, &status)
+  return wait_pidfd_exit(runtime.probe_fd, NativeStopCleanupStepMs) > 0 and reap_probe(runtime, &status)
 end
 
 local function stop_child(runtime: *Runtime): boolean

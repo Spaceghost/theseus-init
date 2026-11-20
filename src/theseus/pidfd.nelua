@@ -1,0 +1,29 @@
+-- Bounded waits for an unreaped process through its pidfd.
+local Timespec: type <cimport 'struct timespec', nodecl, cinclude '<time.h>'> = @record{tv_sec: clong, tv_nsec: clong}
+local function c_clock_gettime(clock: cint, value: *Timespec): cint <cimport 'clock_gettime', nodecl, cinclude '<time.h>'> end
+local Pollfd = @record{fd: cint, events: cshort, revents: cshort}
+local function c_poll(fds: *Pollfd, count: culong, timeout_ms: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
+local CLOCK_MONOTONIC: cint <cimport, nodecl, cinclude '<time.h>'>
+local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
+local POLLIN: cshort <cimport, nodecl, cinclude '<poll.h>'>
+        local event: Pollfd = {fd = peer, events = POLLIN}
+
+global function monotonic_ms(): integer
+  local now: Timespec
+  c_clock_gettime(CLOCK_MONOTONIC, &now)
+  return (@integer)(now.tv_sec) * 1000 + now.tv_nsec // 1000000
+end
+
+global function wait_pidfd_exit(fd: cint, timeout: integer): cint
+  local event: Pollfd = {fd = fd, events = POLLIN}
+  local deadline = monotonic_ms() + timeout
+  local ready = c_poll(&event, 1, (@cint)(timeout))
+  while ready < 0 and errno == EINTR do
+    local remaining = deadline - monotonic_ms()
+    if remaining <= 0 then return 0 end
+    ready = c_poll(&event, 1, (@cint)(remaining))
+  end
+  if ready > 0 and (event.revents & POLLIN) == 0 then return -1 end
+  return ready
+end

@@ -9,6 +9,7 @@ require 'os'
 require 'string'
 require 'src.theseus.readiness'
 require 'src.theseus.shutdown_policy'
+require 'src.theseus.pidfd'
 require 'src.theseus.openrc'
 
 -- Linux/POSIX boundary. These are declarations in maintained Nelua, not
@@ -23,6 +24,13 @@ local function c_kill(pid: cint, signal: cint): cint <cimport 'kill', nodecl, ci
 local function c_usleep(usec: cuint): cint <cimport 'usleep', nodecl, cinclude '<unistd.h>'> end
 local function c_syscall2(number: clong, a1: clong, a2: clong): clong <cimport 'syscall', nodecl, cinclude '<unistd.h>'> end
 local function c_syscall4(number: clong, a1: clong, a2: clong, a3: pointer, a4: clong): clong <cimport 'syscall', nodecl, cinclude '<unistd.h>'> end
+local SignalHandler = @function(cint): void
+local function c_signal(sig: cint, handler: SignalHandler): SignalHandler <cimport 'signal', nodecl, cinclude '<signal.h>'> end
+local SIG_DFL: SignalHandler <cimport, nodecl, cinclude '<signal.h>'>
+local SIG_ERR: SignalHandler <cimport, nodecl, cinclude '<signal.h>'>
+local SIGCHLD: cint <cimport, nodecl, cinclude '<signal.h>'>
+local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
 local SYS_pidfd_open: clong <cimport, nodecl, cinclude '<sys/syscall.h>'>
 local SYS_pidfd_send_signal: clong <cimport, nodecl, cinclude '<sys/syscall.h>'>
 local SIGTERM: cint <cimport, nodecl, cinclude '<signal.h>'>
@@ -344,6 +352,7 @@ local function wait_for_child(pid: cint): ExitResult
   local result: ExitResult
   local status: cint = 0
   local waited = c_waitpid(pid, &status, 0)
+  while waited < 0 and errno == EINTR do waited = c_waitpid(pid, &status, 0) end
   if waited ~= pid then return result end
   result.waited = true
   local term = status & 0x7f
@@ -378,6 +387,31 @@ local function cleanup_unidentified_child(pid: cint)
   end
 end
 
+local function stop_timed_child(service: *Service, pid: cint, pidfd: cint): integer
+  if wait_pidfd_exit(pidfd, 0) > 0 then return 0 end
+  if not pidfd_send_signal(pidfd, SIGTERM) then
+    if wait_pidfd_exit(pidfd, 0) > 0 then return 0 end
+    -- The unreaped direct child is still ours.
+    c_kill(pid, SIGKILL)
+    if wait_pidfd_exit(pidfd, NativeStopCleanupStepMs) > 0 then wait_for_child(pid) end
+    io.stderr:write('theseus: pidfd_send_signal failed for ', service.name, '\n')
+    return 73
+  end
+  print('signal', service.name, 'pidfd', pidfd, 'signal', SIGTERM)
+  local ready = wait_pidfd_exit(pidfd, service.stop_grace_ms)
+  if ready > 0 then return 0 end
+  if ready == 0 then
+    print('shutdown', service.name, 'term-timeout', service.stop_grace_ms)
+  end
+  if not pidfd_send_signal(pidfd, SIGKILL) and wait_pidfd_exit(pidfd, 0) <= 0 then
+    io.stderr:write('theseus: cannot force stop for ', service.name, '\n')
+    return 73
+  end
+  if wait_pidfd_exit(pidfd, NativeStopCleanupStepMs) > 0 then return 0 end
+  io.stderr:write('theseus: timed out waiting for forced exit of ', service.name, '\n')
+  return 74
+end
+
 local function supervise_service(service: Service, stop_after_ms: integer): integer
   local execargv: ExecArgv
   if not decode_exec_argv(service.argv_serialized, &execargv) then
@@ -392,6 +426,12 @@ local function supervise_service(service: Service, stop_after_ms: integer): inte
   if stop_after_ms < 0 or stop_after_ms > 60000 then
     io.stderr:write('theseus: stop-after-ms must be between 0 and 60000\n')
     return 64
+  end
+
+  -- Inherited SIG_IGN must not make children automatically reapable.
+  if c_signal(SIGCHLD, SIG_DFL) == SIG_ERR then
+    io.stderr:write('theseus: cannot keep children waitable\n')
+    return 74
   end
 
   local attempts: integer = 0
@@ -448,16 +488,12 @@ local function supervise_service(service: Service, stop_after_ms: integer): inte
         cleanup_unidentified_child(pid)
         return 70
       end
-      if not pidfd_send_signal(pidfd, SIGTERM) then
-        -- Cleanup must not strand a child if the pidfd operation failed.
-        c_kill(pid, SIGKILL)
-        local cleaned = wait_for_child(pid)
+      local stopped = stop_timed_child(&service, pid, pidfd)
+      if stopped ~= 0 then
         c_close(pidfd)
-        if cleaned.waited then transition(&service, ServiceState.Failed) end
-        io.stderr:write('theseus: pidfd_send_signal failed for ', service.name, '\n')
-        return 73
+        transition(&service, ServiceState.Failed)
+        return stopped
       end
-      print('signal', service.name, 'pidfd', pidfd, 'signal', SIGTERM)
     end
 
     local result = wait_for_child(pid)
