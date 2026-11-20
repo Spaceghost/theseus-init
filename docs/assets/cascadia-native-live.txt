@@ -1,0 +1,95 @@
+Cascadia native live ISO | x86-64 | 2026-11-20
+
+cascadia-native-x86_64.iso   30908416 bytes
+SHA-256   bbb8dbd669bb531119e0feb1170c74096b11a53b85b6207db276bd6ce4be3a59
+CUE graph SHA-256   135fac297467349f2041b3a25a7889fd3aaddade02b119fa9120e755df54e773
+Linux 6.18.64-virt. QEMU q35, 512 MiB, serial console, network disabled.
+37 signed APKs. Selected entries from /packages.txt on the ISO:
+  cascadia-base-0.1.0-r1
+  cascadia-baselayout-0.1.0-r1
+  cascadia-native-live-0.1.0-r0
+  cascadia-nebox-0_git20261119-r5
+  cascadia-nebox-tools-0_git20261119-r5
+  theseus-init-0_git20261119-r14
+  apk-tools-3.0.10-r1
+  agetty-2.42.4-r3
+  agetty-openrc-0.63.2-r1
+  mdevd-0.1.8.2-r1
+  mdevd-openrc-0.1.8.2-r1
+  openrc-0.63.2-r1
+  openrc-init-0.63.2-r1
+  openrc-user-0.63.2-r1
+
+Nebox supplies all 123 applet links, including sh and setsid. The signed base
+has no alpine-base, alpine-baselayout, busybox, busybox-binsh, toybox, or
+cascadia-toybox package. The guest mounted tmpfs, built and reran a nebuild
+recipe, read the result, and unmounted the temporary filesystem.
+
+Firmware      Accelerator  Theseus PID 1    OpenRC PID 1
+SeaBIOS       KVM          pass             pass
+SeaBIOS       TCG          pass             pass
+OVMF/UEFI     KVM          pass             pass
+OVMF/UEFI     TCG          pass             pass
+
+Each boot tested the running hostname and cgroup services, mdevd reload with
+the same PID, mdevd restart with a new PID, and recreation of /dev/zero
+(character device 1:5) from a kernel uevent. The guest interrupted a
+foreground job with Ctrl-C, logged out, and received a fresh serial shell.
+
+Selected serial output from the SeaBIOS/KVM guest.
+
+theseus
+Cascadia live boot from Cascadia edge
+TI1	openrc-start	sysinit
+ * Scanning hardware for mdevd ...
+TI1	openrc-exit	0	0
+TI1	openrc-start	boot
+TI1	openrc-exit	0	0
+TI1	openrc-start	default
+TI1	openrc-exit	0	0
+TI1	supervisor-start	1166
+CHECK release cascadia
+TI1	supervisor-ready
+CHECK shell nebox
+CHECK live Nebox tools
+CHECK hostname and cgroups
+CHECK controlling terminal
+CHECK foreground started
+CHECK foreground interrupted
+CHECK mdevd restarted
+CHECK device event
+CHECK login pid 1168
+CHECK serial login respawned
+CHECK theseus OK
+CHECK supervisor owns console session
+CHECK supervisor frozen
+TI1	supervisor-recovery	supervisor-heartbeat-timeout
+TI1	supervisor-start	1666
+CHECK native recovered
+TI1	openrc-start	shutdown
+TI1	openrc-exit	0	0
+TI1	shutdown-ready
+[   44.382444] reboot: Power down
+
+openrc
+Cascadia live boot from Cascadia edge
+OpenRC init version 0.63.2 starting
+ * Scanning hardware for mdevd ...
+CHECK release cascadia
+CHECK shell nebox
+CHECK live Nebox tools
+CHECK hostname and cgroups
+CHECK controlling terminal
+CHECK foreground started
+CHECK foreground interrupted
+CHECK mdevd restarted
+CHECK device event
+CHECK login pid 1182
+CHECK serial login respawned
+CHECK openrc OK
+[   18.143199] reboot: Power down
+
+The ISO checksum and its package inventory were verified against a manifest
+signed with the development key. Building the native image requires access to
+the Nebox sources. The public 0.1.1 download is the Alpine-layout
+snapshot. This run qualifies the native image in virtual machines.

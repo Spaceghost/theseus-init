@@ -24,7 +24,7 @@ the Nebox setsid applet and execs agetty on ttyS0 in the same process.
 The PID reported by the supervisor then matches the login shell's PID
 and session ID. A foreground command receives Ctrl-C on that terminal,
 and the service's restart policy supplies a new getty after logout.
-See the [Cascadia console trace](https://spacegho.st/cascadia/verification/native-live.txt).
+See the [Cascadia console trace](assets/cascadia-native-live.txt).
 
 ## Rescue and shutdown
 

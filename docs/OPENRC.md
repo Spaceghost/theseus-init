@@ -103,7 +103,7 @@ OpenRC's own init and serial getty. Both entries handled a kernel uevent
 after an mdevd reload and restart. The guest recreated /dev/zero with the
 expected device numbers and could read from it.
 
-The [native ISO serial trace](https://spacegho.st/cascadia/verification/native-live.txt)
+The [native ISO serial trace](assets/cascadia-native-live.txt)
 covers SeaBIOS and OVMF under KVM and TCG. It includes console logout,
 job control, Theseus supervisor replacement, and orderly poweroff.
 
