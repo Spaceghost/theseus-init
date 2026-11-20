@@ -646,6 +646,7 @@ local function run()
   local recovery: WorkerRecovery
   local fallback_by: integer = 0
   local recovery_enabled = not trial and recovery_seconds > 0
+  local fallback_available = fallback_enabled and recovery_enabled and fd >= 0 and boot and not preferred_rescue
   guard = guard and recovery_enabled
   local startup, heartbeat: integer, integer
   if trial then startup, heartbeat = trial_seconds, heartbeat_seconds end
@@ -724,14 +725,17 @@ local function run()
         in_rescue = true
         if session.worker > 0 then worker_grace = RecoveryGrace end
         report('rescue\t' .. reason)
-        if recovery_enabled and fallback_enabled then
-          session.fallback = launch_boot_command(BootFallback, nilptr, -1)
-          if session.fallback > 0 then
-            fallback_by = now_ms() + FallbackGrace
-            report('boot-fallback-start')
-          else
-            report('boot-fallback-fork-failed')
-          end
+      end
+    end
+    if in_rescue and fallback_available and ok then
+      fallback_available = false
+      if action == Action.None then
+        session.fallback = launch_boot_command(BootFallback, nilptr, -1)
+        if session.fallback > 0 then
+          fallback_by = now_ms() + FallbackGrace
+          report('boot-fallback-start')
+        else
+          report('boot-fallback-fork-failed')
         end
       end
     end
@@ -757,6 +761,7 @@ local function run()
     if action ~= Action.None then
       -- If reboot returns, stay in rescue instead of retrying the action.
       trial = false
+      fallback_available = false
       local clear_guard = guard and not in_rescue and monitor.ready and session.worker > 0
       shutdown(fd, &session, action, had_worker, worker_grace, clear_guard)
       close_monitor(&monitor)
