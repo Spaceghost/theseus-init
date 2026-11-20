@@ -153,7 +153,7 @@ jobs:
           test -e "$work/stubborn.ready"
           grep -E '^shutdown[[:space:]]stubborn[[:space:]]term-timeout[[:space:]]1200$' "$work/stubborn.log"
           grep -E '^result[[:space:]].*stubborn.*STOPPED.*exit[[:space:]]-1[[:space:]]signal[[:space:]]9$' "$work/stubborn.log"
-          timeout 10 build/theseus run early --stop-after-ms 500 >"$work/early.log"
+          timeout 10 build/theseus run early --stop-after-ms 60000 >"$work/early.log"
           grep -E '^result[[:space:]].*early.*STOPPED.*exit[[:space:]]0[[:space:]]signal[[:space:]]0$' "$work/early.log"
           for name in delayed stubborn early; do
             pid="$(awk '$1 == "spawn" {print $4}' "$work/$name.log")"

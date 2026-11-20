@@ -482,13 +482,14 @@ local function supervise_service(service: Service, stop_after_ms: integer): inte
 
     local intentional_stop = stop_after_ms > 0
     if intentional_stop then
-      c_usleep((@cuint)(stop_after_ms * 1000))
+      local ready = wait_pidfd_exit(pidfd, stop_after_ms)
       if not transition(&service, ServiceState.Stopping) then
         c_close(pidfd)
         cleanup_unidentified_child(pid)
         return 70
       end
-      local stopped = stop_timed_child(&service, pid, pidfd)
+      local stopped: integer = 0
+      if ready <= 0 then stopped = stop_timed_child(&service, pid, pidfd) end
       if stopped ~= 0 then
         c_close(pidfd)
         transition(&service, ServiceState.Failed)
