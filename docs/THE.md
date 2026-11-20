@@ -43,6 +43,10 @@ and one for hard requirements. `the state of target NAME` prints only the
 phase. Startup reports `STARTING` until the target signals readiness. A
 fully running target reports `RUNNING`. After readiness, a failed optional
 service or a service awaiting restart readiness produces `DEGRADED`.
+During an orderly shutdown the target reports `STOPPING`. If a hard
+requirement fails, the target reports `FAILED` and names the service
+under `failed-requirement` during rollback. Planned hard dependents
+show `FAILED` with PID 0. The control socket closes after service cleanup.
 
 The bootstrap client can inspect compiled configuration and offers
 these forms:

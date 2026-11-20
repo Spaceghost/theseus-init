@@ -754,14 +754,56 @@ jobs:
 
           build/live/theseusd --target rollback >build/live/target-rollback.log 2>&1 &
           daemon_pid=$!
+          wait_state anchor STOPPING
+          test "$(build/live/the state of target rollback)" = FAILED
+          build/live/the status of rollback >"$job_dir/rollback-status"
+          awk '$1=="failed-requirement" && $2=="bad" {f=1}
+               $1=="required-running" && $2=="0/4" {r=1}
+               END {exit !(f && r)}' "$job_dir/rollback-status"
+          printf 'anchor\tSTOPPING\nbad\tFAILED\nunstarted\tFAILED\nleaf\tFAILED\n' >"$job_dir/list.expected"
+          build/live/the services of rollback | cmp "$job_dir/list.expected" -
+          for service in unstarted leaf; do
+            build/live/the status of "$service" | awk '$1=="pid" && $2=="0" {ok=1} END {exit !ok}'
+          done
+          touch "$job_dir/release-anchor"
           timeout 8s tail --pid="$daemon_pid" -f /dev/null
           rc=0
           wait "$daemon_pid" || rc=$?
           daemon_pid=
           test "$rc" -eq 82
           grep -Fx "$(printf 'TE1\ttarget\trollback\tfailed\tbad')" build/live/target-rollback.log
-          ! grep -F "$(printf 'daemon-spawn\tunstarted\t')" build/live/target-rollback.log
+          if grep -Eq '^daemon-spawn[[:space:]]+(unstarted|leaf)[[:space:]]' build/live/target-rollback.log; then exit 1; fi
+          grep -Fx "$(printf 'TE1\ttarget\trollback\tskipped\tleaf\tunstarted')" build/live/target-rollback.log
           check_reaped build/live/target-rollback.log
+          test -f "$job_dir/anchor.stopped"
+
+          rm "$job_dir/anchor.ready" "$job_dir/anchor.stopped" "$job_dir/release-anchor"
+          build/live/theseusd --target halt >build/live/target-halt.log 2>&1 &
+          daemon_pid=$!
+          wait_state halt RUNNING
+          for i in $(seq 1 150); do
+            if test -f "$job_dir/anchor.ready"; then break; fi
+            sleep 0.02
+          done
+          test -f "$job_dir/anchor.ready"
+          timeout 12s build/live/theseus daemon-stop >"$job_dir/shutdown-ack" &
+          stopper=$!
+          wait_state anchor STOPPING
+          test "$(build/live/the state of target halt)" = STOPPING
+          build/live/the services of halt >"$job_dir/halt-members"
+          printf 'anchor\tSTOPPING\n' | cmp - "$job_dir/halt-members"
+          rc=0
+          build/live/theseus daemon-stop 2>"$job_dir/repeated-stop" || rc=$?
+          test "$rc" -eq 70
+          grep -Fx 'theseus: shutdown already in progress' "$job_dir/repeated-stop"
+          kill -0 "$stopper"
+          test ! -e "$job_dir/anchor.stopped"
+          touch "$job_dir/release-anchor"
+          wait "$stopper"
+          wait "$daemon_pid"
+          daemon_pid=
+          test -f "$job_dir/anchor.stopped"
+          check_reaped build/live/target-halt.log
 
           rc=0
           timeout 8s build/live/theseusd --target bad-exec >build/live/target-exec.log 2>&1 || rc=$?

@@ -195,7 +195,7 @@ if arg[1] == 'delay-term' then
   marker:close()
   local signo: cint
   assert(c_sigwait(&mask, &signo) == 0 and signo == SIGTERM, 'failed to receive SIGTERM')
-  c_usleep(1500000)
+  if #arg >= 3 then wait_for_file(arg[3]) else c_usleep(1500000) end
   local done = io.open(arg[2] .. '.stopped', 'w')
   assert(done:isopen(), 'failed to publish completion')
   done:close()

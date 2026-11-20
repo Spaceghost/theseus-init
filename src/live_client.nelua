@@ -209,8 +209,12 @@ local function show_target_status(response: string, expected: string, state_only
   phase, cursor = next_field(response, cursor)
   running, cursor = next_field(response, cursor)
   required, cursor = next_field(response, cursor)
+  local failed_requirement: string
+  local has_failure = cursor ~= 0
+  if has_failure then failed_requirement, cursor = next_field(response, cursor) end
   if name ~= expected or cursor ~= 0 or
-     (phase ~= 'STARTING' and phase ~= 'RUNNING' and phase ~= 'DEGRADED' and phase ~= 'FAILED') or
+     (has_failure and (phase ~= 'FAILED' or not valid_native_name(failed_requirement))) or
+     (phase ~= 'STARTING' and phase ~= 'RUNNING' and phase ~= 'DEGRADED' and phase ~= 'STOPPING' and phase ~= 'FAILED') or
      string.find(running, '^%d+/%d+$') ~= 1 or string.find(required, '^%d+/%d+$') ~= 1 then
     io.stderr:write('theseus: malformed target status response\n')
     return 65
@@ -220,6 +224,7 @@ local function show_target_status(response: string, expected: string, state_only
   print('  state', phase)
   print('  services-running', running)
   print('  required-running', required)
+  if has_failure then print('  failed-requirement', failed_requirement) end
   return 0
 end
 
@@ -281,6 +286,10 @@ local function shutdown(): integer
   local response: string
   ok, response = exchange('TQ1\tSHUTDOWN\n', ShutdownTimeout)
   if not ok then return 69 end
+  if response == 'TR1\tERROR\tstopping\n' then
+    io.stderr:write('theseus: shutdown already in progress\n')
+    return 70
+  end
   if response ~= 'TR1\tOK\n' then
     io.stderr:write('theseus: supervisor rejected shutdown response=[', response, ']\n')
     return 70

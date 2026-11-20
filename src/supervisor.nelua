@@ -137,6 +137,8 @@ local Supervision = @record{
   count: integer,
   next_start: integer,
   announced: boolean,
+  stopping: boolean,
+  failed_requirement: string,
   runtimes: [NativeMaxServices]Runtime,
   arguments: [NativeMaxServices]ExecArgv,
   required: [NativeMaxServices]boolean,
@@ -649,58 +651,6 @@ local function write_status(fd: cint, runtime: *Runtime): boolean
     write_all(fd, last_signal) and write_all(fd, '\n')
 end
 
-local function stop_leader(runtime: *Runtime): boolean
-  if runtime.pidfd < 0 then return true end
-  if not signal_child(runtime, SIGTERM) then return false end
-  local ready = wait_pidfd_exit(runtime.pidfd, runtime.service.stop_grace_ms)
-  if ready == 0 then
-    daemon_log('TE1', 'shutdown', runtime.service.name, runtime.attempts, 'term-timeout',
-               runtime.service.stop_grace_ms)
-    if not signal_child(runtime, SIGKILL) then return false end
-    ready = wait_pidfd_exit(runtime.pidfd, NativeStopCleanupStepMs)
-  end
-  return ready > 0 and reap(runtime)
-end
-
-local function drain_cgroup(runtime: *Runtime): boolean
-  local state = cgroup_state(&runtime.cgroup)
-  if state == CgroupState.Empty then return true end
-  if state == CgroupState.Error or not cgroup_kill(&runtime.cgroup) then return false end
-  daemon_log('TE1', 'ownership', runtime.service.name, runtime.attempts, 'draining')
-  local deadline = monotonic_ms() + NativeStopCleanupStepMs
-  repeat
-    state = cgroup_state(&runtime.cgroup)
-    if state == CgroupState.Empty then
-      daemon_log('TE1', 'ownership', runtime.service.name, runtime.attempts, 'drained')
-      return true
-    end
-    if state == CgroupState.Error then return false end
-    c_poll(nilptr, 0, 10)
-  until monotonic_ms() >= deadline
-  return false
-end
-
-local function stop_probe(runtime: *Runtime): boolean
-  if runtime.probe_fd < 0 then return true end
-  if not cancel_probe(runtime, monotonic_ms()) then return false end
-  local status: cint
-  return wait_pidfd_exit(runtime.probe_fd, NativeStopCleanupStepMs) > 0 and reap_probe(runtime, &status)
-end
-
-local function stop_child(runtime: *Runtime): boolean
-  if runtime.pidfd < 0 and runtime.probe_fd < 0 and
-     runtime.state ~= ServiceState.Backoff and cgroup_state(&runtime.cgroup) == CgroupState.Empty then
-    return true
-  end
-  transition(runtime, ServiceState.Stopping, 'shutdown')
-  local probe_stopped = stop_probe(runtime)
-  local leader_stopped = stop_leader(runtime)
-  local group_empty = drain_cgroup(runtime)
-  if not probe_stopped or not leader_stopped or not group_empty then return false end
-  transition(runtime, ServiceState.Stopped, 'shutdown-complete')
-  return true
-end
-
 local function terminal(state: ServiceState): boolean
   return state == ServiceState.Failed or state == ServiceState.Stopped
 end
@@ -711,12 +661,29 @@ local function send_boot_marker(marker: byte): clong
   return sent
 end
 
+local function skip_dependent(group: *Supervision, member: integer, dependency: integer)
+  local runtime = &group.runtimes[member]
+  transition(runtime, ServiceState.Failed, 'dependency-failed')
+  daemon_log('TE1', 'target', group.name, 'skipped', runtime.service.name, group.runtimes[dependency].service.name)
+end
+
 local function advance_target(group: *Supervision, child_mask: *Sigset, clients: *PollSlots): integer
   for i: integer = 0, group.count - 1 do
     local runtime = &group.runtimes[i]
     if group.required[i] then
       if terminal(runtime.state) then
+        group.failed_requirement = runtime.service.name
         daemon_log('TE1', 'target', group.name, 'failed', runtime.service.name)
+        -- The plan is topological. A skipped member can itself be a hard
+        -- requirement for another service later in the plan.
+        for member: integer = group.next_start, group.count - 1 do
+          for dependency: integer = 0, member - 1 do
+            if group.needs[member][dependency] and terminal(group.runtimes[dependency].state) then
+              skip_dependent(group, member, dependency)
+              break
+            end
+          end
+        end
         return 82
       end
     end
@@ -739,9 +706,7 @@ local function advance_target(group: *Supervision, child_mask: *Sigset, clients:
       end
     end
     if unavailable >= 0 then
-      transition(runtime, ServiceState.Failed, 'dependency-failed')
-      daemon_log('TE1', 'target', group.name, 'skipped', runtime.service.name,
-            group.runtimes[unavailable].service.name)
+      skip_dependent(group, i, unavailable)
     elseif not spawn(runtime, &group.arguments[i], child_mask, clients) then
       daemon_log('TE1', 'target', group.name, 'failed', runtime.service.name)
       return 80
@@ -796,12 +761,16 @@ local function reply_target_status(client: cint, group: *Supervision)
     end
   end
   local phase = 'STARTING'
-  if failed then phase = 'FAILED'
+  if #group.failed_requirement > 0 then phase = 'FAILED'
+  elseif group.stopping then phase = 'STOPPING'
+  elseif failed then phase = 'FAILED'
   elseif group.announced then
     if running == group.count then phase = 'RUNNING' else phase = 'DEGRADED' end
   end
-  write_all(client, string.format('TR1\tTARGET\t%s\t%s\t%d/%d\t%d/%d\n',
-            group.name, phase, running, group.count, required_running, required))
+  local detail = ''
+  if #group.failed_requirement > 0 then detail = '\t' .. group.failed_requirement end
+  write_all(client, string.format('TR1\tTARGET\t%s\t%s\t%d/%d\t%d/%d%s\n',
+            group.name, phase, running, group.count, required_running, required, detail))
 end
 
 local function reply_query(client: cint, request: string, group: *Supervision)
@@ -839,10 +808,27 @@ local function reap_notified_child(group: *Supervision, pid: cint, clients: *Pol
   for i: integer = 0, group.count - 1 do
     local runtime = &group.runtimes[i]
     if runtime.pid == pid then
+      if group.stopping then
+        if not reap(runtime) then return false end
+        if runtime.state ~= ServiceState.Stopping then
+          local state = ServiceState.Stopped
+          if runtime.state == ServiceState.Starting or runtime.last_exit ~= 0 or runtime.last_signal ~= 0 then
+            state = ServiceState.Failed
+          end
+          transition(runtime, state, 'child-exit')
+        end
+        return true
+      end
       if runtime.execfd >= 0 and not record_exec(runtime) then return false end
       return record_exit(runtime)
     end
-    if runtime.probe_pid == pid then return record_probe(runtime, clients) end
+    if runtime.probe_pid == pid then
+      if group.stopping then
+        local status: cint
+        return reap_probe(runtime, &status)
+      end
+      return record_probe(runtime, clients)
+    end
   end
 
   local status: cint
@@ -874,33 +860,142 @@ local function reap_pending_children(group: *Supervision, clients: *PollSlots): 
   return true, true
 end
 
-local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *Supervision,
-                     child_mask: *Sigset): (integer, cint)
-  local fds: PollSlots
+local ControlServer = @record{
+  listener: cint,
+  reap_fd: cint,
+  group: *Supervision,
+  fds: PollSlots,
+  clients: [MaxClients]ControlClient,
+  accept_at: integer,
+  observing: boolean,
+}
+
+local function init_control(control: *ControlServer, listener: cint, shutdown_fd: cint, reap_fd: cint, group: *Supervision)
+  control.listener = listener
+  control.reap_fd = reap_fd
+  control.group = group
+  control.fds[0] = {fd = listener, events = POLLIN}
+  control.fds[1] = {fd = shutdown_fd, events = POLLIN}
+  control.fds[2] = {fd = reap_fd, events = POLLIN}
+  control.fds[3] = {fd = -1, events = POLLOUT}
+  for i: integer = 0, MaxClients - 1 do
+    control.fds[FirstClient + i] = {fd = -1, events = POLLIN}
+  end
+end
+
+local function close_clients(control: *ControlServer)
+  for slot: integer = 0, MaxClients - 1 do
+    local event = &control.fds[FirstClient + slot]
+    if event.fd >= 0 then c_close(event.fd); event.fd = -1 end
+  end
+end
+
+local function prepare_control(control: *ControlServer, now: integer, next_wake: *integer): integer
+  local fds = &control.fds
+  local deadline = $next_wake
+  local free_slot: integer = -1
+  for slot: integer = 0, MaxClients - 1 do
+    local event = &fds[FirstClient + slot]
+    local expires = control.clients[slot].deadline
+    if event.fd >= 0 and expires <= now then
+      c_close(event.fd)
+      event.fd = -1
+    end
+    if event.fd < 0 then free_slot = slot
+    elseif deadline == 0 or expires < deadline then deadline = expires end
+  end
+  fds[0].fd = -1
+  if free_slot >= 0 then
+    if control.accept_at <= now then
+      fds[0].fd = control.listener
+    elseif deadline == 0 or control.accept_at < deadline then
+      deadline = control.accept_at
+    end
+  end
+  $next_wake = deadline
+  return free_slot
+end
+
+local function poll_active(fds: *PollSlots, count: integer, timeout: cint): cint
   local active_fds: PollSlots
-  local active_slots: [4 + MaxClients + 3 * NativeMaxServices]integer
+  local active_slots: [FirstClient + MaxClients + 3 * NativeMaxServices]integer
+  -- Linux counts inactive array entries against RLIMIT_NOFILE too.
+  local active_count: integer = 0
+  for slot: integer = 0, count - 1 do
+    fds[slot].revents = 0
+    if fds[slot].fd >= 0 then
+      active_slots[active_count] = slot
+      active_fds[active_count] = fds[slot]
+      active_count = active_count + 1
+    end
+  end
+  local ready = c_poll(&active_fds[0], (@culong)(active_count), timeout)
+  if ready > 0 then
+    for i: integer = 0, active_count - 1 do
+      fds[active_slots[i]].revents = active_fds[i].revents
+    end
+  end
+  return ready
+end
+
+local function read_clients(control: *ControlServer): cint
+  local fds = &control.fds
+  local shutdown_client: cint = -1
+  for slot: integer = 0, MaxClients - 1 do
+    local event = &fds[FirstClient + slot]
+    if event.revents == 0 then continue end
+    event.revents = 0
+    local state, request = read_request(event.fd, &control.clients[slot])
+    if state == RequestState.Pending then continue end
+    if state == RequestState.Complete and request == 'TQ1\tSHUTDOWN\n' then
+      if not control.group.stopping then
+        shutdown_client = event.fd
+        event.fd = -1
+        break
+      end
+      write_all(event.fd, 'TR1\tERROR\tstopping\n')
+    elseif state == RequestState.Complete then
+      reply_query(event.fd, request, control.group)
+    elseif state ~= RequestState.Closed then
+      write_all(event.fd, 'TR1\tERROR\trequest\n')
+    end
+    c_close(event.fd)
+    event.fd = -1
+  end
+  return shutdown_client
+end
+
+local function accept_client(control: *ControlServer, free_slot: integer): boolean
+  local fds = &control.fds
+  if (fds[0].revents & POLLIN) ~= 0 then
+    local fd = c_accept4(control.listener, nilptr, nilptr, SOCK_CLOEXEC | SOCK_NONBLOCK)
+    if fd >= 0 then
+      fds[FirstClient + free_slot].fd = fd
+      control.clients[free_slot].used = 0
+      control.clients[free_slot].deadline = monotonic_ms() + ControlTimeout
+    elseif errno == EMFILE or errno == ENFILE then
+      -- A queued connection keeps the listener readable during exhaustion.
+      control.accept_at = monotonic_ms() + AcceptRetryMs
+    elseif errno ~= EAGAIN and errno ~= EINTR then return false end
+  elseif fds[0].revents ~= 0 then return false end
+  return true
+end
+
+local function serve(control: *ControlServer, child_mask: *Sigset): (integer, cint)
+  local fds = &control.fds
+  local group = control.group
   local first_child = FirstClient + MaxClients
   local first_exec = first_child + group.count
   local first_probe = first_exec + group.count
   local count = first_probe + group.count
-  fds[0] = {fd = listener, events = POLLIN}
-  fds[1] = {fd = shutdown_fd, events = POLLIN}
-  fds[2] = {fd = reap_fd, events = POLLIN}
-  fds[3].events = POLLOUT
   for i: integer = 0, group.count - 1 do
     fds[first_child + i].events = POLLIN
     fds[first_exec + i].events = POLLIN
     fds[first_probe + i].events = POLLIN
   end
-  local clients: [MaxClients]ControlClient
-  for slot: integer = 0, MaxClients - 1 do
-    fds[FirstClient + slot] = {fd = -1, events = POLLIN}
-  end
-
   local exit_code: integer = 0
   local shutdown_client: cint = -1
   local more_exits = false
-  local accept_at: integer = 0
   local heartbeat_at: integer = 0
   while true do
     local deadline: integer = 0
@@ -914,25 +1009,7 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
       if action ~= 0 and (deadline == 0 or action < deadline) then deadline = action end
     end
     local now = monotonic_ms()
-    local free_slot: integer = -1
-    for slot: integer = 0, MaxClients - 1 do
-      local event = &fds[FirstClient + slot]
-      local expires = clients[slot].deadline
-      if event.fd >= 0 and expires <= now then
-        c_close(event.fd)
-        event.fd = -1
-      end
-      if event.fd < 0 then free_slot = slot
-      elseif deadline == 0 or expires < deadline then deadline = expires end
-    end
-    fds[0].fd = -1
-    if free_slot >= 0 then
-      if accept_at <= now then
-        fds[0].fd = listener
-      elseif deadline == 0 or accept_at < deadline then
-        deadline = accept_at
-      end
-    end
+    local free_slot = prepare_control(control, now, &deadline)
 
     if report_heartbeat and group.announced and (deadline == 0 or heartbeat_at < deadline) then
       deadline = heartbeat_at
@@ -941,25 +1018,10 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
     if deadline > now then timeout = (@cint)(deadline - now)
     elseif deadline ~= 0 then timeout = 0 end
     if more_exits then timeout = 0 end
-    -- Linux counts inactive array entries against RLIMIT_NOFILE too.
-    local active_count: integer = 0
-    for slot: integer = 0, count - 1 do
-      fds[slot].revents = 0
-      if fds[slot].fd >= 0 then
-        active_slots[active_count] = slot
-        active_fds[active_count] = fds[slot]
-        active_count = active_count + 1
-      end
-    end
-    local ready = c_poll(&active_fds[0], (@culong)(active_count), timeout)
+    local ready = poll_active(fds, count, timeout)
     if ready < 0 then
       if errno ~= EINTR then exit_code = 79; break end
     else
-      if ready > 0 then
-        for i: integer = 0, active_count - 1 do
-          fds[active_slots[i]].revents = active_fds[i].revents
-        end
-      end
       if fds[1].revents ~= 0 then break end
       if fds[3].revents ~= 0 then flush_daemon_log_loss() end
       for i: integer = 0, group.count - 1 do
@@ -977,7 +1039,7 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
           break
         end
         local probe_event = fds[first_probe + i].revents
-        if probe_event ~= 0 and ((probe_event & POLLIN) == 0 or not record_probe(runtime, &fds)) then
+        if probe_event ~= 0 and ((probe_event & POLLIN) == 0 or not record_probe(runtime, fds)) then
           exit_code = 80
           break
         end
@@ -985,59 +1047,31 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
       if exit_code ~= 0 then break end
 
       if fds[2].revents ~= 0 then
-        if (fds[2].revents & POLLIN) == 0 or not read_child_signal(reap_fd) then exit_code = 80; break end
+        if (fds[2].revents & POLLIN) == 0 or not read_child_signal(control.reap_fd) then exit_code = 80; break end
         more_exits = true
       end
       if more_exits then
         local ok: boolean
-        ok, more_exits = reap_pending_children(group, &fds)
+        ok, more_exits = reap_pending_children(group, fds)
         if not ok then exit_code = 80; break end
       end
 
-      for slot: integer = 0, MaxClients - 1 do
-        local event = &fds[FirstClient + slot]
-        if event.revents == 0 then continue end
-        event.revents = 0
-        local state, request = read_request(event.fd, &clients[slot])
-        if state == RequestState.Pending then continue end
-        if state == RequestState.Complete and request == 'TQ1\tSHUTDOWN\n' then
-          shutdown_client = event.fd
-          event.fd = -1
-          break
-        end
-        if state == RequestState.Complete then
-          reply_query(event.fd, request, group)
-        elseif state ~= RequestState.Closed then
-          write_all(event.fd, 'TR1\tERROR\trequest\n')
-        end
-        c_close(event.fd)
-        event.fd = -1
-      end
+      shutdown_client = read_clients(control)
       if shutdown_client >= 0 then break end
 
       for i: integer = 0, group.count - 1 do
-        if not advance_service(&group.runtimes[i], &group.arguments[i], child_mask, &fds) then
+        if not advance_service(&group.runtimes[i], &group.arguments[i], child_mask, fds) then
           exit_code = 80
           break
         end
       end
       if exit_code ~= 0 then break end
       if group.target then
-        exit_code = advance_target(group, child_mask, &fds)
+        exit_code = advance_target(group, child_mask, fds)
         if exit_code ~= 0 then break end
       end
 
-      if (fds[0].revents & POLLIN) ~= 0 then
-        local fd = c_accept4(listener, nilptr, nilptr, SOCK_CLOEXEC | SOCK_NONBLOCK)
-        if fd >= 0 then
-          fds[FirstClient + free_slot].fd = fd
-          clients[free_slot].used = 0
-          clients[free_slot].deadline = monotonic_ms() + ControlTimeout
-        elseif errno == EMFILE or errno == ENFILE then
-          -- A queued connection keeps the listener readable during exhaustion.
-          accept_at = monotonic_ms() + AcceptRetryMs
-        elseif errno ~= EAGAIN and errno ~= EINTR then exit_code = 79; break end
-      elseif fds[0].revents ~= 0 then exit_code = 79; break end
+      if not accept_client(control, free_slot) then exit_code = 79; break end
 
       now = monotonic_ms()
       if report_heartbeat and group.announced and now >= heartbeat_at then
@@ -1048,11 +1082,103 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
     end
   end
 
-  for slot: integer = 0, MaxClients - 1 do
-    local fd = fds[FirstClient + slot].fd
-    if fd >= 0 then c_close(fd) end
-  end
   return exit_code, shutdown_client
+end
+
+-- Keep the live control endpoint and child reaper available during each
+-- reverse-order shutdown wait. A nil descriptor waits for a cgroup recheck.
+local function wait_cleanup(control: *ControlServer, watched: *cint, timeout: integer): cint
+  local deadline = monotonic_ms() + timeout
+  local fds = &control.fds
+  local more = true
+  while control.observing do
+    if watched ~= nilptr and $watched < 0 then return 1 end
+    local now = monotonic_ms()
+    if now >= deadline then return 0 end
+    local wake = deadline
+    local free_slot = prepare_control(control, now, &wake)
+    fds[1].fd = -1
+    if watched ~= nilptr then fds[1].fd = $watched end
+    fds[3].fd = daemon_log_writable_fd()
+    local remaining = (@cint)(wake - now)
+    if more then remaining = 0 end
+    local ready = poll_active(fds, FirstClient + MaxClients, remaining)
+    if ready < 0 then
+      if errno == EINTR then continue end
+      break
+    end
+    if fds[3].revents ~= 0 then flush_daemon_log_loss() end
+    if fds[2].revents ~= 0 and not read_child_signal(control.reap_fd) then break end
+    if more or fds[1].revents ~= 0 or fds[2].revents ~= 0 then
+      local ok: boolean
+      ok, more = reap_pending_children(control.group, nilptr)
+      if not ok then break end
+    end
+    read_clients(control)
+    if not accept_client(control, free_slot) then break end
+  end
+  -- A control or polling failure must not prevent direct pidfd cleanup.
+  if control.observing then
+    control.observing = false
+    close_clients(control)
+    daemon_log_error('theseusd: shutdown control unavailable\n')
+  end
+  local remaining = math.max(0, deadline - monotonic_ms())
+  if watched == nilptr then c_poll(nilptr, 0, (@cint)(remaining)); return 0 end
+  if $watched < 0 then return 1 end
+  return wait_pidfd_exit($watched, remaining)
+end
+
+local function stop_leader(runtime: *Runtime, control: *ControlServer): boolean
+  if runtime.pidfd < 0 then return true end
+  if not signal_child(runtime, SIGTERM) then return false end
+  local ready = wait_cleanup(control, &runtime.pidfd, runtime.service.stop_grace_ms)
+  if ready == 0 then
+    daemon_log('TE1', 'shutdown', runtime.service.name, runtime.attempts, 'term-timeout',
+               runtime.service.stop_grace_ms)
+    if not signal_child(runtime, SIGKILL) then return false end
+    ready = wait_cleanup(control, &runtime.pidfd, NativeStopCleanupStepMs)
+  end
+  return ready > 0 and (runtime.pidfd < 0 or reap(runtime))
+end
+
+local function drain_cgroup(runtime: *Runtime, control: *ControlServer): boolean
+  local state = cgroup_state(&runtime.cgroup)
+  if state == CgroupState.Empty then return true end
+  if state == CgroupState.Error or not cgroup_kill(&runtime.cgroup) then return false end
+  daemon_log('TE1', 'ownership', runtime.service.name, runtime.attempts, 'draining')
+  local deadline = monotonic_ms() + NativeStopCleanupStepMs
+  repeat
+    state = cgroup_state(&runtime.cgroup)
+    if state == CgroupState.Empty then
+      daemon_log('TE1', 'ownership', runtime.service.name, runtime.attempts, 'drained')
+      return true
+    end
+    if state == CgroupState.Error then return false end
+    wait_cleanup(control, nilptr, math.min(10, math.max(0, deadline - monotonic_ms())))
+  until monotonic_ms() >= deadline
+  return false
+end
+
+local function stop_probe(runtime: *Runtime, control: *ControlServer): boolean
+  if runtime.probe_fd < 0 then return true end
+  if not cancel_probe(runtime, monotonic_ms()) then return false end
+  local status: cint
+  return wait_cleanup(control, &runtime.probe_fd, NativeStopCleanupStepMs) > 0 and (runtime.probe_fd < 0 or reap_probe(runtime, &status))
+end
+
+local function stop_child(runtime: *Runtime, control: *ControlServer): boolean
+  if runtime.pidfd < 0 and runtime.probe_fd < 0 and
+     runtime.state ~= ServiceState.Backoff and cgroup_state(&runtime.cgroup) == CgroupState.Empty then
+    return true
+  end
+  transition(runtime, ServiceState.Stopping, 'shutdown')
+  local probe_stopped = stop_probe(runtime, control)
+  local leader_stopped = stop_leader(runtime, control)
+  local group_empty = drain_cgroup(runtime, control)
+  if not probe_stopped or not leader_stopped or not group_empty then return false end
+  transition(runtime, ServiceState.Stopped, 'shutdown-complete')
+  return true
 end
 
 local function log_graph_diagnostic(message: string)
@@ -1182,6 +1308,8 @@ local function supervise(shutdown_fd: cint, reap_fd: cint, child_mask: *Sigset):
 
   local exit_code: integer = 78
   local shutdown_client: cint = -1
+  local control: ControlServer
+  init_control(&control, listener, shutdown_fd, reap_fd, &group)
   local resources_ready = true
   if root >= 0 then
     for i: integer = 0, group.count - 1 do
@@ -1202,23 +1330,26 @@ local function supervise(shutdown_fd: cint, reap_fd: cint, child_mask: *Sigset):
       exit_code = 0
     end
     if exit_code == 0 then
-      exit_code, shutdown_client = serve(listener, shutdown_fd, reap_fd, &group, child_mask)
+      exit_code, shutdown_client = serve(&control, child_mask)
     end
   end
 
-  c_close(listener)
+  group.stopping = true
+  control.observing = resources_ready and (exit_code == 0 or exit_code == 82)
   local stopped = true
   for i: integer = group.count - 1, 0, -1 do
     local runtime = &group.runtimes[i]
     if runtime.pidfd >= 0 and group.target then
       daemon_log('TE1', 'target', group.name, 'stopping', runtime.service.name)
     end
-    if resources_ready and not stop_child(runtime) then stopped = false end
+    if resources_ready and not stop_child(runtime, &control) then stopped = false end
     if root >= 0 and not cgroup_remove(root, &runtime.cgroup) then
       daemon_log_error('theseusd: cannot remove cgroup for ', runtime.service.name, '\n')
       stopped = false
     end
   end
+  close_clients(&control)
+  c_close(listener)
   local more = true
   local reap_deadline = monotonic_ms() + 1000
   while more do

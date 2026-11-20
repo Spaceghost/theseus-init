@@ -50,7 +50,8 @@ _services: [
   schema.#GraphService & {
     service: {
       name: "anchor"
-      exec: ["/bin/sleep", "30"]
+      exec: [testProgram, "delay-term", "\(testDir)/anchor", "\(testDir)/release-anchor"]
+      stopGraceMs: 10000
       restart: "never"
     }
   },
@@ -68,6 +69,13 @@ _services: [
       name: "unstarted"
       exec: ["/bin/sleep", "30"]
       requires: ["bad"]
+    }
+  },
+  schema.#GraphService & {
+    service: {
+      name: "leaf"
+      exec: ["/bin/sleep", "30"]
+      requires: ["unstarted"]
     }
   },
   schema.#GraphService & {
@@ -97,7 +105,8 @@ _services: [
 
 _targets: [
   schema.#Target & {name: "demo", members: ["app"]},
-  schema.#Target & {name: "rollback", members: ["unstarted"]},
+  schema.#Target & {name: "halt", members: ["anchor"]},
+  schema.#Target & {name: "rollback", members: ["leaf"]},
   schema.#Target & {name: "bad-exec", members: ["exec-dependent"]},
   schema.#Target & {name: "shared", members: ["shared"]},
 ]

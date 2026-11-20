@@ -182,7 +182,12 @@ to inspect any selected service. The named target status and service list
 use the same in-memory service states, including required members, wanted
 dependencies, and their current startup or restart verdicts. See the
 [live query grammar](THE.md). `theseus daemon-stop` stops and reaps
-owned direct children in reverse plan order. Target events report
+owned direct children in reverse plan order. While a child or cgroup
+drains, the daemon answers read-only queries and reaps adopted children.
+A second stop request reports that shutdown is in progress. The first
+request receives its acknowledgment after cleanup. A failed hard
+requirement remains visible during rollback, together with the selected
+dependents skipped before their first start. Target events report
 running, failed, skipped, and stopping outcomes. One daemon manages
 one target, and the target contains up to 32 services.
 
