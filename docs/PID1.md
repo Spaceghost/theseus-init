@@ -18,6 +18,14 @@ under /run/theseus-init and /sys/fs/cgroup/theseus-init. Clients
 can use THESEUS_SOCKET=/run/theseus-init/control.sock to query
 the target. Startup has no dependency on a network or CUE evaluator.
 
+For a native service that owns a serial getty, run the getty in a new
+session and keep it in the foreground. Cascadia starts a session with
+the Nebox setsid applet and execs agetty on ttyS0 in the same process.
+The PID reported by the supervisor then matches the login shell's PID
+and session ID. A foreground command receives Ctrl-C on that terminal,
+and the service's restart policy supplies a new getty after logout.
+See the [Cascadia console trace](https://spacegho.st/cascadia/verification/native-live.txt).
+
 ## Rescue and shutdown
 
 Omit theseus.pid1=1 or add theseus.rescue=1 for console rescue
