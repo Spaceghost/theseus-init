@@ -84,12 +84,22 @@ _services: [
       requires: ["exec-failure"]
     }
   },
+  schema.#GraphService & {
+    service: {
+      name: "shared"
+      exec: [testProgram, "listen", "\(testDir)/shared.sock", "\(testDir)/allow-shared"]
+      restart: "on-failure"
+      maxRestarts: 1
+      readiness: {kind: "unix-socket", path: "\(testDir)/shared.sock", timeoutMs: 10000}
+    }
+  },
 ]
 
 _targets: [
   schema.#Target & {name: "demo", members: ["app"]},
   schema.#Target & {name: "rollback", members: ["unstarted"]},
   schema.#Target & {name: "bad-exec", members: ["exec-dependent"]},
+  schema.#Target & {name: "shared", members: ["shared"]},
 ]
 
 compiled: strings.Join(

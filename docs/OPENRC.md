@@ -72,7 +72,7 @@ first boot's checkpoint. See the [serial results](assets/openrc-network-corpus.t
 ## Alpine workloads with Nebox as /bin/sh
 
 The signed Cascadia Nebox r3 shell package provides `/bin/sh` in the
-[Alpine-layout VM](https://github.com/Spaceghost/cascadia/blob/master/docs/VM-DISK.md#build-with-the-nebox-shell).
+[Alpine-layout VM](https://github.com/Spaceghost/cascadia/blob/master/docs/VM-DISK.md#nebox-shell-and-stock-comparison).
 With that package installed on Alpine 3.24.4, both Theseus clients
 matched direct OpenRC status output and exit codes for 65 scripts.
 On KVM and TCG, both clients completed all nine lifecycle comparisons

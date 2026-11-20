@@ -178,7 +178,10 @@ exec. Services with socket readiness use their configured deadline for
 both the handshake and listener checks.
 
 Use the live `the state of SERVICE` against the target's control socket
-to inspect any selected service. `theseus daemon-stop` stops and reaps
+to inspect any selected service. The named target status and service list
+use the same in-memory service states, including required members, wanted
+dependencies, and their current startup or restart verdicts. See the
+[live query grammar](THE.md). `theseus daemon-stop` stops and reaps
 owned direct children in reverse plan order. Target events report
 running, failed, skipped, and stopping outcomes. One daemon manages
 one target, and the target contains up to 32 services.

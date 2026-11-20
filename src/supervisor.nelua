@@ -781,6 +781,29 @@ local function reply_services(client: cint, group: *Supervision)
   write_all(client, response:view())
 end
 
+local function reply_target_status(client: cint, group: *Supervision)
+  local running: integer = 0
+  local required: integer = 0
+  local required_running: integer = 0
+  local failed = false
+  for i: integer = 0, group.count - 1 do
+    local state = group.runtimes[i].state
+    if state == ServiceState.Running then running = running + 1 end
+    if group.required[i] then
+      required = required + 1
+      if state == ServiceState.Running then required_running = required_running + 1 end
+      if terminal(state) then failed = true end
+    end
+  end
+  local phase = 'STARTING'
+  if failed then phase = 'FAILED'
+  elseif group.announced then
+    if running == group.count then phase = 'RUNNING' else phase = 'DEGRADED' end
+  end
+  write_all(client, string.format('TR1\tTARGET\t%s\t%s\t%d/%d\t%d/%d\n',
+            group.name, phase, running, group.count, required_running, required))
+end
+
 local function reply_query(client: cint, request: string, group: *Supervision)
   if request == 'TQ1\tSERVICES\n' then
     reply_services(client, group)
@@ -793,7 +816,23 @@ local function reply_query(client: cint, request: string, group: *Supervision)
       return
     end
   end
-  write_all(client, 'TR1\tERROR\trequest\n')
+  -- Service names keep precedence in an unqualified status query.
+  if group.target then
+    local subject = group.name .. '\n'
+    if request == 'TQ1\tSTATUS\t' .. subject or request == 'TQ1\tTARGET\t' .. subject then
+      reply_target_status(client, group)
+      return
+    end
+    if request == 'TQ1\tSERVICES\t' .. subject then
+      reply_services(client, group)
+      return
+    end
+  end
+  if string.find(request, '^TQ1\tTARGET\t') == 1 or string.find(request, '^TQ1\tSERVICES\t') == 1 then
+    write_all(client, 'TR1\tERROR\tunknown-target\n')
+  else
+    write_all(client, 'TR1\tERROR\trequest\n')
+  end
 end
 
 local function reap_notified_child(group: *Supervision, pid: cint, clients: *PollSlots): boolean

@@ -437,6 +437,10 @@ jobs:
           test -n "$child_pid"
           kill -0 "$child_pid"
           test "$(build/live/the state of sleep-stop)" = RUNNING
+          rc=0
+          build/live/the services of sleep-stop >/dev/null 2>"build/live/single-target.err" || rc=$?
+          test "$rc" -eq 3
+          grep -Fx 'theseus: no active target named sleep-stop' build/live/single-target.err
           timeout 8s build/live/control-test
 
           saved_nofile=$(prlimit --pid "$daemon_pid" --nofile --noheadings --raw --output SOFT)
@@ -683,6 +687,19 @@ jobs:
           test "$(timeout 2s build/live/the state of app)" = PLANNED
           printf 'gate\tSTARTING\noptional\tPLANNED\nskipped\tPLANNED\napp\tPLANNED\n' >"$job_dir/list.expected"
           timeout 2s build/live/the services | cmp "$job_dir/list.expected" -
+          timeout 2s build/live/the services of demo | cmp "$job_dir/list.expected" -
+          test "$(build/live/the state of demo)" = STARTING
+          build/live/the status of demo >"$job_dir/target-status"
+          awk '$1=="target" && $2=="demo" {n=1}
+               $1=="state" && $2=="STARTING" {s=1}
+               $1=="services-running" && $2=="0/4" {t=1}
+               $1=="required-running" && $2=="0/2" {r=1}
+               END {exit !(n && s && t && r)}' "$job_dir/target-status"
+          rc=0
+          build/live/the services of rollback >"$job_dir/wrong-target" 2>"$job_dir/wrong-target.err" || rc=$?
+          test "$rc" -eq 3
+          test ! -s "$job_dir/wrong-target"
+          grep -Fx 'theseus: no active target named rollback' "$job_dir/wrong-target.err"
           timeout 2s build/live/the failed services >"$job_dir/list.failed"
           test ! -s "$job_dir/list.failed"
           touch "$job_dir/release"
@@ -699,10 +716,17 @@ jobs:
           test "$(timeout 2s build/live/the state of skipped)" = FAILED
           printf 'gate\tRUNNING\noptional\tFAILED\nskipped\tFAILED\napp\tRUNNING\n' >"$job_dir/list.expected"
           timeout 2s build/live/theseus services | cmp "$job_dir/list.expected" -
+          build/live/theseus services demo | cmp "$job_dir/list.expected" -
+          test "$(build/live/the state of target demo)" = DEGRADED
+          build/live/the status of demo >"$job_dir/target-status"
+          awk '$1=="services-running" && $2=="2/4" {t=1}
+               $1=="required-running" && $2=="2/2" {r=1}
+               END {exit !(t && r)}' "$job_dir/target-status"
           timeout 2s build/live/the running services >"$job_dir/list.running"
           printf 'gate\tRUNNING\napp\tRUNNING\n' | cmp "$job_dir/list.running" -
           timeout 2s build/live/the failed services >"$job_dir/list.failed"
           printf 'optional\tFAILED\nskipped\tFAILED\n' | cmp "$job_dir/list.failed" -
+          build/live/the failed services of demo | cmp "$job_dir/list.failed" -
           timeout 8s build/live/theseus daemon-stop
           wait "$daemon_pid"
           daemon_pid=
@@ -746,6 +770,29 @@ jobs:
           ! grep -F "$(printf 'daemon-spawn\texec-dependent\t')" build/live/target-exec.log
           check_reaped build/live/target-exec.log
 
+          # A service can have the same name as the target. Hold its second
+          # start below readiness to check aggregate state across a real restart.
+          touch "$job_dir/allow-shared"
+          build/live/theseusd --target shared >build/live/target-shared.log 2>&1 &
+          daemon_pid=$!
+          wait_state shared RUNNING
+          test "$(build/live/the state of target shared)" = RUNNING
+          leader=$(build/live/the status of shared | awk '$1=="pid" {print $2}')
+          test "$leader" -gt 0
+          rm "$job_dir/allow-shared" "$job_dir/shared.sock"
+          kill -TERM "$leader"
+          wait_state shared STARTING
+          test "$(build/live/the state of target shared)" = DEGRADED
+          build/live/the services of shared >"$job_dir/list.shared"
+          printf 'shared\tSTARTING\n' | cmp - "$job_dir/list.shared"
+          touch "$job_dir/allow-shared"
+          wait_state shared RUNNING
+          test "$(build/live/the state of target shared)" = RUNNING
+          build/live/theseus daemon-stop
+          wait "$daemon_pid"
+          daemon_pid=
+          check_reaped build/live/target-shared.log
+
           export THESEUS_GRAPH="$PWD/build/invalid-target.tsc"
           printf 'TSC3\tself\t/bin/true\tnever\t0\tnone\tself\t\t\t\nTGT1\tloop\tself\n' > "$THESEUS_GRAPH"
           rc=0
@@ -769,6 +816,8 @@ jobs:
           daemon_pid=$!
           wait_state "$name" RUNNING
           timeout 2s build/live/the services | cmp "$job_dir/full-list.expected" -
+          timeout 2s build/live/the services of full | cmp "$job_dir/full-list.expected" -
+          test "$(build/live/the state of full)" = RUNNING
           timeout 8s build/live/theseus daemon-stop
           wait "$daemon_pid"
           daemon_pid=

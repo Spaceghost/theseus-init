@@ -6,6 +6,7 @@ require 'io'
 require 'os'
 require 'string'
 require 'src.theseus.openrc'
+require 'src.theseus.name'
 
 local function c_socket(domain: cint, kind: cint, protocol: cint): cint <cimport 'socket', nodecl, cinclude '<sys/socket.h>'> end
 local function c_connect(fd: cint, address: pointer, length: cuint): cint <cimport 'connect', nodecl, cinclude '<sys/socket.h>'> end
@@ -201,11 +202,44 @@ local function show_status(response: string, state_only: boolean): integer
   return 0
 end
 
-local function query_status(name: string, state_only: boolean): integer
-  local ok: boolean
-  local response: string
-  ok, response = exchange('TQ1\tSTATUS\t' .. name .. '\n', QueryTimeout)
+local function show_target_status(response: string, expected: string, state_only: boolean): integer
+  local cursor: isize = #'TR1\tTARGET\t' + 1
+  local name, phase, running, required: string
+  name, cursor = next_field(response, cursor)
+  phase, cursor = next_field(response, cursor)
+  running, cursor = next_field(response, cursor)
+  required, cursor = next_field(response, cursor)
+  if name ~= expected or cursor ~= 0 or
+     (phase ~= 'STARTING' and phase ~= 'RUNNING' and phase ~= 'DEGRADED' and phase ~= 'FAILED') or
+     string.find(running, '^%d+/%d+$') ~= 1 or string.find(required, '^%d+/%d+$') ~= 1 then
+    io.stderr:write('theseus: malformed target status response\n')
+    return 65
+  end
+  if state_only then print(phase); return 0 end
+  print('target', name)
+  print('  state', phase)
+  print('  services-running', running)
+  print('  required-running', required)
+  return 0
+end
+
+local function unknown_target(name: string): integer
+  io.stderr:write('theseus: no active target named ', name, '\n')
+  return 3
+end
+
+local function query_status(name: string, state_only: boolean, target_only: boolean): integer
+  if not valid_native_name(name) then io.stderr:write('theseus: invalid name\n'); return 64 end
+  local verb = 'STATUS'
+  if target_only then verb = 'TARGET' end
+  local ok, response = exchange('TQ1\t' .. verb .. '\t' .. name .. '\n', QueryTimeout)
   if not ok then return 69 end
+  if response == 'TR1\tERROR\tunknown-target\n' then return unknown_target(name) end
+  if string.find(response, '^TR1\tTARGET\t') == 1 then return show_target_status(response, name, state_only) end
+  if target_only or response == 'TR1\tERROR\trequest\n' then
+    io.stderr:write('theseus: supervisor rejected status query for ', name, '\n')
+    return 65
+  end
   return show_status(response, state_only)
 end
 
@@ -226,9 +260,15 @@ local function print_services(response: string, filter: string): boolean
   return true
 end
 
-local function query_services(filter: string): integer
-  local ok, response = exchange('TQ1\tSERVICES\n', QueryTimeout)
+local function query_services(filter: string, target: string): integer
+  local request = 'TQ1\tSERVICES\n'
+  if #target > 0 then
+    if not valid_native_name(target) then io.stderr:write('theseus: invalid target name\n'); return 64 end
+    request = 'TQ1\tSERVICES\t' .. target .. '\n'
+  end
+  local ok, response = exchange(request, QueryTimeout)
   if not ok then return 69 end
+  if response == 'TR1\tERROR\tunknown-target\n' then return unknown_target(target) end
   if not print_services(response, filter) then
     io.stderr:write('theseus: malformed services response\n')
     return 65
@@ -251,24 +291,30 @@ end
 
 dispatch_openrc(is_the())
 if is_the() then
-  if #arg == 1 and arg[1] == 'services' then os.exit(query_services('')) end
-  if #arg == 2 and arg[2] == 'services' then
-    if arg[1] == 'failed' then os.exit(query_services('FAILED')) end
-    if arg[1] == 'running' then os.exit(query_services('RUNNING')) end
+  local subject: string
+  local words = #arg
+  if words >= 3 and arg[words - 1] == 'of' and #arg[words] > 0 then
+    subject = arg[words]
+    words = words - 2
   end
-  if #arg == 3 and arg[2] == 'of' and arg[1] == 'status' then
-    os.exit(query_status(arg[3], false))
+  if words == 1 and arg[1] == 'services' then os.exit(query_services('', subject)) end
+  if words == 2 and arg[2] == 'services' then
+    if arg[1] == 'failed' then os.exit(query_services('FAILED', subject)) end
+    if arg[1] == 'running' then os.exit(query_services('RUNNING', subject)) end
   end
-  if #arg == 3 and arg[2] == 'of' and arg[1] == 'state' then
-    os.exit(query_status(arg[3], true))
+  if (#arg == 3 or #arg == 4) and (arg[1] == 'status' or arg[1] == 'state') and arg[2] == 'of' then
+    if #arg == 3 then os.exit(query_status(arg[3], arg[1] == 'state', false)) end
+    if #arg == 4 and arg[3] == 'target' then os.exit(query_status(arg[4], arg[1] == 'state', true)) end
   end
-  io.stderr:write('usage: the [failed | running] services | the status of SERVICE | the state of SERVICE | the status of openrc SERVICE | the openrc-runlevel\n')
+  io.stderr:write('usage: the [failed | running] services [of TARGET] | the {status | state} of [target] NAME | the status of openrc SERVICE | the openrc-runlevel\n')
   os.exit(64)
 end
 
-if #arg == 2 and arg[1] == 'status' then os.exit(query_status(arg[2], false)) end
-if #arg == 2 and arg[1] == 'state' then os.exit(query_status(arg[2], true)) end
-if #arg == 1 and arg[1] == 'services' then os.exit(query_services('')) end
+if #arg == 2 and (arg[1] == 'status' or arg[1] == 'state') then
+  os.exit(query_status(arg[2], arg[1] == 'state', false))
+end
+if #arg == 1 and arg[1] == 'services' then os.exit(query_services('', '')) end
+if #arg == 2 and arg[1] == 'services' and #arg[2] > 0 then os.exit(query_services('', arg[2])) end
 if #arg == 1 and arg[1] == 'daemon-stop' then os.exit(shutdown()) end
-io.stderr:write('usage: theseus services | theseus status SERVICE | theseus state SERVICE | theseus daemon-stop | theseus openrc SERVICE ACTION | theseus openrc-runlevel RUNLEVEL\n')
+io.stderr:write('usage: theseus services [TARGET] | theseus status NAME | theseus state NAME | theseus daemon-stop | theseus openrc SERVICE ACTION | theseus openrc-runlevel RUNLEVEL\n')
 os.exit(64)

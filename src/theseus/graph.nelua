@@ -1,6 +1,7 @@
 require 'io'
 require 'string'
 require 'src.theseus.shutdown_policy'
+require 'src.theseus.name'
 
 local GraphDiagnostic = @function(string): void
 local report_graph_error: GraphDiagnostic
@@ -63,17 +64,13 @@ local function list_contains(list: string, wanted: string): boolean
   return false
 end
 
-local function valid_name(name: string): boolean
-  return #name <= 63 and string.find(name, '^[a-zA-Z0-9][a-zA-Z0-9._@:+-]*$') == 1
-end
-
 local function valid_list(list: string): boolean
   if #list == 0 then return true end
   local cursor: isize = 1
   while cursor ~= 0 do
     local item: string
     item, cursor = next_list_item(list, cursor)
-    if not valid_name(item) then return false end
+    if not valid_native_name(item) then return false end
   end
   return true
 end
@@ -99,7 +96,7 @@ local function parse_service(line: string): (boolean, GraphService)
 
   local payload_start = cursor
   service.name, cursor = next_field(line, cursor)
-  if not valid_name(service.name) or cursor == 0 then return false, service end
+  if not valid_native_name(service.name) or cursor == 0 then return false, service end
   for _: integer = 1, runtime_fields do
     field, cursor = next_field(line, cursor)
     if cursor == 0 then return false, service end
@@ -128,7 +125,7 @@ local function parse_target(line: string): (boolean, Target)
   magic, cursor = next_field(line, cursor)
   if magic ~= 'TGT1' or cursor == 0 then return false, target end
   target.name, cursor = next_field(line, cursor)
-  if not valid_name(target.name) or cursor == 0 then return false, target end
+  if not valid_native_name(target.name) or cursor == 0 then return false, target end
   target.members, cursor = next_field(line, cursor)
   if #target.members == 0 or cursor ~= 0 or not valid_list(target.members) then return false, target end
   return true, target

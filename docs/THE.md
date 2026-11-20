@@ -14,8 +14,13 @@ with status 69 and reports the deadline.
 the services
 the failed services
 the running services
-the status of SERVICE
-the state of SERVICE
+the services of TARGET
+the failed services of TARGET
+the running services of TARGET
+the status of NAME
+the state of NAME
+the status of target TARGET
+the state of target TARGET
 the status of openrc SERVICE
 the openrc-runlevel
 ```
@@ -25,6 +30,19 @@ tab-separated service name and state per line. A filter with zero
 matches succeeds with empty output. Use `theseus services` for the
 same full snapshot. OpenRC queries are separate from native service
 lists.
+
+A named target list includes its selected services and transitive dependencies.
+The daemon reports only the target it is supervising. An inactive target
+name, including one declared elsewhere in the same graph, exits with status 3
+on an explicit target query. `theseus services TARGET` prints the same list.
+
+`the status of NAME` looks up a supervised service first, then the active
+target. Use `the status of target NAME` when both share a name. Target status
+shows the current phase and two running counts, one for all selected services
+and one for hard requirements. `the state of target NAME` prints only the
+phase. Startup reports `STARTING` until the target signals readiness. A
+fully running target reports `RUNNING`. After readiness, a failed optional
+service or a service awaiting restart readiness produces `DEGRADED`.
 
 The bootstrap client can inspect compiled configuration and offers
 these forms:
