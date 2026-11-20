@@ -345,7 +345,12 @@ jobs:
           test ! -e "$THESEUS_SOCKET"
           build/live/theseusd sleep-stop >build/live/daemon.log 2>&1 &
           daemon_pid=$!
+          backlog_pid=
           cleanup() {
+            if test -n "$backlog_pid"; then
+              kill "$backlog_pid" 2>/dev/null || true
+              wait "$backlog_pid" 2>/dev/null || true
+            fi
             kill -CONT "$daemon_pid" 2>/dev/null || true
             if test -S "$THESEUS_SOCKET"; then
               timeout 3s build/live/theseus daemon-stop >/dev/null 2>&1 || true
@@ -399,7 +404,28 @@ jobs:
           test ! -s build/live/timed-query.out
           grep -Fx 'theseus: supervisor request timed out' build/live/timed-query.err
           test "$(timeout 2s build/live/the state of sleep-stop)" = RUNNING
-          timeout 3s build/live/theseus daemon-stop
+
+          kill -STOP "$daemon_pid"
+          rm -f build/live/backlog-full
+          build/live/control-test fill-backlog build/live/backlog-full &
+          backlog_pid=$!
+          for i in $(seq 1 100); do
+            if test -f build/live/backlog-full; then break; fi
+            kill -0 "$backlog_pid"
+            sleep 0.02
+          done
+          test -f build/live/backlog-full
+          rc=0
+          timeout 10s build/live/the services >build/live/backlog-query.out 2>build/live/backlog-query.err || rc=$?
+          test "$rc" -eq 69
+          test ! -s build/live/backlog-query.out
+          grep -Fx 'theseus: supervisor request timed out' build/live/backlog-query.err
+          timeout 6s build/live/theseus daemon-stop &
+          shutdown_pid=$!
+          sleep 0.25
+          kill -0 "$shutdown_pid"
+          kill -CONT "$daemon_pid"
+          wait "$shutdown_pid"
           wait "$daemon_pid"
           test ! -e "$THESEUS_SOCKET"
           if kill -0 "$child_pid" 2>/dev/null; then

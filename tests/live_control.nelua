@@ -27,6 +27,9 @@ local SignalHandler = @function(cint): void
 local function c_signal(signal: cint, handler: SignalHandler): SignalHandler <cimport 'signal', nodecl, cinclude '<signal.h>'> end
 local AF_UNIX: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
 local SOCK_STREAM: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local SOCK_NONBLOCK: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
+local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EAGAIN: cint <cimport, nodecl, cinclude '<errno.h>'>
 local SHUT_RD: cint <cimport, nodecl, cinclude '<sys/socket.h>'>
 local SIGTERM: cint <cimport, nodecl, cinclude '<signal.h>'>
 local SIG_IGN: SignalHandler <cimport, nodecl, cinclude '<signal.h>'>
@@ -198,6 +201,24 @@ if arg[1] == 'listen' then
     assert(connection >= 0, 'readiness fixture accept failed')
     c_close(connection)
   end
+end
+
+if arg[1] == 'fill-backlog' then
+  local path = os.getenv('THESEUS_SOCKET')
+  local address = endpoint(path)
+  for _ = 1, 64 do
+    local fd = c_socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0)
+    assert(fd >= 0, 'backlog fixture socket failed')
+    if c_connect(fd, &address, (@cuint)(2 + #path + 1)) ~= 0 then
+      assert(errno == EAGAIN, 'backlog fixture connect failed')
+      c_close(fd)
+      local marker = io.open(arg[2], 'w')
+      assert(marker:isopen(), 'backlog fixture cannot publish readiness')
+      marker:close()
+      while true do c_pause() end
+    end
+  end
+  assert(false, 'control socket backlog did not fill')
 end
 
 if arg[1] == 'hold-requests' then

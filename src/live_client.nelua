@@ -79,6 +79,20 @@ local function wait_socket(fd: cint, events: cshort, deadline: integer): boolean
   end
 end
 
+local function connect_socket(fd: cint, address: *SockaddrUn, length: cuint, deadline: integer): boolean
+  while monotonic_ms() < deadline do
+    if c_connect(fd, address, length) == 0 then return true end
+    if errno ~= EAGAIN then return false end
+    -- A full Linux AF_UNIX queue leaves this socket unconnected. Polling
+    -- the socket would not wait for space in the listener's queue.
+    local remaining = deadline - monotonic_ms()
+    if remaining <= 0 then return false end
+    if remaining > 25 then remaining = 25 end
+    if c_poll(nilptr, 0, (@cint)(remaining)) < 0 and errno ~= EINTR then return false end
+  end
+  return false
+end
+
 local function write_all(fd: cint, text: string, deadline: integer): boolean
   local remaining = text
   while #remaining > 0 do
@@ -130,7 +144,7 @@ local function exchange(request: string, timeout: integer): (boolean, string)
   defer c_close(fd) end
   local address: SockaddrUn
   fill_address(&address, path)
-  if c_connect(fd, &address, (@cuint)(2 + #path + 1)) ~= 0 or
+  if not connect_socket(fd, &address, (@cuint)(2 + #path + 1), deadline) or
      not write_all(fd, request, deadline) then return exchange_failed(deadline) end
   local ok, response = read_line(fd, deadline)
   if not ok then return exchange_failed(deadline) end
