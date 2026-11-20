@@ -23,6 +23,7 @@ local function c_waitpid(pid: cint, status: *cint, options: cint): cint <cimport
 local ChildInfo: type <cimport 'siginfo_t', nodecl, cinclude '<signal.h>'> = @record{si_pid: cint}
 local function c_waitid(kind: cint, id: cuint, info: *ChildInfo, options: cint): cint <cimport 'waitid', nodecl, cinclude '<sys/wait.h>'> end
 local function c_prctl(option: cint, arg2: culong, arg3: culong, arg4: culong, arg5: culong): cint <cimport 'prctl', nodecl, cinclude '<sys/prctl.h>'> end
+local function c_fcntl(fd: cint, command: cint, value: cint): cint <cimport 'fcntl', nodecl, cinclude '<fcntl.h>'> end
 local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
 local function c_kill(pid: cint, signal: cint): cint <cimport 'kill', nodecl, cinclude '<signal.h>'> end
 local function c_syscall2(number: clong, a1: clong, a2: clong): clong <cimport 'syscall', nodecl, cinclude '<unistd.h>'> end
@@ -55,6 +56,7 @@ local function c_clock_gettime(clock: cint, value: *Timespec): cint <cimport 'cl
 local Pollfd = @record{fd: cint, events: cshort, revents: cshort}
 local MaxClients <comptime> = 8
 local FirstClient <comptime> = 4
+local ready_fd: cint = -1
 local PollSlots = @[FirstClient + MaxClients + 3 * NativeMaxServices]Pollfd
 local function c_poll(fds: *Pollfd, count: culong, timeout_ms: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
 
@@ -91,6 +93,8 @@ local EAGAIN: cint <cimport, nodecl, cinclude '<errno.h>'>
 local EMFILE: cint <cimport, nodecl, cinclude '<errno.h>'>
 local ENFILE: cint <cimport, nodecl, cinclude '<errno.h>'>
 local ESRCH: cint <cimport, nodecl, cinclude '<errno.h>'>
+local F_SETFD: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local FD_CLOEXEC: cint <cimport, nodecl, cinclude '<fcntl.h>'>
 local O_CLOEXEC: cint <cimport, nodecl, cinclude '<fcntl.h>'>
 local O_NONBLOCK: cint <cimport, nodecl, cinclude '<fcntl.h>'>
 local POLLOUT: cshort <cimport, nodecl, cinclude '<poll.h>'>
@@ -262,6 +266,7 @@ local function spawn(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset, cl
   end
   local pid = c_fork()
   if pid == 0 then
+    if ready_fd >= 0 then c_close(ready_fd) end
     c_close(handshake[0])
     local failed: cchar = 2
     if cgroup_enter(&runtime.cgroup) then
@@ -483,6 +488,7 @@ end
 local function start_probe(runtime: *Runtime, child_mask: *Sigset, now: integer, clients: *PollSlots): boolean
   local pid = c_fork()
   if pid == 0 then
+    if ready_fd >= 0 then c_close(ready_fd) end
     if not cgroup_enter(&runtime.cgroup) or
        c_sigprocmask(SIG_SETMASK, child_mask, nilptr) ~= 0 then c__exit(126) end
     local argv = &runtime.probe_args.cargs[0]
@@ -758,6 +764,14 @@ local function advance_target(group: *Supervision, child_mask: *Sigset, clients:
     if last == ServiceState.Running or terminal(last) then
       daemon_log('TE1', 'target', group.name, 'running')
       group.announced = true
+      if ready_fd >= 0 then
+        local marker: byte = 82 -- R
+        local sent = c_write(ready_fd, &marker, 1)
+        while sent < 0 and errno == EINTR do sent = c_write(ready_fd, &marker, 1) end
+        c_close(ready_fd)
+        ready_fd = -1
+        if sent ~= 1 then return 74 end
+      end
     end
   end
   return 0
@@ -1060,7 +1074,7 @@ end
 local function supervise(shutdown_fd: cint, reap_fd: cint, child_mask: *Sigset): integer
   local group: Supervision
   local code: integer
-  if #arg == 2 and arg[1] == '--target' then
+  if (#arg == 2 or ready_fd >= 0) and arg[1] == '--target' then
     group.target = true
     group.name = arg[2]
     code = load_target(group.name, &group)
@@ -1190,10 +1204,17 @@ local function supervise(shutdown_fd: cint, reap_fd: cint, child_mask: *Sigset):
 end
 
 local function main(): integer
+  if #arg == 4 and arg[1] == '--target' and arg[3] == '--ready-fd' then
+    local descriptor = arg[4]
+    if #descriptor > 9 or string.find(descriptor, '^[0-9]+$') ~= 1 then return 64 end
+    ready_fd = (@cint)(tonumber(descriptor))
+    if ready_fd < 3 or c_fcntl(ready_fd, F_SETFD, FD_CLOEXEC) ~= 0 then return 64 end
+  end
+  defer if ready_fd >= 0 then c_close(ready_fd) end end
   local child_mask: Sigset
   local shutdown_fd = open_shutdown_fd(&child_mask)
   if shutdown_fd < 0 then return 74 end
-  if not start_daemon_log() then return 85 end
+  if not start_daemon_log(ready_fd) then return 85 end
   local reap_fd = open_reap_fd()
   if reap_fd < 0 then
     daemon_log_error('theseusd: cannot enable child subreaping\n')

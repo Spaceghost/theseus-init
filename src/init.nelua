@@ -141,20 +141,30 @@ local function mount_type(kind: cstring, path: cstring, flags: culong, magic: cl
   return has_type(path, magic) or c_mount(kind, path, kind, flags, nilptr) == 0
 end
 
-local function command_line(): (boolean, boolean, boolean, boolean, boolean)
+local function command_line(): (boolean, boolean, boolean, boolean, boolean, integer)
   local file = io.open('/proc/cmdline', 'r')
-  if not file:isopen() then return false, false, false, true, false end
+  if not file:isopen() then return false, false, false, true, false, 0 end
   local line = file:read('*a')
   file:close()
   local enabled, rescue, openrc, rescue_disabled, trial: boolean, boolean, boolean, boolean, boolean
+  local trial_seconds: integer = 0
+  local timeout_prefix = 'theseus.trial_timeout='
   for option in string.gmatch(line, '%S+') do
     if option == 'theseus.pid1=1' then enabled = true end
     if option == 'theseus.rescue=1' then rescue = true end
     if option == 'theseus.rescue=off' then rescue_disabled = true end
     if option == 'theseus.openrc=1' then openrc = true end
     if option == 'theseus.trial=1' then trial = true end
+    if string.sub(option, 1, #timeout_prefix) == timeout_prefix then
+      local seconds = string.sub(option, #timeout_prefix + 1)
+      trial_seconds = -1
+      if #seconds <= 4 and string.find(seconds, '^[0-9]+$') == 1 then
+        local value = (@integer)(tonumber(seconds))
+        if value >= 1 and value <= 3600 then trial_seconds = value end
+      end
+    end
   end
-  return enabled, rescue, openrc, rescue_disabled, trial and enabled and not rescue
+  return enabled, rescue, openrc, rescue_disabled, trial and enabled and not rescue, trial_seconds
 end
 
 local function provision_run(): boolean
@@ -234,7 +244,7 @@ local function unblock_signals()
   if c_sigemptyset(&unblocked) ~= 0 or c_sigprocmask(SIG_SETMASK, &unblocked, nilptr) ~= 0 then c_exit(126) end
 end
 
-local function launch(rescue: boolean): cint
+local function launch(rescue: boolean, ready_writer: cint): cint
   local pid = c_fork()
   if pid ~= 0 then return pid end
   unblock_signals()
@@ -255,6 +265,13 @@ local function launch(rescue: boolean): cint
        c_setenv('THESEUS_RECOVERY_DIR', (@cstring)(TheseusRuntimeDir), 1) ~= 0 or
        c_setenv('THESEUS_SOCKET', (@cstring)(TheseusControlSocket), 1) ~= 0 then c_exit(126) end
     local worker = (@cstring)(worker_path)
+    if ready_writer >= 0 then
+      local descriptor = tostring(ready_writer)
+      if c_fcntl(ready_writer, F_SETFD, 0) < 0 then c_exit(126) end
+      local argv: [6]cstring = {worker, '--target', 'default', '--ready-fd', (@cstring)(descriptor), nilptr}
+      c_execv(worker, &argv[0])
+      c_exit(127)
+    end
     local argv: [4]cstring = {worker, '--target', 'default', nilptr}
     c_execv(worker, &argv[0])
   end
@@ -397,7 +414,7 @@ local function boot_openrc(fd: cint, session: *Session): (boolean, Action)
   return true, Action.None
 end
 
-local function shutdown(fd: cint, session: *Session, action: Action, had_worker: boolean)
+local function shutdown(fd: cint, session: *Session, action: Action, had_worker: boolean, worker_grace: integer)
   local cmd = RB_POWER_OFF
   if action == Action.Reboot then
     cmd = RB_AUTOBOOT
@@ -410,7 +427,7 @@ local function shutdown(fd: cint, session: *Session, action: Action, had_worker:
   end
   if session.worker > 0 then
     c_kill(session.worker, SIGTERM)
-    if not await_cleanup(fd, session, true, WorkerGrace) then
+    if not await_cleanup(fd, session, true, worker_grace) then
       report('supervisor-timeout')
       c_kill(session.worker, SIGKILL)
       await_cleanup(fd, session, true, 1000)
@@ -443,8 +460,9 @@ local function run()
   if c_access(Console, 0) ~= 0 then c_mount('devtmpfs', '/dev', 'devtmpfs', MS_NOSUID, nilptr) end
   console = c_open(Console, O_WRONLY | O_NONBLOCK | O_CLOEXEC | O_NOCTTY)
   local boot, preferred_rescue, openrc, rescue_disabled, trial = false, false, false, true, false
+  local trial_seconds: integer = 0
   if mount_type('proc', '/proc', MS_NOSUID | MS_NODEV | MS_NOEXEC, PROC_SUPER_MAGIC) then
-    boot, preferred_rescue, openrc, rescue_disabled, trial = command_line()
+    boot, preferred_rescue, openrc, rescue_disabled, trial, trial_seconds = command_line()
   end
   if rescue_disabled then report('rescue-console\tdisabled') end
   c_setenv('PATH', '/usr/sbin:/usr/bin:/sbin:/bin', 1)
@@ -453,12 +471,16 @@ local function run()
   local session: Session
   local reason: string
   local pending = Action.None
+  local ready_reader: cint = -1
+  local ready_deadline: integer = 0
   if fd < 0 then
     reason = 'signal-queue'
   elseif not boot then
     reason = 'missing-opt-in'
   elseif preferred_rescue then
     reason = 'requested'
+  elseif trial and trial_seconds < 0 then
+    reason = 'trial-timeout-config'
   elseif not select_bundle() then
     reason = 'release-path'
   elseif not provision_run() then
@@ -473,8 +495,18 @@ local function run()
       if not provision(openrc) then
         reason = 'boot-filesystems'
       else
-        session.worker = launch(false)
-        if session.worker <= 0 then reason = 'supervisor-fork' end
+        local ready: [2]cint = {-1, -1}
+        if trial and trial_seconds > 0 and c_pipe2(&ready[0], O_CLOEXEC | O_NONBLOCK) ~= 0 then
+          reason = 'trial-ready-pipe'
+        else
+          if ready[0] >= 0 then
+            ready_reader = ready[0]
+            ready_deadline = now_ms() + trial_seconds * 1000
+          end
+          session.worker = launch(false, ready[1])
+          if ready[1] >= 0 then c_close(ready[1]) end
+          if session.worker <= 0 then reason = 'supervisor-fork' end
+        end
       end
     end
   end
@@ -495,6 +527,19 @@ local function run()
       reason = 'supervisor'
       report('rescue\t' .. reason)
     end
+    local worker_grace: integer = WorkerGrace
+    if action == Action.None and trial and not in_rescue and ready_reader >= 0 then
+      local marker: byte
+      if c_read(ready_reader, &marker, 1) == 1 and marker == 82 then
+        c_close(ready_reader)
+        ready_reader = -1
+        report('trial-ready')
+      elseif now_ms() >= ready_deadline then
+        in_rescue = true
+        reason = 'supervisor-startup-timeout'
+        worker_grace = 4000
+      end
+    end
     if action == Action.None and trial and in_rescue then
       report('trial-reboot\t' .. reason)
       action = Action.Reboot
@@ -502,7 +547,8 @@ local function run()
     if action ~= Action.None then
       -- If reboot returns, stay in rescue instead of retrying the action.
       trial = false
-      shutdown(fd, &session, action, had_worker)
+      shutdown(fd, &session, action, had_worker, worker_grace)
+      if ready_reader >= 0 then c_close(ready_reader); ready_reader = -1 end
       in_rescue = true
       report('rescue\tshutdown-failed')
     elseif fd < 0 or not ok then
@@ -511,7 +557,7 @@ local function run()
       if fd < 0 then report('signal-queue-failed') end
     end
     if in_rescue and not rescue_disabled and session.rescue <= 0 and now_ms() >= session.rescue_at then
-      session.rescue = launch(true)
+      session.rescue = launch(true, -1)
       if session.rescue < 0 then session.rescue_at = now_ms() + 1000 end
     end
   end

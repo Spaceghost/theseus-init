@@ -76,7 +76,7 @@ local function write_loop(fd: cint)
   end
 end
 
-global function start_daemon_log(): boolean
+global function start_daemon_log(ready_fd: cint): boolean
   local pair: [2]cint
   if c_socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, &pair[0]) ~= 0 then return false end
   local capacity: cint = 65536
@@ -87,6 +87,7 @@ global function start_daemon_log(): boolean
   local parent = c_getpid()
   writer = c_fork()
   if writer == 0 then
+    if ready_fd >= 0 then c_close(ready_fd) end
     -- The writer may be blocked in output when the daemon is killed.
     if c_prctl(PR_SET_PDEATHSIG, (@culong)(SIGKILL), 0, 0, 0) ~= 0 or c_getppid() ~= parent then
       c_exit(126)

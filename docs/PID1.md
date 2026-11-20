@@ -50,8 +50,19 @@ supervisor exits during the trial, PID 1 runs the existing orderly
 reboot sequence. Its `trial-reboot` console event includes the
 failure reason. A manual shutdown request takes precedence, and
 `theseus.rescue=1` still requests rescue. A failed reboot syscall
-does not trigger repeated trial reboots. This policy does not detect
-a hung kernel or a live supervisor that never finishes startup.
+does not trigger repeated trial reboots.
+
+To bound native startup, add `theseus.trial_timeout=SECONDS` to that
+entry. Use a positive whole number from 1 to 3600 and a matching
+PID 1 and supervisor from the same release. The clock starts after
+the OpenRC boot phases, when PID 1 forks the native supervisor.
+The supervisor acknowledges startup only when its required services
+have reached their configured readiness and the native target
+reports running. If the deadline expires first, PID 1 allows up to
+four seconds for native shutdown before killing the supervisor and
+continuing the orderly reboot. Set the deadline for the target's
+startup and retry policy. This deadline covers startup only. A hung
+PID 1 or kernel requires an independent watchdog or reset.
 
 ## OpenRC-managed services
 
