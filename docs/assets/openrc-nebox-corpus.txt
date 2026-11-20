@@ -1,0 +1,80 @@
+Alpine 3.24.4 x86-64, OpenRC 0.63.2-r0, signed Nebox r3.
+The nine installed Alpine init scripts matched their APK contents.
+Guests had no virtual NIC and used loopback for workload requests.
+
+BusyBox PID 1 with Nebox /bin/sh (KVM)
+NEBOX_SHELL_SELECTED
+NETWORK_CORPUS_STOCK_PID1 init
+NETWORK_CORPUS_CLIENT one-shot
+openrc-catalog	total	65
+openrc-corpus	nginx	pass
+openrc-corpus	haproxy	pass
+openrc-corpus	sshd	pass
+openrc-corpus	cronie	pass
+openrc-corpus	lighttpd	pass
+openrc-corpus	postgresql	pass
+openrc-corpus	caddy	pass
+openrc-corpus	valkey	pass
+openrc-corpus	mosquitto	pass
+NETWORK_CORPUS_CLIENT live
+openrc-catalog	total	65
+openrc-corpus	nginx	pass
+openrc-corpus	haproxy	pass
+openrc-corpus	sshd	pass
+openrc-corpus	cronie	pass
+openrc-corpus	lighttpd	pass
+openrc-corpus	postgresql	pass
+openrc-corpus	caddy	pass
+openrc-corpus	valkey	pass
+openrc-corpus	mosquitto	pass
+openrc-corpus	stacked-runlevels	pass
+NETWORK_CORPUS_PASS
+NETWORK_CORPUS_EXIT 0
+
+BusyBox PID 1 with Nebox /bin/sh (TCG)
+NEBOX_SHELL_SELECTED
+NETWORK_CORPUS_STOCK_PID1 init
+NETWORK_CORPUS_CLIENT one-shot
+openrc-catalog	total	65
+openrc-corpus	nginx	pass
+openrc-corpus	haproxy	pass
+openrc-corpus	sshd	pass
+openrc-corpus	cronie	pass
+openrc-corpus	lighttpd	pass
+openrc-corpus	postgresql	pass
+openrc-corpus	caddy	pass
+openrc-corpus	valkey	pass
+openrc-corpus	mosquitto	pass
+NETWORK_CORPUS_CLIENT live
+openrc-catalog	total	65
+openrc-corpus	nginx	pass
+openrc-corpus	haproxy	pass
+openrc-corpus	sshd	pass
+openrc-corpus	cronie	pass
+openrc-corpus	lighttpd	pass
+openrc-corpus	postgresql	pass
+openrc-corpus	caddy	pass
+openrc-corpus	valkey	pass
+openrc-corpus	mosquitto	pass
+openrc-corpus	stacked-runlevels	pass
+NETWORK_CORPUS_PASS
+NETWORK_CORPUS_EXIT 0
+
+Theseus r11 PID 1 with Nebox /bin/sh (KVM, first boot)
+NEBOX_SHELL_SELECTED
+TI1	openrc-start	default
+NETWORK_PID1_WORKLOADS_READY first
+NETWORK_PID1_SERVICES_AVAILABLE_AT_NATIVE_SHUTDOWN first
+TI1	openrc-start	shutdown
+TI1	shutdown-ready
+reboot: Restarting system
+
+Theseus r11 PID 1 with Nebox /bin/sh (KVM, second boot)
+NEBOX_SHELL_SELECTED
+TI1	openrc-start	default
+NETWORK_PID1_PREVIOUS_CHECKPOINT_OK
+NETWORK_PID1_WORKLOADS_READY second
+NETWORK_PID1_SERVICES_AVAILABLE_AT_NATIVE_SHUTDOWN second
+TI1	openrc-start	shutdown
+TI1	shutdown-ready
+reboot: Power down

@@ -69,6 +69,23 @@ Alpine OpenRC under Theseus PID 1. The native client used the services
 during startup and its shutdown handler. The second boot read the
 first boot's checkpoint. See the [serial results](assets/openrc-network-corpus.txt).
 
+## Alpine workloads with Nebox as /bin/sh
+
+The signed Cascadia Nebox r3 shell package provides `/bin/sh` in the
+[Alpine-layout VM](https://github.com/Spaceghost/cascadia/blob/master/docs/VM-DISK.md#build-with-the-nebox-shell).
+With that package installed on Alpine 3.24.4, both Theseus clients
+matched direct OpenRC status output and exit codes for 65 scripts.
+On KVM and TCG, both clients completed all nine lifecycle comparisons
+above. The live client also passed the stacked runlevel switch.
+
+Two KVM boots used the signed Theseus r11 APK as PID 1 and the same
+Nebox shell. All nine installed services answered their workload checks
+at startup and again in the native client's shutdown handler. After
+the first reboot, the native client read the checkpoint it had written
+during shutdown. The second boot powered down cleanly. All nine
+installed service scripts matched the original Alpine APKs byte for
+byte. See the [serial results](assets/openrc-nebox-corpus.txt).
+
 ## Reproduce the comparison
 
 1. Build `src/theseus.nelua` as `theseus` and
