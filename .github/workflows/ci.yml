@@ -221,6 +221,21 @@ jobs:
           test "$code" -eq 73
           test -z "$(ls -A "$work/releases/reserved")"
 
+          (
+            stale="$work/releases/.retry.$BASHPID"
+            mkdir "$stale" "$stale.1"
+            printf 'stranded staging data\n' >"$stale/theseus-init"
+            printf '%s\n' "$stale" >"$work/stale-path"
+            exec build/theseus-install "$work/releases" retry "$work/input"
+          )
+          stale="$(cat "$work/stale-path")"
+          grep -Fx 'stranded staging data' "$stale/theseus-init"
+          test -d "$stale.1"
+          test ! -e "$stale.2"
+          cmp "$work/input/theseus-init" "$work/releases/retry/theseus-init"
+          cmp "$work/input/graph.tsc" "$work/releases/retry/graph.tsc"
+          test "$(readlink "$work/releases/retry/the")" = theseus
+
 
       - name: Keep OpenRC arguments explicit and the status grammar read-only
         run: |

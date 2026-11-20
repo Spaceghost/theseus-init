@@ -97,8 +97,16 @@ local function graph_error(stage: cint): string
 end
 
 local function install(root: cint, source: cint, release: string): integer
-  local temporary = (@cstring)('.' .. release .. '.' .. tostring(c_getpid()))
-  if c_mkdirat(root, temporary, 0x1c0) ~= 0 then return fail(73, 'cannot create staging directory') end
+  local base = '.' .. release .. '.' .. tostring(c_getpid())
+  local staging_name: string = base
+  local suffix: integer = 0
+  -- An interrupted install can leave a directory behind after its PID is reused.
+  while c_mkdirat(root, (@cstring)(staging_name), 0x1c0) ~= 0 do
+    if errno ~= EEXIST then return fail(73, 'cannot create staging directory') end
+    suffix = suffix + 1
+    staging_name = base .. '.' .. tostring(suffix)
+  end
+  local temporary = (@cstring)(staging_name)
   local stage = c_openat(root, temporary, DirFlags, 0)
   local published = false
   defer

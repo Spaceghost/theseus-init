@@ -91,5 +91,6 @@ For a portable boot image, include the loader and libraries for the
 target platform alongside the binaries' normal runtime dependencies.
 Leave the release root under trusted administration and keep its
 entries on the mounted root filesystem. A half-written staging
-directory starts with a dot. It can be removed after verifying that
-its installer is no longer running.
+directory starts with a dot. Retrying uses a fresh staging directory
+if an interrupted install left one behind. Remove an abandoned
+directory after verifying that its installer is no longer running.
