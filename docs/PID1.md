@@ -27,6 +27,13 @@ cgroups and control socket, and starts /bin/sh on /dev/console.
 Exiting the rescue shell starts another after a short delay.
 Keep the boot console physically or administratively protected.
 
+For an installed system with a separate recovery boot entry, add
+`theseus.rescue=off`. This option takes precedence over
+`theseus.rescue=1` for console access. Theseus still reports the
+failure, cleans up owned resources and accepts reboot, halt and
+poweroff signals. It leaves the console without a shell. It also
+keeps the shell disabled if it cannot read the kernel command line.
+
 BusyBox halt, poweroff, and reboot request system shutdown.
 Their signals are SIGUSR1, SIGUSR2, and SIGTERM respectively.
 SIGINT requests reboot for Ctrl+Alt+Del. The daemon first gets
@@ -55,7 +62,8 @@ invokes OpenRC with its reboot argument so shutdown scripts receive
 RC_REBOOT=YES while RC_RUNLEVEL remains shutdown. A failed native
 supervisor is cleaned up while already running OpenRC services
 remain available in rescue. Use the kernel option theseus.rescue=1
-to enter the console before either service manager starts.
+to enter the console before either service manager starts when the
+console is enabled.
 
 Each OpenRC invocation has a two-minute deadline. A shutdown
 request can interrupt a boot runlevel. PID 1 sends SIGTERM to the
