@@ -98,6 +98,8 @@ local worker_path = '/sbin/theseusd'
 local graph_path = '/etc/theseus/graph.tsc'
 local OpenRC: cstring = '/sbin/openrc'
 local Rescue: cstring = '/bin/sh'
+local BootFallback: cstring = '/usr/libexec/theseus/boot-fallback'
+local FallbackGrace <comptime> = 5000
 -- 32 services each get up to four seconds for probe, leader, and cgroup cleanup.
 local WorkerGrace <comptime> = 135000
 local OpenRCGrace <comptime> = 120000
@@ -113,6 +115,8 @@ local Session = @record{
   openrc: cint,
   openrc_failed: boolean,
   openrc_started: boolean,
+  fallback: cint,
+  fallback_armed: boolean,
 }
 local WorkerMonitor = @record{
   reader: cint,
@@ -169,13 +173,14 @@ local function parse_seconds(value: string, minimum: integer): integer
   return -1
 end
 
-local function command_line(): (boolean, boolean, boolean, boolean, boolean, integer, boolean, integer, integer)
+local function command_line(): (boolean, boolean, boolean, boolean, boolean, integer, boolean, integer, integer, boolean)
   local file = io.open('/proc/cmdline', 'r')
-  if not file:isopen() then return false, false, false, true, false, 0, false, 0, 0 end
+  if not file:isopen() then return false, false, false, true, false, 0, false, 0, 0, false end
   local line = file:read('*a')
   file:close()
   local enabled, rescue, openrc, rescue_disabled, trial: boolean, boolean, boolean, boolean, boolean
   local trial_watchdog = false
+  local fallback_enabled = false
   local trial_seconds: integer = 0
   local heartbeat_seconds: integer = 0
   local timeout_prefix = 'theseus.trial_timeout='
@@ -189,6 +194,7 @@ local function command_line(): (boolean, boolean, boolean, boolean, boolean, int
     if option == 'theseus.openrc=1' then openrc = true end
     if option == 'theseus.trial=1' then trial = true end
     if option == 'theseus.trial_watchdog=1' then trial_watchdog = true end
+    if option == 'theseus.boot_fallback=1' then fallback_enabled = true end
     if string.sub(option, 1, #timeout_prefix) == timeout_prefix then
       trial_seconds = parse_seconds(string.sub(option, #timeout_prefix + 1), 1)
     elseif string.sub(option, 1, #heartbeat_prefix) == heartbeat_prefix then
@@ -197,7 +203,7 @@ local function command_line(): (boolean, boolean, boolean, boolean, boolean, int
       recovery_seconds = parse_seconds(string.sub(option, #recovery_prefix + 1), 3)
     end
   end
-  return enabled, rescue, openrc, rescue_disabled, trial and enabled and not rescue, trial_seconds, trial_watchdog, heartbeat_seconds, recovery_seconds
+  return enabled, rescue, openrc, rescue_disabled, trial and enabled and not rescue, trial_seconds, trial_watchdog, heartbeat_seconds, recovery_seconds, fallback_enabled
 end
 
 local function provision_run(): boolean
@@ -416,6 +422,10 @@ local function reap(session: *Session): boolean
       session.rescue = 0
       session.rescue_at = now_ms() + 1000
       report('rescue-exit')
+    elseif pid == session.fallback then
+      session.fallback = 0
+      session.fallback_armed = status == 0
+      report('boot-fallback-exit\t' .. tostring((status >> 8) & 0xff) .. '\t' .. tostring(status & 0x7f))
     elseif pid == session.openrc then
       session.openrc = 0
       session.openrc_failed = status ~= 0
@@ -441,7 +451,7 @@ local function await_cleanup(fd: cint, session: *Session, worker_only: boolean, 
   return false
 end
 
-local function launch_openrc(argument: cstring, output: cint): cint
+local function launch_boot_command(program: cstring, argument: cstring, output: cint): cint
   local pid = c_fork()
   if pid > 0 then
     c_setpgid(pid, pid)
@@ -452,8 +462,8 @@ local function launch_openrc(argument: cstring, output: cint): cint
     -- A pipe endpoint may already occupy an inherited standard descriptor.
     if output >= 0 and (c_dup2(output, 1) < 0 or c_dup2(output, 2) < 0 or
        c_fcntl(1, F_SETFD, 0) < 0 or c_fcntl(2, F_SETFD, 0) < 0) then c_exit(126) end
-    local argv: [3]cstring = {OpenRC, argument, nilptr}
-    c_execv(OpenRC, &argv[0])
+    local argv: [3]cstring = {program, argument, nilptr}
+    c_execv(program, &argv[0])
     c_exit(127)
   end
   return pid
@@ -487,7 +497,7 @@ local function openrc_phase(fd: cint, session: *Session, level: cstring, shutdow
   -- OpenRC maps reboot onto shutdown and sets RC_REBOOT for its scripts.
   local argument: cstring = level
   if shutdown_action == Action.Reboot then argument = 'reboot' end
-  session.openrc = launch_openrc(argument, output[1])
+  session.openrc = launch_boot_command(OpenRC, argument, output[1])
   if session.openrc <= 0 then return false, Action.None end
   local deadline = now_ms() + OpenRCGrace
   local action = Action.None
@@ -586,11 +596,12 @@ local function run()
   console = c_open(Console, O_WRONLY | O_NONBLOCK | O_CLOEXEC | O_NOCTTY)
   local boot, preferred_rescue, openrc, rescue_disabled, trial = false, false, false, true, false
   local trial_watchdog = false
+  local fallback_enabled = false
   local trial_seconds: integer = 0
   local heartbeat_seconds: integer = 0
   local recovery_seconds: integer = 0
   if mount_type('proc', '/proc', MS_NOSUID | MS_NODEV | MS_NOEXEC, PROC_SUPER_MAGIC) then
-    boot, preferred_rescue, openrc, rescue_disabled, trial, trial_seconds, trial_watchdog, heartbeat_seconds, recovery_seconds = command_line()
+    boot, preferred_rescue, openrc, rescue_disabled, trial, trial_seconds, trial_watchdog, heartbeat_seconds, recovery_seconds, fallback_enabled = command_line()
   end
   if rescue_disabled then report('rescue-console\tdisabled') end
   c_setenv('PATH', '/usr/sbin:/usr/bin:/sbin:/bin', 1)
@@ -601,6 +612,7 @@ local function run()
   local pending = Action.None
   local monitor: WorkerMonitor = {reader = -1}
   local recovery: WorkerRecovery
+  local fallback_by: integer = 0
   local recovery_enabled = not trial and recovery_seconds > 0
   local startup, heartbeat: integer, integer
   if trial then startup, heartbeat = trial_seconds, heartbeat_seconds end
@@ -675,6 +687,30 @@ local function run()
         in_rescue = true
         if session.worker > 0 then worker_grace = RecoveryGrace end
         report('rescue\t' .. reason)
+        if recovery_enabled and fallback_enabled then
+          session.fallback = launch_boot_command(BootFallback, nilptr, -1)
+          if session.fallback > 0 then
+            fallback_by = now_ms() + FallbackGrace
+            report('boot-fallback-start')
+          else
+            report('boot-fallback-fork-failed')
+          end
+        end
+      end
+    end
+    if fallback_by > 0 then
+      if action ~= Action.None or (session.fallback > 0 and now_ms() >= fallback_by) then
+        if session.fallback > 0 then
+          if c_kill(-session.fallback, SIGKILL) ~= 0 then c_kill(session.fallback, SIGKILL) end
+          report('boot-fallback-cancelled')
+        end
+        fallback_by = 0
+      elseif session.fallback == 0 then
+        fallback_by = 0
+        if session.fallback_armed then
+          report('boot-fallback-reboot')
+          action, worker_grace = Action.Reboot, RecoveryGrace
+        end
       end
     end
     if action == Action.None and trial and in_rescue then
@@ -693,7 +729,7 @@ local function run()
       fd = signal_queue()
       if fd < 0 then report('signal-queue-failed') end
     end
-    if in_rescue and not rescue_disabled and session.rescue <= 0 and now_ms() >= session.rescue_at then
+    if in_rescue and fallback_by == 0 and not rescue_disabled and session.rescue <= 0 and now_ms() >= session.rescue_at then
       session.rescue = launch(true, -1, false)
       if session.rescue < 0 then session.rescue_at = now_ms() + 1000 end
     end

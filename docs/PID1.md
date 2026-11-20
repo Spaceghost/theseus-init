@@ -102,6 +102,20 @@ reclaim its ownership, or if the budget is exhausted. An operator
 poweroff or reboot takes precedence over a pending restart. One-boot
 entries use their existing trial failure policy.
 
+### Select a recovery boot after native recovery fails
+
+Distributions can add `theseus.boot_fallback=1` to the installed
+entry alongside supervisor recovery. If in-place recovery gives up,
+PID 1 starts the distribution-owned executable
+`/usr/libexec/theseus/boot-fallback` with no arguments. The executable
+must durably select a recovery entry for the next boot before
+returning success. It must finish within five seconds.
+
+PID 1 reboots through its normal shutdown path after a successful
+selection. A failed selector leaves PID 1 in rescue with the configured
+console policy. A pending operator shutdown takes precedence. Trial
+entries continue to use their own rollback policy.
+
 ## OpenRC-managed services
 
 On Alpine, add theseus.openrc=1 alongside theseus.pid1=1 to boot
