@@ -1,5 +1,6 @@
 require 'io'
 require 'string'
+require 'src.theseus.shutdown_policy'
 
 local GraphDiagnostic = @function(string): void
 local report_graph_error: GraphDiagnostic
@@ -19,6 +20,7 @@ local MAX_TARGETS: integer = 16
 local GraphService = @record{
   name: string,
   runtime_record: string,
+  stop_grace_ms: integer,
   requires: string,
   wants: string,
   after: string,
@@ -78,6 +80,9 @@ end
 
 local function parse_service(line: string): (boolean, GraphService)
   local service: GraphService
+  local ok: boolean
+  ok, service.stop_grace_ms, line = unwrap_stop_grace(line, 'TSC9\t')
+  if not ok then return false, service end
   local cursor: isize = 1
   local field: string
   field, cursor = next_field(line, cursor)
@@ -100,6 +105,9 @@ local function parse_service(line: string): (boolean, GraphService)
     if cursor == 0 then return false, service end
   end
   service.runtime_record = runtime_magic .. '\t' .. string.sub(line, payload_start, cursor - 2)
+  if service.stop_grace_ms ~= NativeDefaultStopGraceMs then
+    service.runtime_record = 'TSC8\t' .. tostring(service.stop_grace_ms) .. '\t' .. service.runtime_record
+  end
 
   service.requires, cursor = next_field(line, cursor)
   if cursor == 0 then return false, service end
@@ -149,7 +157,7 @@ global function load_native_graph(path: string, graph: *NativeGraph): boolean
   for line in file:lines() do
     if #line > 0 then
       local prefix = string.sub(line, 1, 5)
-      if prefix == 'TSC3\t' or prefix == 'TSC5\t' or prefix == 'TSC7\t' then
+      if prefix == 'TSC3\t' or prefix == 'TSC5\t' or prefix == 'TSC7\t' or prefix == 'TSC9\t' then
         if graph.service_count >= NativeMaxServices then
           diagnose('theseus-graph: service bound exceeded\n')
           file:close()
@@ -283,13 +291,20 @@ global function plan_native_target(graph: *NativeGraph, target_name: string, res
   local indegree: [NativeMaxServices]integer
   local emitted: [NativeMaxServices]boolean
   local selected_count: integer = 0
+  local stop_budget: integer = 0
   for b: integer = 0, graph.service_count - 1 do
     if selected[b] then
       selected_count = selected_count + 1
+      stop_budget = stop_budget + graph.services[b].stop_grace_ms + 3 * NativeStopCleanupStepMs
       for a: integer = 0, graph.service_count - 1 do
         if selected[a] and precedes(graph, a, b) then indegree[b] = indegree[b] + 1 end
       end
     end
+  end
+
+  if stop_budget > NativeTargetStopBudgetMs then
+    diagnose('theseus-graph: shutdown budget exceeded for target: ' .. target_name .. '\n')
+    return 65
   end
 
   for position: integer = 1, selected_count do

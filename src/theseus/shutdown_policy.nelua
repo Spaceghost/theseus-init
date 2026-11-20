@@ -1,0 +1,25 @@
+require 'string'
+
+global NativeDefaultStopGraceMs <comptime> = 1000
+global NativeMaxStopGraceMs <comptime> = 60000
+-- Probe reap, forced leader reap, and the cgroup drain each get this long.
+global NativeStopCleanupStepMs <comptime> = 1000
+global NativeTargetStopBudgetMs <comptime> = 128000
+-- Allow time for the worker's final reaping, log and control cleanup.
+global NativeWorkerShutdownMs <comptime> = NativeTargetStopBudgetMs + 7000
+
+global function unwrap_stop_grace(line: string, prefix: string): (boolean, integer, string)
+  if string.sub(line, 1, #prefix) ~= prefix then return true, NativeDefaultStopGraceMs, line end
+  local start = #prefix + 1
+  local separator = string.find(line, '\t', start, true)
+  if separator <= start or separator == #line then return false, 0, '' end
+  local grace: integer = 0
+  for i: isize = start, separator - 1 do
+    local byte = string.byte(line, i)
+    if byte < 48 or byte > 57 then return false, 0, '' end
+    grace = grace * 10 + byte - 48
+    if grace > NativeMaxStopGraceMs then return false, 0, '' end
+  end
+  if grace == 0 then return false, 0, '' end
+  return true, grace, string.sub(line, separator + 1)
+end

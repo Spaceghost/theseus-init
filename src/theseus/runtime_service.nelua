@@ -11,6 +11,7 @@ global RuntimeService = @record{
   argv_serialized: string,
   restart: RestartPolicy,
   max_restarts: integer,
+  stop_grace_ms: integer,
   readiness: ReadinessKind,
   readiness_options: ReadinessOptions,
 }
@@ -46,6 +47,9 @@ end
 
 global function parse_runtime_service(line: string): (boolean, RuntimeService)
   local service: RuntimeService
+  local grace_ok: boolean
+  grace_ok, service.stop_grace_ms, line = unwrap_stop_grace(line, 'TSC8\t')
+  if not grace_ok then return false, service end
   local cursor: isize = 1
   local magic: string
   magic, cursor = next_field(line, cursor)

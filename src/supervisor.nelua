@@ -673,10 +673,10 @@ end
 local function stop_leader(runtime: *Runtime): boolean
   if runtime.pidfd < 0 then return true end
   if not signal_child(runtime, SIGTERM) then return false end
-  local ready = wait_for_exit(runtime.pidfd, 1000)
+  local ready = wait_for_exit(runtime.pidfd, runtime.service.stop_grace_ms)
   if ready == 0 then
     if not signal_child(runtime, SIGKILL) then return false end
-    ready = wait_for_exit(runtime.pidfd, 1000)
+    ready = wait_for_exit(runtime.pidfd, NativeStopCleanupStepMs)
   end
   return ready > 0 and reap(runtime)
 end
@@ -686,7 +686,7 @@ local function drain_cgroup(runtime: *Runtime): boolean
   if state == CgroupState.Empty then return true end
   if state == CgroupState.Error or not cgroup_kill(&runtime.cgroup) then return false end
   daemon_log('TE1', 'ownership', runtime.service.name, runtime.attempts, 'draining')
-  local deadline = monotonic_ms() + 1000
+  local deadline = monotonic_ms() + NativeStopCleanupStepMs
   repeat
     state = cgroup_state(&runtime.cgroup)
     if state == CgroupState.Empty then
@@ -703,7 +703,7 @@ local function stop_probe(runtime: *Runtime): boolean
   if runtime.probe_fd < 0 then return true end
   if not cancel_probe(runtime, monotonic_ms()) then return false end
   local status: cint
-  return wait_for_exit(runtime.probe_fd, 1000) > 0 and reap_probe(runtime, &status)
+  return wait_for_exit(runtime.probe_fd, NativeStopCleanupStepMs) > 0 and reap_probe(runtime, &status)
 end
 
 local function stop_child(runtime: *Runtime): boolean

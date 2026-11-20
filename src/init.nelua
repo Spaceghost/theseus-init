@@ -7,6 +7,7 @@ require 'os'
 require 'string'
 require 'src.theseus.recovery'
 require 'src.theseus.install_paths'
+require 'src.theseus.shutdown_policy'
 
 local Sigset: type <cimport 'sigset_t', nodecl, cinclude '<signal.h>'> = @record{}
 local Statfs: type <cimport 'struct statfs', nodecl, cinclude '<sys/statfs.h>'> = @record{f_type: clong}
@@ -103,8 +104,6 @@ local ClearBootGuard: cstring = '/usr/libexec/theseus/boot-guard-clear'
 -- The recovery selector must persist the boot choice before PID 1 reboots.
 local FallbackGrace <comptime> = 30000
 local ClearGuardGrace <comptime> = 5000
--- 32 services each get up to four seconds for probe, leader, and cgroup cleanup.
-local WorkerGrace <comptime> = 135000
 local OpenRCGrace <comptime> = 120000
 local RecoveryGrace <comptime> = 4000
 local RecoveryStartup <comptime> = 120
@@ -698,7 +697,7 @@ local function run()
     if pending == Action.None then ok, action = notification(fd, timeout, -1) end
     pending = Action.None
     reap(&session)
-    local worker_grace = WorkerGrace
+    local worker_grace = NativeWorkerShutdownMs
     if recovery.phase == RecoveryPhase.Stopping or recovery.phase == RecoveryPhase.Killing then
       worker_grace = RecoveryGrace
     end

@@ -27,6 +27,7 @@ import (
 
   restart: *"on-failure" | #RestartPolicy
   maxRestarts: *5 | int & >=0 & <=1000000
+  stopGraceMs: *1000 | int & >=1 & <=60000
 
   readiness: *{
     kind: "none"
@@ -44,20 +45,27 @@ import (
 // The runtime record stays deliberately narrow. It is compiled by CUE and
 // parsed by Nelua before any process effects. argv uses ASCII Unit Separator.
 #CompiledService: {
+  _record: string
   service: #Service
   let argvSeparator = "\u001f"
   let fields = "\(service.name)\t\(strings.Join(service.exec, argvSeparator))\t\(service.restart)\t\(service.maxRestarts)\t\(service.readiness.kind)"
   if service.readiness.kind == "unix-socket" {
     let socketFields = "\(fields)\t\(service.readiness.path)\t\(service.readiness.timeoutMs)"
     if service.readiness.probe == null {
-      compiled: "TSC4\t\(socketFields)"
+      _record: "TSC4\t\(socketFields)"
     }
     if service.readiness.probe != null {
       let probe = service.readiness.probe
-      compiled: "TSC6\t\(socketFields)\t\(strings.Join(probe.exec, argvSeparator))\t\(probe.intervalMs)\t\(probe.timeoutMs)"
+      _record: "TSC6\t\(socketFields)\t\(strings.Join(probe.exec, argvSeparator))\t\(probe.intervalMs)\t\(probe.timeoutMs)"
     }
   }
   if service.readiness.kind != "unix-socket" {
-    compiled: "TSC2\t\(fields)"
+    _record: "TSC2\t\(fields)"
+  }
+  if service.stopGraceMs == 1000 {
+    compiled: _record
+  }
+  if service.stopGraceMs != 1000 {
+    compiled: "TSC8\t\(service.stopGraceMs)\t\(_record)"
   }
 }

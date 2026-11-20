@@ -8,6 +8,7 @@ require 'io'
 require 'os'
 require 'string'
 require 'src.theseus.readiness'
+require 'src.theseus.shutdown_policy'
 require 'src.theseus.openrc'
 
 -- Linux/POSIX boundary. These are declarations in maintained Nelua, not
@@ -70,6 +71,7 @@ local Service = @record{
   state: ServiceState,
   restart: RestartPolicy,
   max_restarts: integer,
+  stop_grace_ms: integer,
   readiness: ReadinessKind,
   readiness_options: ReadinessOptions,
 }
@@ -206,6 +208,9 @@ end
 
 local function parse_service_record(line: string): (boolean, Service)
   local service: Service
+  local grace_ok: boolean
+  grace_ok, service.stop_grace_ms, line = unwrap_stop_grace(line, 'TSC8\t')
+  if not grace_ok then return false, service end
   local cursor: isize = 1
   local magic: string
   magic, cursor = next_field(line, cursor)
