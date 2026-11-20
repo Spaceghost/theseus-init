@@ -101,6 +101,9 @@ local Rescue: cstring = '/bin/sh'
 -- 32 services each get up to four seconds for probe, leader, and cgroup cleanup.
 local WorkerGrace <comptime> = 135000
 local OpenRCGrace <comptime> = 120000
+local RecoveryGrace <comptime> = 4000
+local RecoveryStartup <comptime> = 120
+local RecoveryLimit <comptime> = 3
 
 local Action = @enum{None = 0, Poweroff, Reboot, Halt}
 local Session = @record{
@@ -110,6 +113,17 @@ local Session = @record{
   openrc: cint,
   openrc_failed: boolean,
   openrc_started: boolean,
+}
+local WorkerMonitor = @record{
+  reader: cint,
+  ready: boolean,
+  deadline: integer,
+}
+local RecoveryPhase = @enum{Idle = 0, Stopping, Killing, Backoff}
+local WorkerRecovery = @record{
+  phase: RecoveryPhase,
+  deadline: integer,
+  attempts: integer,
 }
 local console: cint = -1
 local watchdog: cint = -1
@@ -155,9 +169,9 @@ local function parse_seconds(value: string, minimum: integer): integer
   return -1
 end
 
-local function command_line(): (boolean, boolean, boolean, boolean, boolean, integer, boolean, integer)
+local function command_line(): (boolean, boolean, boolean, boolean, boolean, integer, boolean, integer, integer)
   local file = io.open('/proc/cmdline', 'r')
-  if not file:isopen() then return false, false, false, true, false, 0, false, 0 end
+  if not file:isopen() then return false, false, false, true, false, 0, false, 0, 0 end
   local line = file:read('*a')
   file:close()
   local enabled, rescue, openrc, rescue_disabled, trial: boolean, boolean, boolean, boolean, boolean
@@ -166,6 +180,8 @@ local function command_line(): (boolean, boolean, boolean, boolean, boolean, int
   local heartbeat_seconds: integer = 0
   local timeout_prefix = 'theseus.trial_timeout='
   local heartbeat_prefix = 'theseus.trial_heartbeat_timeout='
+  local recovery_prefix = 'theseus.supervisor_recovery_timeout='
+  local recovery_seconds: integer = 0
   for option in string.gmatch(line, '%S+') do
     if option == 'theseus.pid1=1' then enabled = true end
     if option == 'theseus.rescue=1' then rescue = true end
@@ -177,9 +193,11 @@ local function command_line(): (boolean, boolean, boolean, boolean, boolean, int
       trial_seconds = parse_seconds(string.sub(option, #timeout_prefix + 1), 1)
     elseif string.sub(option, 1, #heartbeat_prefix) == heartbeat_prefix then
       heartbeat_seconds = parse_seconds(string.sub(option, #heartbeat_prefix + 1), 3)
+    elseif string.sub(option, 1, #recovery_prefix) == recovery_prefix then
+      recovery_seconds = parse_seconds(string.sub(option, #recovery_prefix + 1), 3)
     end
   end
-  return enabled, rescue, openrc, rescue_disabled, trial and enabled and not rescue, trial_seconds, trial_watchdog, heartbeat_seconds
+  return enabled, rescue, openrc, rescue_disabled, trial and enabled and not rescue, trial_seconds, trial_watchdog, heartbeat_seconds, recovery_seconds
 end
 
 local function provision_run(): boolean
@@ -300,6 +318,56 @@ local function launch(rescue: boolean, ready_writer: cint, heartbeat: boolean): 
   return -1
 end
 
+local function close_monitor(monitor: *WorkerMonitor)
+  if monitor.reader >= 0 then c_close(monitor.reader) end
+  monitor.reader = -1
+  monitor.ready = false
+  monitor.deadline = 0
+end
+
+local function start_worker(session: *Session, monitor: *WorkerMonitor,
+                            startup: integer, heartbeat: integer): string
+  local channel: [2]cint = {-1, -1}
+  if (startup > 0 or heartbeat > 0) and c_pipe2(&channel[0], O_CLOEXEC | O_NONBLOCK) ~= 0 then
+    return 'trial-ready-pipe'
+  end
+  monitor.reader = channel[0]
+  if startup > 0 then monitor.deadline = now_ms() + startup * 1000 end
+  session.worker = launch(false, channel[1], heartbeat > 0)
+  if channel[1] >= 0 then c_close(channel[1]) end
+  if session.worker <= 0 then
+    close_monitor(monitor)
+    return 'supervisor-fork'
+  end
+  report('supervisor-start\t' .. tostring(session.worker))
+  return ''
+end
+
+local function worker_failure(monitor: *WorkerMonitor, heartbeat: integer, trial: boolean): string
+  if monitor.reader < 0 then return '' end
+  local markers: [64]byte
+  local count = c_read(monitor.reader, &markers[0], #markers)
+  local read_error = errno
+  local now = now_ms()
+  for i = 0, count - 1 do
+    if not monitor.ready and markers[i] == 82 then -- R
+      if trial then report('trial-ready') else report('supervisor-ready') end
+      if heartbeat == 0 then close_monitor(monitor); return '' end
+      monitor.ready = true
+      monitor.deadline = now + heartbeat * 1000
+    elseif monitor.ready and markers[i] == 72 then -- H
+      monitor.deadline = now + heartbeat * 1000
+    end
+  end
+  if heartbeat > 0 and count == 0 then return 'supervisor-heartbeat-closed' end
+  if count < 0 and read_error ~= EAGAIN and read_error ~= EINTR then return 'supervisor-trial-channel' end
+  if monitor.deadline > 0 and now >= monitor.deadline then
+    if monitor.ready then return 'supervisor-heartbeat-timeout' end
+    return 'supervisor-startup-timeout'
+  end
+  return ''
+end
+
 local function reclaim(): boolean
   local root = cgroup_open_root(Delegation)
   if root < 0 then return false end
@@ -307,6 +375,32 @@ local function reclaim(): boolean
   local instance: RecoverableInstance = {dir = -1, scope = -1}
   defer recovery_close(&instance) end
   return recovery_reclaim(&instance, TheseusControlSocket, TheseusRuntimeDir, root) == 0
+end
+
+local function recover_worker(session: *Session, monitor: *WorkerMonitor,
+                              recovery: *WorkerRecovery, heartbeat: integer): string
+  local now = now_ms()
+  if recovery.phase == RecoveryPhase.Backoff then
+    if now < recovery.deadline then return '' end
+    recovery.phase = RecoveryPhase.Idle
+    return start_worker(session, monitor, RecoveryStartup, heartbeat)
+  end
+  if session.worker == 0 then
+    if not reclaim() then return 'supervisor-reclaim-failed' end
+    if recovery.attempts >= RecoveryLimit then return 'supervisor-restart-limit' end
+    local delay = 1 << recovery.attempts
+    recovery.attempts = recovery.attempts + 1
+    recovery.deadline = now_ms() + delay * 1000
+    recovery.phase = RecoveryPhase.Backoff
+    report('supervisor-restart-scheduled\t' .. tostring(recovery.attempts) .. '\t' .. tostring(delay))
+  elseif now >= recovery.deadline then
+    if recovery.phase == RecoveryPhase.Killing then return 'supervisor-unreaped' end
+    report('supervisor-timeout')
+    c_kill(session.worker, SIGKILL)
+    recovery.phase = RecoveryPhase.Killing
+    recovery.deadline = now + 1000
+  end
+  return ''
 end
 
 -- Return whether any child may remain. Batching avoids starving the signal queue.
@@ -494,8 +588,9 @@ local function run()
   local trial_watchdog = false
   local trial_seconds: integer = 0
   local heartbeat_seconds: integer = 0
+  local recovery_seconds: integer = 0
   if mount_type('proc', '/proc', MS_NOSUID | MS_NODEV | MS_NOEXEC, PROC_SUPER_MAGIC) then
-    boot, preferred_rescue, openrc, rescue_disabled, trial, trial_seconds, trial_watchdog, heartbeat_seconds = command_line()
+    boot, preferred_rescue, openrc, rescue_disabled, trial, trial_seconds, trial_watchdog, heartbeat_seconds, recovery_seconds = command_line()
   end
   if rescue_disabled then report('rescue-console\tdisabled') end
   c_setenv('PATH', '/usr/sbin:/usr/bin:/sbin:/bin', 1)
@@ -504,9 +599,12 @@ local function run()
   local session: Session
   local reason: string
   local pending = Action.None
-  local ready_reader: cint = -1
-  local trial_ready = false
-  local trial_deadline: integer = 0
+  local monitor: WorkerMonitor = {reader = -1}
+  local recovery: WorkerRecovery
+  local recovery_enabled = not trial and recovery_seconds > 0
+  local startup, heartbeat: integer, integer
+  if trial then startup, heartbeat = trial_seconds, heartbeat_seconds end
+  if recovery_enabled then startup, heartbeat = RecoveryStartup, recovery_seconds end
   if fd < 0 then
     reason = 'signal-queue'
   elseif not boot then
@@ -517,6 +615,8 @@ local function run()
     reason = 'trial-timeout-config'
   elseif trial and heartbeat_seconds < 0 then
     reason = 'trial-heartbeat-config'
+  elseif not trial and recovery_seconds < 0 then
+    reason = 'supervisor-recovery-config'
   elseif not select_bundle() then
     reason = 'release-path'
   elseif not provision_run() then
@@ -536,26 +636,13 @@ local function run()
       if not provision(openrc) then
         reason = 'boot-filesystems'
       else
-        local ready: [2]cint = {-1, -1}
-        local heartbeat = trial and heartbeat_seconds > 0
-        if trial and (trial_seconds > 0 or heartbeat) and c_pipe2(&ready[0], O_CLOEXEC | O_NONBLOCK) ~= 0 then
-          reason = 'trial-ready-pipe'
-        else
-          if ready[0] >= 0 then
-            ready_reader = ready[0]
-            if trial_seconds > 0 then trial_deadline = now_ms() + trial_seconds * 1000 end
-          end
-          session.worker = launch(false, ready[1], heartbeat)
-          if ready[1] >= 0 then c_close(ready[1]) end
-          if session.worker <= 0 then reason = 'supervisor-fork' end
-        end
+        reason = start_worker(&session, &monitor, startup, heartbeat)
       end
     end
   end
   local had_worker = session.worker > 0
   local in_rescue = not had_worker
-  if had_worker then report('supervisor-start\t' .. tostring(session.worker))
-  else report('rescue\t' .. reason) end
+  if in_rescue then report('rescue\t' .. reason) end
   while true do
     local timeout: cint = 100
     if fd < 0 then timeout = 1000 end
@@ -563,44 +650,31 @@ local function run()
     if pending == Action.None then ok, action = notification(fd, timeout, -1) end
     pending = Action.None
     reap(&session)
-    if action == Action.None and not in_rescue and session.worker == 0 then
-      if not trial and not reclaim() then report('supervisor-reclaim-failed') end
-      in_rescue = true
-      reason = 'supervisor'
-      report('rescue\t' .. reason)
+    local worker_grace = WorkerGrace
+    if recovery.phase == RecoveryPhase.Stopping or recovery.phase == RecoveryPhase.Killing then
+      worker_grace = RecoveryGrace
     end
-    local worker_grace: integer = WorkerGrace
-    if action == Action.None and trial and not in_rescue and ready_reader >= 0 then
-      local markers: [64]byte
-      local count = c_read(ready_reader, &markers[0], #markers)
-      local read_error = errno
-      local now = now_ms()
-      for i = 0, count - 1 do
-        if not trial_ready and markers[i] == 82 then -- R
-          trial_ready = true
-          trial_deadline = now + heartbeat_seconds * 1000
-          report('trial-ready')
-          if heartbeat_seconds == 0 then
-            c_close(ready_reader)
-            ready_reader = -1
-            trial_deadline = 0
-            break
-          end
-        elseif trial_ready and markers[i] == 72 then -- H
-          trial_deadline = now + heartbeat_seconds * 1000
+    if action == Action.None and not in_rescue then
+      if recovery.phase ~= RecoveryPhase.Idle then
+        reason = recover_worker(&session, &monitor, &recovery, heartbeat)
+      else
+        if session.worker == 0 then reason = 'supervisor'
+        else reason = worker_failure(&monitor, heartbeat, trial) end
+        if #reason > 0 and recovery_enabled then
+          report('supervisor-recovery\t' .. reason)
+          close_monitor(&monitor)
+          if session.worker > 0 then c_kill(session.worker, SIGTERM) end
+          recovery.phase = RecoveryPhase.Stopping
+          recovery.deadline = now_ms() + RecoveryGrace
+          reason = ''
+        elseif #reason > 0 and not trial and not reclaim() then
+          report('supervisor-reclaim-failed')
         end
-      end
-      if heartbeat_seconds > 0 and count == 0 then
-        reason = 'supervisor-heartbeat-closed'
-      elseif count < 0 and read_error ~= EAGAIN and read_error ~= EINTR then
-        reason = 'supervisor-trial-channel'
-      elseif trial_deadline > 0 and now >= trial_deadline then
-        if trial_ready then reason = 'supervisor-heartbeat-timeout'
-        else reason = 'supervisor-startup-timeout' end
       end
       if #reason > 0 then
         in_rescue = true
-        worker_grace = 4000
+        if session.worker > 0 then worker_grace = RecoveryGrace end
+        report('rescue\t' .. reason)
       end
     end
     if action == Action.None and trial and in_rescue then
@@ -611,7 +685,7 @@ local function run()
       -- If reboot returns, stay in rescue instead of retrying the action.
       trial = false
       shutdown(fd, &session, action, had_worker, worker_grace)
-      if ready_reader >= 0 then c_close(ready_reader); ready_reader = -1 end
+      close_monitor(&monitor)
       in_rescue = true
       report('rescue\tshutdown-failed')
     elseif fd < 0 or not ok then

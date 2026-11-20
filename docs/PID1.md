@@ -85,6 +85,23 @@ filesystem sync. On halt or poweroff, PID 1 attempts to disable it
 and reports failure if the device cannot stop. Qualify the device's
 reset and poweroff behavior before enabling it on hardware.
 
+## Recover the supervisor on an installed system
+
+Add `theseus.supervisor_recovery_timeout=SECONDS` from 3 to 3600 to
+a normal boot entry with matching PID 1 and supervisor binaries.
+The native target has two minutes to reach readiness. After readiness,
+the supervisor reports progress from its event loop once a second.
+If it exits or stops reporting, PID 1 allows up to four seconds for
+shutdown before sending SIGKILL. It waits for the worker to exit and
+reclaims its recorded cgroup and control socket before starting a
+replacement. OpenRC stays running.
+
+The first three replacement attempts in a boot wait one, two, then
+four seconds. PID 1 enters rescue if it cannot reap the old worker or
+reclaim its ownership, or if the budget is exhausted. An operator
+poweroff or reboot takes precedence over a pending restart. One-boot
+entries use their existing trial failure policy.
+
 ## OpenRC-managed services
 
 On Alpine, add theseus.openrc=1 alongside theseus.pid1=1 to boot
