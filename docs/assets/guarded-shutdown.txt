@@ -1,0 +1,44 @@
+Cascadia x86-64, signed Theseus and Nebox APKs, 12-second i6300esb watchdog.
+Each scenario uses a separate overlay and authenticated serial console.
+
+r13 KVM, failure
+TI1	openrc-exit	23	0
+TI1	openrc-shutdown-failed
+TI1	boot-guard-retained	shutdown-incomplete
+reboot: Restarting system
+
+r13 KVM, healthy
+CHECK slow OpenRC shutdown began
+CHECK slow OpenRC shutdown finished
+TI1	boot-guard-cleared
+reboot: Restarting system
+
+r13 KVM, freeze
+GUARD_TEST_PID1_FROZEN
+CHECK expected guarded boot preserved data
+QMP WATCHDOG action=reset
+
+r13 TCG, failure
+TI1	openrc-exit	23	0
+TI1	openrc-shutdown-failed
+TI1	boot-guard-retained	shutdown-incomplete
+reboot: Restarting system
+
+r13 TCG, healthy
+CHECK slow OpenRC shutdown began
+CHECK slow OpenRC shutdown finished
+TI1	boot-guard-cleared
+reboot: Restarting system
+
+r13 TCG, freeze
+GUARD_TEST_PID1_FROZEN
+CHECK expected guarded boot preserved data
+QMP WATCHDOG action=reset
+
+r13 KVM, nonzero supervisor exit with successful ownership reclaim
+TI1	supervisor-exit	24	0
+TI1	boot-guard-retained	shutdown-incomplete
+
+r12 KVM baseline, failed OpenRC shutdown cleared the guard
+TI1	openrc-exit	23	0
+TI1	boot-guard-cleared

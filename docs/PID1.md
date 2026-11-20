@@ -141,7 +141,7 @@ also uses the software recovery selector.
 The guard remains armed across unexpected resets, even after target
 readiness. Recovery on a specific device still depends on qualifying
 its independent reset behavior. The guard ends at the final shutdown
-checkpoint.
+checkpoint. See the [guarded shutdown tests](assets/guarded-shutdown.txt).
 
 ## OpenRC-managed services
 
