@@ -107,6 +107,7 @@ local OpenRCGrace <comptime> = 120000
 local RecoveryGrace <comptime> = 4000
 local RecoveryStartup <comptime> = 120
 local RecoveryLimit <comptime> = 3
+local RecoveryStable <comptime> = 5 * 60 * 1000
 
 local Action = @enum{None = 0, Poweroff, Reboot, Halt}
 local Session = @record{
@@ -122,6 +123,7 @@ local Session = @record{
 local WorkerMonitor = @record{
   reader: cint,
   ready: boolean,
+  ready_since: integer,
   deadline: integer,
 }
 local RecoveryPhase = @enum{Idle = 0, Stopping, Killing, Backoff}
@@ -331,6 +333,7 @@ local function close_monitor(monitor: *WorkerMonitor)
   if monitor.reader >= 0 then c_close(monitor.reader) end
   monitor.reader = -1
   monitor.ready = false
+  monitor.ready_since = 0
   monitor.deadline = 0
 end
 
@@ -363,6 +366,7 @@ local function worker_failure(monitor: *WorkerMonitor, heartbeat: integer, trial
       if trial then report('trial-ready') else report('supervisor-ready') end
       if heartbeat == 0 then close_monitor(monitor); return '' end
       monitor.ready = true
+      monitor.ready_since = now
       monitor.deadline = now + heartbeat * 1000
     elseif monitor.ready and markers[i] == 72 then -- H
       monitor.deadline = now + heartbeat * 1000
@@ -707,6 +711,10 @@ local function run()
           reason = ''
         elseif #reason > 0 and not trial and not reclaim() then
           report('supervisor-reclaim-failed')
+        elseif #reason == 0 and recovery.attempts > 0 and monitor.ready and
+               now_ms() - monitor.ready_since >= RecoveryStable then
+          recovery.attempts = 0
+          report('supervisor-restart-budget-restored')
         end
       end
       if #reason > 0 then

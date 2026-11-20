@@ -96,11 +96,13 @@ shutdown before sending SIGKILL. It waits for the worker to exit and
 reclaims its recorded cgroup and control socket before starting a
 replacement. OpenRC stays running.
 
-The first three replacement attempts in a boot wait one, two, then
-four seconds. PID 1 enters rescue if it cannot reap the old worker or
-reclaim its ownership, or if the budget is exhausted. An operator
-poweroff or reboot takes precedence over a pending restart. One-boot
-entries use their existing trial failure policy.
+Three consecutive replacement attempts wait one, two, then four seconds.
+A replacement restores the full restart budget after five minutes of
+readiness with continuing heartbeats. PID 1 enters rescue if it cannot
+reap the old worker or reclaim its ownership, or if another failure
+exhausts the budget before the healthy interval. An operator poweroff or
+reboot takes precedence over a pending restart. One-boot entries use
+their existing trial failure policy.
 
 ### Select a recovery boot after native recovery fails
 
