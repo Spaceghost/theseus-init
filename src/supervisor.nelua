@@ -54,7 +54,8 @@ local function c_clock_gettime(clock: cint, value: *Timespec): cint <cimport 'cl
 
 local Pollfd = @record{fd: cint, events: cshort, revents: cshort}
 local MaxClients <comptime> = 8
-local ControlSlots = @[MaxClients]Pollfd
+local FirstClient <comptime> = 4
+local PollSlots = @[FirstClient + MaxClients + 3 * NativeMaxServices]Pollfd
 local function c_poll(fds: *Pollfd, count: culong, timeout_ms: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
 
 local Credentials: type <cimport 'struct ucred', nodecl, cinclude '<sys/socket.h>'> = @record{
@@ -172,10 +173,10 @@ local function load_service(path: string, wanted: string): (boolean, RuntimeServ
 end
 
 -- Preserve service descriptor allocations when incomplete clients fill the table.
-local function discard_pending_client(clients: *ControlSlots): boolean
+local function discard_pending_client(clients: *PollSlots): boolean
   if clients == nilptr then return false end
   for i: integer = 0, MaxClients - 1 do
-    local event = &clients[i]
+    local event = &clients[FirstClient + i]
     if event.fd >= 0 and event.revents == 0 then
       c_close(event.fd)
       event.fd = -1
@@ -185,7 +186,7 @@ local function discard_pending_client(clients: *ControlSlots): boolean
   return false
 end
 
-local function pidfd_open_for(pid: cint, clients: *ControlSlots): cint
+local function pidfd_open_for(pid: cint, clients: *PollSlots): cint
   while true do
     local fd = (@cint)(c_syscall2(SYS_pidfd_open, (@clong)(pid), 0))
     if fd >= 0 or errno ~= EMFILE or not discard_pending_client(clients) then return fd end
@@ -249,7 +250,7 @@ local function wait_for_child(pid: cint, status: *cint): boolean
   return waited == pid
 end
 
-local function spawn(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset, clients: *ControlSlots): boolean
+local function spawn(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset, clients: *PollSlots): boolean
   runtime.attempts = runtime.attempts + 1
   transition(runtime, ServiceState.Starting, 'start')
   local handshake: [2]cint
@@ -418,7 +419,7 @@ local function fill_address(address: *SockaddrUn, path: string)
   for i: isize = 1, #path do address.sun_path[i - 1] = (@cchar)(string.byte(path, i)) end
 end
 
-local function peer_pidfd(socket: cint, clients: *ControlSlots): cint
+local function peer_pidfd(socket: cint, clients: *PollSlots): cint
   local fd: cint = -1
   local size = (@cuint)(#cint)
   while c_getsockopt(socket, SOL_SOCKET, PeerPidfdOption, &fd, &size) ~= 0 do
@@ -439,7 +440,7 @@ local function peer_pidfd_available(): boolean
   return true
 end
 
-local function has_ready_peer(runtime: *Runtime, clients: *ControlSlots): boolean
+local function has_ready_peer(runtime: *Runtime, clients: *PollSlots): boolean
   local probe = c_socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)
   while probe < 0 do
     if errno ~= EMFILE or not discard_pending_client(clients) then return false end
@@ -479,7 +480,7 @@ local function mark_ready(runtime: *Runtime)
   runtime.action_at = 0
 end
 
-local function start_probe(runtime: *Runtime, child_mask: *Sigset, now: integer, clients: *ControlSlots): boolean
+local function start_probe(runtime: *Runtime, child_mask: *Sigset, now: integer, clients: *PollSlots): boolean
   local pid = c_fork()
   if pid == 0 then
     if not cgroup_enter(&runtime.cgroup) or
@@ -512,7 +513,7 @@ local function reap_probe(runtime: *Runtime, status: *cint): boolean
   return true
 end
 
-local function record_probe(runtime: *Runtime, clients: *ControlSlots): boolean
+local function record_probe(runtime: *Runtime, clients: *PollSlots): boolean
   local status: cint
   if not reap_probe(runtime, &status) then return false end
   if runtime.state ~= ServiceState.Starting then return true end
@@ -536,7 +537,7 @@ local function record_probe(runtime: *Runtime, clients: *ControlSlots): boolean
   return true
 end
 
-local function advance_service(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset, clients: *ControlSlots): boolean
+local function advance_service(runtime: *Runtime, argv: *ExecArgv, child_mask: *Sigset, clients: *PollSlots): boolean
   local now = monotonic_ms()
   if runtime.action_at == 0 or now < runtime.action_at then return true end
   if runtime.drain_by ~= 0 then
@@ -712,7 +713,7 @@ local function terminal(state: ServiceState): boolean
   return state == ServiceState.Failed or state == ServiceState.Stopped
 end
 
-local function advance_target(group: *Supervision, child_mask: *Sigset, clients: *ControlSlots): integer
+local function advance_target(group: *Supervision, child_mask: *Sigset, clients: *PollSlots): integer
   for i: integer = 0, group.count - 1 do
     local runtime = &group.runtimes[i]
     if group.required[i] then
@@ -789,7 +790,7 @@ local function reply_query(client: cint, request: string, group: *Supervision)
   write_all(client, 'TR1\tERROR\trequest\n')
 end
 
-local function reap_notified_child(group: *Supervision, pid: cint, clients: *ControlSlots): boolean
+local function reap_notified_child(group: *Supervision, pid: cint, clients: *PollSlots): boolean
   for i: integer = 0, group.count - 1 do
     local runtime = &group.runtimes[i]
     if runtime.pid == pid then
@@ -809,7 +810,7 @@ local function reap_notified_child(group: *Supervision, pid: cint, clients: *Con
   return true
 end
 
-local function reap_pending_children(group: *Supervision, clients: *ControlSlots): (boolean, boolean)
+local function reap_pending_children(group: *Supervision, clients: *PollSlots): (boolean, boolean)
   -- SIGCHLD can coalesce. Drain waitable children in batches so the
   -- control socket and startup deadlines also make progress under churn.
   for _: integer = 1, 64 do
@@ -830,11 +831,10 @@ end
 
 local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *Supervision,
                      child_mask: *Sigset): (integer, cint)
-  local fds: [4 + MaxClients + 3 * NativeMaxServices]Pollfd
-  local control = (@*ControlSlots)(&fds[4])
-  local active_fds: [4 + MaxClients + 3 * NativeMaxServices]Pollfd
+  local fds: PollSlots
+  local active_fds: PollSlots
   local active_slots: [4 + MaxClients + 3 * NativeMaxServices]integer
-  local first_child = 4 + MaxClients
+  local first_child = FirstClient + MaxClients
   local first_exec = first_child + group.count
   local first_probe = first_exec + group.count
   local count = first_probe + group.count
@@ -849,7 +849,7 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
   end
   local clients: [MaxClients]ControlClient
   for slot: integer = 0, MaxClients - 1 do
-    fds[slot + 4] = {fd = -1, events = POLLIN}
+    fds[FirstClient + slot] = {fd = -1, events = POLLIN}
   end
 
   local exit_code: integer = 0
@@ -870,7 +870,7 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
     local now = monotonic_ms()
     local free_slot: integer = -1
     for slot: integer = 0, MaxClients - 1 do
-      local event = &fds[slot + 4]
+      local event = &fds[FirstClient + slot]
       local expires = clients[slot].deadline
       if event.fd >= 0 and expires <= now then
         c_close(event.fd)
@@ -928,7 +928,7 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
           break
         end
         local probe_event = fds[first_probe + i].revents
-        if probe_event ~= 0 and ((probe_event & POLLIN) == 0 or not record_probe(runtime, control)) then
+        if probe_event ~= 0 and ((probe_event & POLLIN) == 0 or not record_probe(runtime, &fds)) then
           exit_code = 80
           break
         end
@@ -941,12 +941,12 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
       end
       if more_exits then
         local ok: boolean
-        ok, more_exits = reap_pending_children(group, control)
+        ok, more_exits = reap_pending_children(group, &fds)
         if not ok then exit_code = 80; break end
       end
 
       for slot: integer = 0, MaxClients - 1 do
-        local event = &fds[slot + 4]
+        local event = &fds[FirstClient + slot]
         if event.revents == 0 then continue end
         event.revents = 0
         local state, request = read_request(event.fd, &clients[slot])
@@ -967,21 +967,21 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
       if shutdown_client >= 0 then break end
 
       for i: integer = 0, group.count - 1 do
-        if not advance_service(&group.runtimes[i], &group.arguments[i], child_mask, control) then
+        if not advance_service(&group.runtimes[i], &group.arguments[i], child_mask, &fds) then
           exit_code = 80
           break
         end
       end
       if exit_code ~= 0 then break end
       if group.target then
-        exit_code = advance_target(group, child_mask, control)
+        exit_code = advance_target(group, child_mask, &fds)
         if exit_code ~= 0 then break end
       end
 
       if (fds[0].revents & POLLIN) ~= 0 then
         local fd = c_accept4(listener, nilptr, nilptr, SOCK_CLOEXEC | SOCK_NONBLOCK)
         if fd >= 0 then
-          fds[free_slot + 4].fd = fd
+          fds[FirstClient + free_slot].fd = fd
           clients[free_slot].used = 0
           clients[free_slot].deadline = monotonic_ms() + ControlTimeout
         elseif errno == EMFILE or errno == ENFILE then
@@ -993,7 +993,7 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
   end
 
   for slot: integer = 0, MaxClients - 1 do
-    local fd = fds[slot + 4].fd
+    local fd = fds[FirstClient + slot].fd
     if fd >= 0 then c_close(fd) end
   end
   return exit_code, shutdown_client
