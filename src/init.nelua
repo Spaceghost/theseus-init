@@ -124,6 +124,7 @@ local WorkerMonitor = @record{
   reader: cint,
   ready: boolean,
   ready_since: integer,
+  last_heartbeat: integer,
   deadline: integer,
 }
 local RecoveryPhase = @enum{Idle = 0, Stopping, Killing, Backoff}
@@ -334,6 +335,7 @@ local function close_monitor(monitor: *WorkerMonitor)
   monitor.reader = -1
   monitor.ready = false
   monitor.ready_since = 0
+  monitor.last_heartbeat = 0
   monitor.deadline = 0
 end
 
@@ -369,6 +371,7 @@ local function worker_failure(monitor: *WorkerMonitor, heartbeat: integer, trial
       monitor.ready_since = now
       monitor.deadline = now + heartbeat * 1000
     elseif monitor.ready and markers[i] == 72 then -- H
+      monitor.last_heartbeat = now
       monitor.deadline = now + heartbeat * 1000
     end
   end
@@ -712,7 +715,7 @@ local function run()
         elseif #reason > 0 and not trial and not reclaim() then
           report('supervisor-reclaim-failed')
         elseif #reason == 0 and recovery.attempts > 0 and monitor.ready and
-               now_ms() - monitor.ready_since >= RecoveryStable then
+               monitor.last_heartbeat - monitor.ready_since >= RecoveryStable then
           recovery.attempts = 0
           report('supervisor-restart-budget-restored')
         end
