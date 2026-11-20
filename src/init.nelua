@@ -22,6 +22,8 @@ local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unis
 local function c_readlink(path: cstring, data: pointer, size: csize): clong <cimport 'readlink', nodecl, cinclude '<unistd.h>'> end
 local function c_read(fd: cint, data: pointer, count: csize): clong <cimport 'read', nodecl, cinclude '<unistd.h>'> end
 local function c_write(fd: cint, data: pointer, count: csize): clong <cimport 'write', nodecl, cinclude '<unistd.h>'> end
+local function c_pipe2(fds: *cint, flags: cint): cint <cimport 'pipe2', nodecl, cinclude '<unistd.h>'> end
+local function c_fcntl(fd: cint, command: cint, value: cint): cint <cimport 'fcntl', nodecl, cinclude '<fcntl.h>'> end
 local function c_dup2(source: cint, dest: cint): cint <cimport 'dup2', nodecl, cinclude '<unistd.h>'> end
 local function c_setpgid(pid: cint, group: cint): cint <cimport 'setpgid', nodecl, cinclude '<unistd.h>'> end
 local function c_setsid(): cint <cimport 'setsid', nodecl, cinclude '<unistd.h>'> end
@@ -43,6 +45,8 @@ local function c_clock_gettime(clock: cint, now: *Timespec): cint <cimport 'cloc
 local function c_sync(): void <cimport 'sync', nodecl, cinclude '<unistd.h>'> end
 local function c_reboot(command: cint): cint <cimport 'reboot', nodecl, cinclude '<sys/reboot.h>'> end
 
+local F_SETFL: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local F_SETFD: cint <cimport, nodecl, cinclude '<fcntl.h>'>
 local O_CLOEXEC: cint <cimport, nodecl, cinclude '<fcntl.h>'>
 local O_NONBLOCK: cint <cimport, nodecl, cinclude '<fcntl.h>'>
 local O_NOCTTY: cint <cimport, nodecl, cinclude '<fcntl.h>'>
@@ -178,10 +182,22 @@ local function signal_queue(): cint
   return c_signalfd(-1, &set, SFD_CLOEXEC | SFD_NONBLOCK)
 end
 
-local function notification(fd: cint, timeout: cint): (boolean, Action)
-  local p: Pollfd = {fd = fd, events = POLLIN}
-  local ready = c_poll(&p, 1, timeout)
+-- OpenRC shutdown scripts can write normally even when the console is stuck.
+-- Drain at most one chunk per poll so noisy scripts cannot starve signals.
+local function relay_shutdown_output(fd: cint): boolean
+  local data: [4096]byte <noinit>
+  local size = c_read(fd, &data[0], #data)
+  if size <= 0 then return false end
+  if console >= 0 then c_write(console, &data[0], (@csize)(size)) end
+  return true
+end
+
+local function notification(fd: cint, timeout: cint, output: cint): (boolean, Action)
+  local events: [2]Pollfd = {{fd = fd, events = POLLIN}, {fd = output, events = POLLIN}}
+  local ready = c_poll(&events[0], 2, timeout)
   if ready <= 0 then return ready == 0 or errno == EINTR, Action.None end
+  if (events[1].revents & POLLIN) ~= 0 then relay_shutdown_output(output) end
+  if events[0].revents == 0 then return true, Action.None end
   -- The Linux signalfd record is 128 bytes and starts with a native uint32.
   local info: [32]uint32 <noinit>
   local size = #info * #uint32
@@ -285,18 +301,21 @@ local function await_cleanup(fd: cint, session: *Session, worker_only: boolean, 
     if left <= 0 then return false end
     local timeout = 50
     if left < timeout then timeout = left end
-    notification(fd, (@cint)(timeout))
+    notification(fd, (@cint)(timeout), -1)
   end
   return false
 end
 
-local function launch_openrc(level: cstring): cint
+local function launch_openrc(level: cstring, output: cint): cint
   local pid = c_fork()
   if pid > 0 then
     c_setpgid(pid, pid)
   elseif pid == 0 then
     if c_setpgid(0, 0) ~= 0 then c_exit(126) end
     unblock_signals()
+    -- A pipe endpoint may already occupy an inherited standard descriptor.
+    if output >= 0 and (c_dup2(output, 1) < 0 or c_dup2(output, 2) < 0 or
+       c_fcntl(1, F_SETFD, 0) < 0 or c_fcntl(2, F_SETFD, 0) < 0) then c_exit(126) end
     local argv: [3]cstring = {OpenRC, level, nilptr}
     c_execv(OpenRC, &argv[0])
     c_exit(127)
@@ -305,19 +324,40 @@ local function launch_openrc(level: cstring): cint
 end
 
 -- Keep PID 1 responsive while the distribution's runlevel program runs.
-local function openrc_phase(fd: cint, session: *Session, level: cstring, interruptible: boolean): (boolean, Action)
+local function openrc_phase(fd: cint, session: *Session, level: cstring, shutting_down: boolean): (boolean, Action)
   report('openrc-start\t' .. tostring(level))
-  session.openrc = launch_openrc(level)
+  local output: [2]cint = {-1, -1}
+  if shutting_down then
+    if c_pipe2(&output[0], O_CLOEXEC | O_NONBLOCK) ~= 0 then
+      report('openrc-output-pipe-failed')
+    elseif c_fcntl(output[1], F_SETFL, 0) ~= 0 then
+      c_close(output[0])
+      c_close(output[1])
+      output = {-1, -1}
+      report('openrc-output-pipe-failed')
+    end
+  end
+  -- Keep the parent writer open while polling so EOF cannot wake it repeatedly.
+  defer
+    if output[0] >= 0 then
+      c_close(output[1])
+      for _ = 1, 16 do
+        if not relay_shutdown_output(output[0]) then break end
+      end
+      c_close(output[0])
+    end
+  end
+  session.openrc = launch_openrc(level, output[1])
   if session.openrc <= 0 then return false, Action.None end
   local deadline = now_ms() + OpenRCGrace
   local action = Action.None
   local interrupted = false
   while session.openrc > 0 do
-    local ok, received = notification(fd, 100)
+    local ok, received = notification(fd, 100, output[0])
     -- A cancelled leader may already be waitable while its group remains
     -- alive. Keep its PID reserved until the final signal to the group.
     if not interrupted then reap(session) end
-    if interruptible and action == Action.None and received ~= Action.None then action = received end
+    if not shutting_down and action == Action.None and received ~= Action.None then action = received end
     if session.openrc <= 0 then break end
     local now = now_ms()
     if not interrupted and (now >= deadline or action ~= Action.None or not ok) then
@@ -329,7 +369,7 @@ local function openrc_phase(fd: cint, session: *Session, level: cstring, interru
       if c_kill(-session.openrc, SIGKILL) ~= 0 then c_kill(session.openrc, SIGKILL) end
       -- Poll one final bounded interval for the phase leader to exit.
       for _ = 1, 10 do
-        notification(fd, 100)
+        notification(fd, 100, -1)
         reap(session)
         if session.openrc <= 0 then break end
       end
@@ -343,7 +383,7 @@ local function boot_openrc(fd: cint, session: *Session): (boolean, Action)
   session.openrc_started = true
   local levels: [3]cstring = {'sysinit', 'boot', 'default'}
   for i = 0, 2 do
-    local ok, action = openrc_phase(fd, session, levels[i], true)
+    local ok, action = openrc_phase(fd, session, levels[i], false)
     if not ok or action ~= Action.None then return false, action end
   end
   return true, Action.None
@@ -372,7 +412,7 @@ local function shutdown(fd: cint, session: *Session, action: Action, had_worker:
   -- Keep compatibility services available until native clients have stopped.
   if session.openrc_started then
     if session.openrc > 0 then report('openrc-phase-still-running')
-    elseif not openrc_phase(fd, session, 'shutdown', false) then report('openrc-shutdown-failed') end
+    elseif not openrc_phase(fd, session, 'shutdown', true) then report('openrc-shutdown-failed') end
     session.openrc_started = false
   end
   -- Sweep children and session processes outside the managed cgroups last.
@@ -437,7 +477,7 @@ local function run()
     local timeout: cint = 100
     if fd < 0 then timeout = 1000 end
     local ok, action = true, pending
-    if pending == Action.None then ok, action = notification(fd, timeout) end
+    if pending == Action.None then ok, action = notification(fd, timeout, -1) end
     pending = Action.None
     reap(&session)
     if action ~= Action.None then

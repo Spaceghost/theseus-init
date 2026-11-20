@@ -60,7 +60,10 @@ request can interrupt a boot runlevel. PID 1 sends SIGTERM to the
 active process group and gives it two seconds before sending
 SIGKILL, even if the leader exits during that interval. PID 1
 retains the leader's PID until the final group signal. A runlevel
-failure or timeout is reported on the console.
+failure or timeout is reported on the console. During OpenRC shutdown,
+PID 1 forwards script output to the console on a best-effort basis.
+If the console stalls, PID 1 discards output that cannot be written
+immediately so that the scripts can continue.
 
 ## VM checks
 
