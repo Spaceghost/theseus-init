@@ -78,3 +78,12 @@ NETWORK_PID1_SERVICES_AVAILABLE_AT_NATIVE_SHUTDOWN second
 TI1	openrc-start	shutdown
 TI1	shutdown-ready
 reboot: Power down
+
+Theseus r11 PID 1 with Nebox /bin/sh (TCG, shutdown limit)
+NETWORK_PID1_WORKLOADS_READY first
+TI1	shutdown	reboot
+TE1	state	network-client	1	RUNNING	STOPPING	shutdown
+TE1	service	network-client	1	exited	-1	9
+TI1	openrc-start	shutdown
+TI1	shutdown-ready
+reboot: Restarting system

@@ -84,7 +84,10 @@ at startup and again in the native client's shutdown handler. After
 the first reboot, the native client read the checkpoint it had written
 during shutdown. The second boot powered down cleanly. All nine
 installed service scripts matched the original Alpine APKs byte for
-byte. See the [serial results](assets/openrc-nebox-corpus.txt).
+byte. A separate Theseus PID 1 run under TCG reached all nine workloads,
+then the supervisor sent SIGKILL when the native client's shutdown
+handler exceeded the one-second SIGTERM grace. OpenRC shutdown still
+completed. See the [serial results](assets/openrc-nebox-corpus.txt).
 
 ## Reproduce the comparison
 
