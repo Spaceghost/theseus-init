@@ -325,6 +325,9 @@ local function record_exec(runtime: *Runtime): boolean
       return false
     end
     daemon_log('TE1', 'service', runtime.service.name, runtime.attempts, 'exec-failed')
+  elseif monotonic_ms() >= runtime.ready_by then
+    -- Leave the service in STARTING so the overdue timer stops the child.
+    return true
   elseif runtime.service.readiness == ReadinessKind.UnixSocket then
     runtime.action_at = monotonic_ms()
   else

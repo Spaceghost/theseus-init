@@ -155,9 +155,11 @@ daemon shuts down the target and exits 82. A dependency's restart
 backoff after startup leaves existing services running.
 
 A close-on-exec handshake keeps newly forked children in `STARTING`
-until exec succeeds or reports failure. Services with socket readiness
-then wait for their listener. Services configured as `none` or `pid`
-need no application probe after exec.
+until exec succeeds or reports failure. The daemon must observe a
+successful handshake before the startup deadline. Services configured
+as `none` or `pid` have 30 seconds and need no application probe after
+exec. Services with socket readiness use their configured deadline for
+both the handshake and listener checks.
 
 Use the live `the state of SERVICE` against the target's control socket
 to inspect any selected service. `theseus daemon-stop` stops and reaps
