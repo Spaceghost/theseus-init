@@ -351,7 +351,7 @@ local function openrc_phase(fd: cint, session: *Session, level: cstring, shutdow
     end
   end
   -- OpenRC maps reboot onto shutdown and sets RC_REBOOT for its scripts.
-  local argument = level
+  local argument: cstring = level
   if shutdown_action == Action.Reboot then argument = 'reboot' end
   session.openrc = launch_openrc(argument, output[1])
   if session.openrc <= 0 then return false, Action.None end
