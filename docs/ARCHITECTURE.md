@@ -78,7 +78,9 @@ Set `THESEUS_SOCKET` to an absolute path in a directory controlled by the
 daemon's user. The socket is created with mode 0600. The daemon handles
 up to eight active requests, each with a one-second deadline for sending
 the request line. Partial requests and restart backoff share the poll
-loop with child exit detection.
+loop with child exit detection. When accepting a connection hits the
+process or system descriptor limit, the daemon retries after a short
+delay while existing clients and child events continue to run.
 
 `theseus daemon-stop`, SIGTERM, and SIGINT initiate shutdown. The daemon
 signals its direct child through the pidfd and gives it one second to

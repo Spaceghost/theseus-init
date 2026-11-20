@@ -85,6 +85,8 @@ local CLOCK_MONOTONIC: cint <cimport, nodecl, cinclude '<time.h>'>
 local errno: cint <cimport, nodecl, cinclude '<errno.h>'>
 local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
 local EAGAIN: cint <cimport, nodecl, cinclude '<errno.h>'>
+local EMFILE: cint <cimport, nodecl, cinclude '<errno.h>'>
+local ENFILE: cint <cimport, nodecl, cinclude '<errno.h>'>
 local ESRCH: cint <cimport, nodecl, cinclude '<errno.h>'>
 local O_CLOEXEC: cint <cimport, nodecl, cinclude '<fcntl.h>'>
 local O_NONBLOCK: cint <cimport, nodecl, cinclude '<fcntl.h>'>
@@ -582,6 +584,7 @@ local ControlClient = @record{
 local RequestState = @enum{Pending = 0, Complete, Closed, Invalid}
 local ControlTimeout <comptime> = 1000
 local MaxClients <comptime> = 8
+local AcceptRetryMs <comptime> = 50
 
 local function read_request(fd: cint, client: *ControlClient): (RequestState, string)
   local got = c_read(fd, &client.buffer[client.used], (@csize)(255 - client.used))
@@ -801,6 +804,8 @@ end
 local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *Supervision,
                      child_mask: *Sigset): (integer, cint)
   local fds: [4 + MaxClients + 3 * NativeMaxServices]Pollfd
+  local active_fds: [4 + MaxClients + 3 * NativeMaxServices]Pollfd
+  local active_slots: [4 + MaxClients + 3 * NativeMaxServices]integer
   local first_child = 4 + MaxClients
   local first_exec = first_child + group.count
   local first_probe = first_exec + group.count
@@ -822,6 +827,7 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
   local exit_code: integer = 0
   local shutdown_client: cint = -1
   local more_exits = false
+  local accept_at: integer = 0
   while true do
     local deadline: integer = 0
     fds[3].fd = daemon_log_writable_fd()
@@ -845,17 +851,38 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
       if event.fd < 0 then free_slot = slot
       elseif deadline == 0 or expires < deadline then deadline = expires end
     end
-    fds[0].fd = listener
-    if free_slot < 0 then fds[0].fd = -1 end
+    fds[0].fd = -1
+    if free_slot >= 0 then
+      if accept_at <= now then
+        fds[0].fd = listener
+      elseif deadline == 0 or accept_at < deadline then
+        deadline = accept_at
+      end
+    end
 
     local timeout: cint = -1
     if deadline > now then timeout = (@cint)(deadline - now)
     elseif deadline ~= 0 then timeout = 0 end
     if more_exits then timeout = 0 end
-    local ready = c_poll(&fds[0], (@culong)(count), timeout)
+    -- Linux counts inactive array entries against RLIMIT_NOFILE too.
+    local active_count: integer = 0
+    for slot: integer = 0, count - 1 do
+      fds[slot].revents = 0
+      if fds[slot].fd >= 0 then
+        active_slots[active_count] = slot
+        active_fds[active_count] = fds[slot]
+        active_count = active_count + 1
+      end
+    end
+    local ready = c_poll(&active_fds[0], (@culong)(active_count), timeout)
     if ready < 0 then
       if errno ~= EINTR then exit_code = 79; break end
     else
+      if ready > 0 then
+        for i: integer = 0, active_count - 1 do
+          fds[active_slots[i]].revents = active_fds[i].revents
+        end
+      end
       if fds[1].revents ~= 0 then break end
       if fds[3].revents ~= 0 then flush_daemon_log_loss() end
       for i: integer = 0, group.count - 1 do
@@ -916,6 +943,9 @@ local function serve(listener: cint, shutdown_fd: cint, reap_fd: cint, group: *S
           fds[free_slot + 4].fd = fd
           clients[free_slot].used = 0
           clients[free_slot].deadline = monotonic_ms() + ControlTimeout
+        elseif errno == EMFILE or errno == ENFILE then
+          -- A queued connection keeps the listener readable during exhaustion.
+          accept_at = monotonic_ms() + AcceptRetryMs
         elseif errno ~= EAGAIN and errno ~= EINTR then exit_code = 79; break end
       elseif fds[0].revents ~= 0 then exit_code = 79; break end
 

@@ -329,6 +329,21 @@ jobs:
           kill -0 "$child_pid"
           test "$(build/live/the state of sleep-stop)" = RUNNING
           timeout 8s build/live/control-test
+
+          saved_nofile=$(prlimit --pid "$daemon_pid" --nofile --noheadings --raw --output SOFT)
+          prlimit --pid "$daemon_pid" --nofile=12:
+          test "$(timeout 2s build/live/the state of sleep-stop)" = RUNNING
+          first_free=0
+          while test -L "/proc/$daemon_pid/fd/$first_free"; do first_free=$((first_free + 1)); done
+          prlimit --pid "$daemon_pid" --nofile="$first_free:"
+          timeout 4s build/live/the state of sleep-stop >build/live/queued-query.out &
+          query_pid=$!
+          sleep 0.25
+          kill -0 "$daemon_pid"
+          test ! -s build/live/queued-query.out
+          prlimit --pid "$daemon_pid" --nofile="$saved_nofile:"
+          wait "$query_pid"
+          grep -Fx RUNNING build/live/queued-query.out
           kill -STOP "$daemon_pid"
           rc=0
           timeout 10s build/live/the services >build/live/timed-query.out 2>build/live/timed-query.err || rc=$?
