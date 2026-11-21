@@ -43,7 +43,9 @@ local SIGTERM: cint <cimport, nodecl, cinclude '<signal.h>'>
 local SIG_IGN: SignalHandler <cimport, nodecl, cinclude '<signal.h>'>
 local SIG_ERR: SignalHandler <cimport, nodecl, cinclude '<signal.h>'>
 local POLLIN: cshort <cimport, nodecl, cinclude '<poll.h>'>
-local Pollfd = @record{fd: cint, events: cshort, revents: cshort}
+local Pollfd: type <cimport 'TheseusTestPollfd', nodecl, cinclude '<poll.h>', ctypedef 'pollfd'> = @record{
+  fd: cint, events: cshort, revents: cshort
+}
 local function c_poll(fds: *Pollfd, count: culong, timeout_ms: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
 local SockaddrUn = @record{sun_family: cushort, sun_path: [108]cchar}
 

@@ -12,7 +12,9 @@ require 'src.theseus.shutdown_policy'
 local Sigset: type <cimport 'sigset_t', nodecl, cinclude '<signal.h>'> = @record{}
 local Statfs: type <cimport 'struct statfs', nodecl, cinclude '<sys/statfs.h>'> = @record{f_type: clong}
 local Timespec: type <cimport 'struct timespec', nodecl, cinclude '<time.h>'> = @record{tv_sec: clong, tv_nsec: clong}
-local Pollfd = @record{fd: cint, events: cshort, revents: cshort}
+local Pollfd: type <cimport 'TheseusInitPollfd', nodecl, cinclude '<poll.h>', ctypedef 'pollfd'> = @record{
+  fd: cint, events: cshort, revents: cshort
+}
 local SignalHandler = @function(cint): void
 local function c_getpid(): cint <cimport 'getpid', nodecl, cinclude '<unistd.h>'> end
 local function c_fork(): cint <cimport 'fork', nodecl, cinclude '<unistd.h>'> end

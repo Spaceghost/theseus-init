@@ -17,7 +17,9 @@ local function c_access(path: cstring, mode: cint): cint <cimport 'access', node
 local function c_close(fd: cint): cint <cimport 'close', nodecl, cinclude '<unistd.h>'> end
 local Timespec: type <cimport 'struct timespec', nodecl, cinclude '<time.h>'> = @record{tv_sec: clong, tv_nsec: clong}
 local function c_clock_gettime(clock: cint, value: *Timespec): cint <cimport 'clock_gettime', nodecl, cinclude '<time.h>'> end
-local Pollfd = @record{fd: cint, events: cshort, revents: cshort}
+local Pollfd: type <cimport 'TheseusLiveClientPollfd', nodecl, cinclude '<poll.h>', ctypedef 'pollfd'> = @record{
+  fd: cint, events: cshort, revents: cshort
+}
 local function c_poll(fds: *Pollfd, count: culong, timeout: cint): cint <cimport 'poll', nodecl, cinclude '<poll.h>'> end
 local CLOCK_MONOTONIC: cint <cimport, nodecl, cinclude '<time.h>'>
 local POLLIN: cshort <cimport, nodecl, cinclude '<poll.h>'>

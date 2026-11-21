@@ -52,7 +52,9 @@ local function c_sigaddset(set: *Sigset, signal: cint): cint <cimport 'sigaddset
 local function c_sigprocmask(how: cint, set: *Sigset, previous: *Sigset): cint <cimport 'sigprocmask', nodecl, cinclude '<signal.h>'> end
 local function c_signalfd(fd: cint, set: *Sigset, flags: cint): cint <cimport 'signalfd', nodecl, cinclude '<sys/signalfd.h>'> end
 
-local Pollfd = @record{fd: cint, events: cshort, revents: cshort}
+local Pollfd: type <cimport 'TheseusSupervisorPollfd', nodecl, cinclude '<poll.h>', ctypedef 'pollfd'> = @record{
+  fd: cint, events: cshort, revents: cshort
+}
 local MaxClients <comptime> = 8
 local FirstClient <comptime> = 4
 local ready_fd: cint = -1
