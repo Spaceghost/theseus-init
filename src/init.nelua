@@ -9,6 +9,9 @@ require 'src.theseus.recovery'
 require 'src.theseus.install_paths'
 require 'src.theseus.shutdown_policy'
 
+local explicit_openrc = arg[1] == '--openrc'
+local lxc = os.getenv('container') == 'lxc'
+
 local Sigset: type <cimport 'sigset_t', nodecl, cinclude '<signal.h>'> = @record{}
 local Statfs: type <cimport 'struct statfs', nodecl, cinclude '<sys/statfs.h>'> = @record{f_type: clong}
 local Timespec: type <cimport 'struct timespec', nodecl, cinclude '<time.h>'> = @record{tv_sec: clong, tv_nsec: clong}
@@ -66,6 +69,7 @@ local SYSFS_MAGIC: clong <cimport, nodecl, cinclude '<linux/magic.h>'>
 local TMPFS_MAGIC: clong <cimport, nodecl, cinclude '<linux/magic.h>'>
 local CGROUP2_SUPER_MAGIC: clong <cimport, nodecl, cinclude '<linux/magic.h>'>
 local SIGCHLD: cint <cimport, nodecl, cinclude '<signal.h>'>
+local SIGPWR: cint <cimport, nodecl, cinclude '<signal.h>'>
 local SIGTERM: cint <cimport, nodecl, cinclude '<signal.h>'>
 local SIGINT: cint <cimport, nodecl, cinclude '<signal.h>'>
 local SIGUSR1: cint <cimport, nodecl, cinclude '<signal.h>'>
@@ -233,12 +237,14 @@ end
 local function signal_queue(): cint
   local set: Sigset
   if c_sigemptyset(&set) ~= 0 or
+     (lxc and c_sigaddset(&set, SIGPWR) ~= 0) or
      c_sigaddset(&set, SIGCHLD) ~= 0 or c_sigaddset(&set, SIGTERM) ~= 0 or
      c_sigaddset(&set, SIGINT) ~= 0 or c_sigaddset(&set, SIGUSR1) ~= 0 or
      c_sigaddset(&set, SIGUSR2) ~= 0 or c_sigprocmask(SIG_SETMASK, &set, nilptr) ~= 0 then return -1 end
   if c_signal(SIGCHLD, SIG_DFL) == SIG_ERR or c_signal(SIGINT, SIG_DFL) == SIG_ERR or
      c_signal(SIGTERM, SIG_DFL) == SIG_ERR or c_signal(SIGUSR1, SIG_DFL) == SIG_ERR or
-     c_signal(SIGUSR2, SIG_DFL) == SIG_ERR then return -1 end
+     c_signal(SIGUSR2, SIG_DFL) == SIG_ERR or
+     (lxc and c_signal(SIGPWR, SIG_DFL) == SIG_ERR) then return -1 end
   return c_signalfd(-1, &set, SFD_CLOEXEC | SFD_NONBLOCK)
 end
 
@@ -267,7 +273,9 @@ local function notification(fd: cint, timeout: cint, output: cint): (boolean, Ac
   local size = #info * #uint32
   if c_read(fd, &info[0], size) ~= size then return false, Action.None end
   if info[0] == (@cuint)(SIGUSR1) then return true, Action.Halt end
-  if info[0] == (@cuint)(SIGUSR2) then return true, Action.Poweroff end
+  if info[0] == (@cuint)(SIGUSR2) or (lxc and info[0] == (@cuint)(SIGPWR)) then
+    return true, Action.Poweroff
+  end
   if info[0] == (@cuint)(SIGTERM) or info[0] == (@cuint)(SIGINT) then return true, Action.Reboot end
   return true, Action.None
 end
@@ -655,6 +663,13 @@ local function run()
   local recovery_seconds: integer = 0
   if mount_type('proc', '/proc', MS_NOSUID | MS_NODEV | MS_NOEXEC, PROC_SUPER_MAGIC) then
     boot, preferred_rescue, openrc, rescue_disabled, trial, trial_seconds, trial_watchdog, heartbeat_seconds, recovery_seconds, fallback_enabled, guard = command_line()
+  end
+  if explicit_openrc then
+    boot, preferred_rescue, openrc = true, false, true
+    if lxc then
+      rescue_disabled, trial, trial_watchdog, fallback_enabled, guard = true, false, false, false, false
+      recovery_seconds = 0
+    end
   end
   if rescue_disabled then report('rescue-console\tdisabled') end
   c_setenv('PATH', '/usr/sbin:/usr/bin:/sbin:/bin', 1)

@@ -1,5 +1,7 @@
 # Opt-in Linux PID 1
 
+Pass `--openrc` to the PID 1 executable to start the installed OpenRC runlevels. Linux containers launched with `container=lxc` also handle `SIGPWR` as an orderly poweroff request.
+
 Build src/init.nelua as /sbin/theseus-init and src/supervisor.nelua
 as /sbin/theseusd. Prepare a local Linux root with those binaries,
 their native loader and libraries if dynamically linked, /bin/sh,
